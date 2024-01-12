@@ -15,6 +15,8 @@
 #include "services/svc_sys_obj.h"
 #include "rgw_zone.h"
 
+#include <regex>
+
 #define dout_subsys ceph_subsys_rgw
 
 using namespace std;
@@ -109,7 +111,17 @@ void RGWOp_User_Info::execute(optional_yield y)
   op_ret = RGWUserAdminOp_User::info(s, driver, op_state, flusher, y);
 }
 
-class RGWOp_User_Create : public RGWRESTOp {
+class RGWRESTOpWithSecret : public RGWRESTOp {
+public:
+  virtual std::optional<UriLogRewrite> get_uri_log_rewrite() const override {
+    return std::make_optional<UriLogRewrite>([](const std::string& uri) {
+        const std::regex secret_key_pattern("([&|\?])(secret-key=[^=&]+)");
+        return std::regex_replace(uri, secret_key_pattern, "$1secret-key=XXXXXXXX");
+    });
+  }
+};
+
+class RGWOp_User_Create : public RGWRESTOpWithSecret {
 
 public:
   RGWOp_User_Create() {}
@@ -256,7 +268,7 @@ void RGWOp_User_Create::execute(optional_yield y)
   op_ret = RGWUserAdminOp_User::create(s, driver, op_state, flusher, y);
 }
 
-class RGWOp_User_Modify : public RGWRESTOp {
+class RGWOp_User_Modify : public RGWRESTOpWithSecret {
 
 public:
   RGWOp_User_Modify() {}
@@ -443,7 +455,7 @@ void RGWOp_User_Remove::execute(optional_yield y)
   op_ret = RGWUserAdminOp_User::remove(s, driver, op_state, flusher, s->yield);
 }
 
-class RGWOp_Subuser_Create : public RGWRESTOp {
+class RGWOp_Subuser_Create : public RGWRESTOpWithSecret {
 
 public:
   RGWOp_Subuser_Create() {}
@@ -518,7 +530,7 @@ void RGWOp_Subuser_Create::execute(optional_yield y)
   op_ret = RGWUserAdminOp_Subuser::create(s, driver, op_state, flusher, y);
 }
 
-class RGWOp_Subuser_Modify : public RGWRESTOp {
+class RGWOp_Subuser_Modify : public RGWRESTOpWithSecret {
 
 public:
   RGWOp_Subuser_Modify() {}
@@ -628,7 +640,7 @@ void RGWOp_Subuser_Remove::execute(optional_yield y)
   op_ret = RGWUserAdminOp_Subuser::remove(s, driver, op_state, flusher, y);
 }
 
-class RGWOp_Key_Create : public RGWRESTOp {
+class RGWOp_Key_Create : public RGWRESTOpWithSecret {
 
 public:
   RGWOp_Key_Create() {}

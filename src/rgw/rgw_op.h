@@ -282,6 +282,11 @@ public:
   virtual dmc::client_id dmclock_client() { return dmc::client_id::metadata; }
   virtual dmc::Cost dmclock_cost() { return 1; }
   virtual void write_ops_log_entry(rgw_log_entry& entry) const {};
+
+  using UriLogRewrite = std::function<const std::string(const std::string&)>;
+  virtual std::optional<UriLogRewrite> get_uri_log_rewrite() const {
+    return std::nullopt;
+  }
 };
 
 class RGWDefaultResponseOp : public RGWOp {

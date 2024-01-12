@@ -450,6 +450,7 @@ done:
 
   if (op) {
     op_ret = op->get_ret();
+    req->uri_log_rewrite = op->get_uri_log_rewrite();
     ldpp_dout(op, 2) << "op status=" << op_ret << dendl;
     ldpp_dout(op, 2) << "http status=" << s->err.http_ret << dendl;
   } else {
