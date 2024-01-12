@@ -115,7 +115,7 @@ class RGWRESTOpWithSecret : public RGWRESTOp {
 public:
   virtual std::optional<UriLogRewrite> get_uri_log_rewrite() const override {
     return std::make_optional<UriLogRewrite>([](const std::string& uri) {
-        const std::regex secret_key_pattern("([&|\?])(secret-key=[^=&]+)");
+        const std::regex secret_key_pattern("([&?])(secret-key=[^=&]+)");
         return std::regex_replace(uri, secret_key_pattern, "$1secret-key=XXXXXXXX");
     });
   }
