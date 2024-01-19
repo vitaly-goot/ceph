@@ -17,12 +17,15 @@
 #include "rgw_tools.h"
 #include "rgw_zone.h"
 #include "rgw_rados.h"
+#include "rgw/rgw_secret_encryption.h"
 
 #include "cls/user/cls_user_client.h"
 
 #define dout_subsys ceph_subsys_rgw
 
 #define RGW_BUCKETS_OBJ_SUFFIX ".buckets"
+
+#define RGW_SECRET_ENCRYPT_KEY_ID "ceph.rgw.secret.encrypt_key_id"
 
 using namespace std;
 
@@ -108,6 +111,30 @@ rgw_raw_obj RGWSI_User_RADOS::get_buckets_obj(const rgw_user& user) const
   return rgw_raw_obj(svc.zone->get_zone_params().user_uid_pool, oid);
 }
 
+static uint32_t get_encrypt_key_id(const map<string, bufferlist> &attrs)
+{
+  uint32_t key_id = 0;
+  auto piter = attrs.find(RGW_SECRET_ENCRYPT_KEY_ID);
+  if (piter != attrs.end()) {
+    auto iter = piter->second.cbegin();
+    try {
+      std::string key_id_str;
+      decode(key_id_str, iter);
+      key_id = std::stoul(key_id_str);
+    } catch (...) {
+      key_id = 0;
+    }
+  }
+  return key_id;
+}
+
+static void set_encrypt_key_id(map<string, bufferlist> &attrs, uint32_t key_id)
+{
+  bufferlist bl;
+  encode(std::to_string(key_id), bl);
+  attrs[RGW_SECRET_ENCRYPT_KEY_ID] = bl;
+}
+
 int RGWSI_User_RADOS::read_user_info(RGWSI_MetaBackend::Context *ctx,
                                const rgw_user& user,
                                RGWUserInfo *info,
@@ -125,12 +152,21 @@ int RGWSI_User_RADOS::read_user_info(RGWSI_MetaBackend::Context *ctx,
   bufferlist bl;
   RGWUID user_id;
 
-  RGWSI_MBSObj_GetParams params(&bl, pattrs, pmtime);
+  map<string, bufferlist> attrs;
+
+  RGWSI_MBSObj_GetParams params(&bl, &attrs, pmtime);
   params.set_cache_info(cache_info);
 
-  int ret = svc.meta_be->get_entry(ctx, get_meta_key(user), params, objv_tracker, y, dpp);
+  // Read out raw attributes to access the encryption key id
+  int ret = svc.meta_be->get_entry(ctx, get_meta_key(user), params, objv_tracker, y, dpp, true);
   if (ret < 0) {
     return ret;
+  }
+
+  auto key_id = get_encrypt_key_id(attrs);
+  if (pattrs) {
+    // Apply the same filtering as get_entry() does for non-raw attribute retrieval.
+    rgw_filter_attrset(attrs, RGW_ATTR_PREFIX, pattrs);
   }
 
   auto iter = bl.cbegin();
@@ -140,8 +176,42 @@ int RGWSI_User_RADOS::read_user_info(RGWSI_MetaBackend::Context *ctx,
       ldpp_dout(dpp, -1)  << "ERROR: rgw_get_user_info_by_uid(): user id mismatch: " << user_id.user_id << " != " << user << dendl;
       return -EIO;
     }
+
     if (!iter.end()) {
+      ldpp_dout(dpp, 20) << "user info is encrypted by key id " << key_id << ", buf size " << iter.get_remaining() << dendl;
+
+      std::string iv;
+      bufferlist encrypted_bl;
+      if (key_id != 0) {
+        decode(iv, iter);
+      }
+      bl.splice(iter.get_off(), iter.get_remaining(), &encrypted_bl);
+      bufferptr iv_buf(iv.data(), iv.length());
+
+      bool success;
+      uint32_t suggested_key;
+      bufferlist decrypted_bl;
+      ldpp_dout(dpp, 20) << "Try to decrypt bl with size " << encrypted_bl.length() << " with key " << key_id << " with user id " << user.id << dendl;
+      std::tie(success, suggested_key, decrypted_bl) = rgw::secret::encrypter()->decrypt(key_id, std::move(encrypted_bl), iv_buf, user.id);
+
+      if (!success) {
+        ldpp_dout(dpp, -1)  << "ERROR: failed to decrypt user info of " << user.id << " with key id " << key_id << dendl;
+        return -EIO;
+      }
+      ldpp_dout(dpp, 20) << "Decryption succeeded with bl size " << decrypted_bl.length() << " suggested key " << suggested_key << dendl;
+      iter = decrypted_bl.cbegin();
       decode(*info, iter);
+      if (suggested_key != key_id) {
+        ldpp_dout(dpp, 20) << "Suggested key is different: suggested_key " << suggested_key << " != key_id " << key_id << dendl;
+        // Key has been rotated or feature disabled. Need re-encrypt or not encrypt at all
+        real_time mtime = pmtime ? *pmtime : real_clock::now();
+
+        ret = store_user_info(ctx, *info, info, objv_tracker, mtime, false, pattrs, y, dpp);
+        if (ret < 0) {
+          ldpp_dout(dpp, -1) << "ERROR: fail to store user info when it should be updated: " << ret << dendl;
+          // Do NOT fail the call since user info was decoded successfully. Prefer delaying re-encryption to DoS the user.
+        }
+      }
     }
   } catch (buffer::error& err) {
     ldpp_dout(dpp, 0) << "ERROR: failed to decode user info, caught buffer::error" << dendl;
@@ -238,9 +308,26 @@ public:
   int put(const DoutPrefixProvider *dpp) {
     bufferlist data_bl;
     encode(ui, data_bl);
-    encode(info, data_bl);
 
-    RGWSI_MBSObj_PutParams params(data_bl, pattrs, mtime, exclusive);
+    bufferlist info_bl;
+    encode(info, info_bl);
+
+    uint32_t key_used;
+    std::string iv;
+    bufferlist encrypted_bl;
+    std::tie(key_used, iv, encrypted_bl) = rgw::secret::encrypter()->encrypt(std::move(info_bl), ui.user_id.id);
+    ldpp_dout(dpp, 20) << "Encrypted user info with key " << key_used << " with user id " << ui.user_id.id << " bl size " << encrypted_bl.length() << " from info_bl size " << info_bl.length() << dendl;
+
+    map<string, bufferlist> no_attrs;
+    map<string, bufferlist> &attrs(pattrs ? *pattrs : no_attrs);
+    set_encrypt_key_id(attrs, key_used);
+
+    if (key_used != 0) {
+      encode(iv, data_bl);
+    }
+    data_bl.append(encrypted_bl);
+
+    RGWSI_MBSObj_PutParams params(data_bl, &attrs, mtime, exclusive);
 
     int ret = svc.meta_be->put(ctx, RGWSI_User::get_meta_key(info.user_id), params, &ot, y, dpp);
     if (ret < 0)

@@ -145,6 +145,7 @@ set(librgw_common_srcs
   rgw_lua.cc
   rgw_lua_data_filter.cc
   rgw_bucket_encryption.cc
+  rgw_secret_encryption.cc
   rgw_tracer.cc
   rgw_lua_background.cc
   driver/rados/cls_fifo_legacy.cc

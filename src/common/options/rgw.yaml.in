@@ -3794,3 +3794,21 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_secret_encrypt_enabled
+  type: bool
+  level: advanced
+  desc: Is the feature that encrypts secrets enabled?
+  default: false
+  services:
+    - rgw
+  flags:
+    - startup
+- name: rgw_secret_encrypt_key_file
+  type: str
+  level: advanced
+  desc: Name of the file that contains the encryption keys to encrypt secrets, including S3 secret keys.
+  default: /dev/shm/rgw_secret_encryption/encrypt_keys.json
+  services:
+    - rgw
+  flags:
+    - startup

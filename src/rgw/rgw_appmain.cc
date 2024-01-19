@@ -55,6 +55,7 @@
 #include "rgw_kmip_client.h"
 #include "rgw_kmip_client_impl.h"
 #include "rgw_perf_counters.h"
+#include "rgw_secret_encryption.h"
 #include "rgw_signal.h"
 #ifdef WITH_RADOSGW_AMQP_ENDPOINT
 #include "rgw_amqp.h"
@@ -198,7 +199,12 @@ void rgw::AppMain::init_numa()
 
 void rgw::AppMain::init_storage()
 {
-    auto run_gc =
+  // Initialize before storage store is open
+  rgw::secret::init_encrypter(g_ceph_context,
+                              g_conf().get_val<bool>("rgw_secret_encrypt_enabled"),
+                              g_conf().get_val<std::string>("rgw_secret_encrypt_key_file")); 
+
+  auto run_gc =
     (g_conf()->rgw_enable_gc_threads &&
       ((!nfs) || (nfs && g_conf()->rgw_nfs_run_gc_threads)));
 
