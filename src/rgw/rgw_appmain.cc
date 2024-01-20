@@ -202,7 +202,8 @@ void rgw::AppMain::init_storage()
   // Initialize before storage store is open
   rgw::secret::init_encrypter(g_ceph_context,
                               g_conf().get_val<bool>("rgw_secret_encrypt_enabled"),
-                              g_conf().get_val<std::string>("rgw_secret_encrypt_key_file")); 
+                              g_conf().get_val<std::string>("rgw_secret_encrypt_key_file"),
+                              g_conf().get_val<uint64_t>("rgw_secret_encrypt_key_reload_interval"));
 
   auto run_gc =
     (g_conf()->rgw_enable_gc_threads &&

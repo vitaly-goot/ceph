@@ -33,11 +33,12 @@ using RGWEncryptKeyMap = std::map<uint32_t, RGWEncryptKey>;
 class RGWSecretEncrypterImpl : public RGWSecretEncrypter
 {
 public:
-  RGWSecretEncrypterImpl(CephContext *const cct, bool enabled, const std::string &encrypt_key_file) :
+  RGWSecretEncrypterImpl(CephContext *const cct, bool enabled, const std::string &encrypt_key_file, uint64_t reload_interval) :
     cct(cct),
     enabled(enabled),
     encrypt_key_file(encrypt_key_file),
-    curr_db(std::make_shared<RGWEncryptKeyMap>())
+    curr_db(std::make_shared<RGWEncryptKeyMap>()),
+    reload_interval(reload_interval)
   {
     ldout(cct, 1)  << "Create secret encrypter with enablement " << enabled << dendl;
     auto ret = reload_keys(0);
@@ -59,6 +60,10 @@ protected:
   const std::string encrypt_key_file;
 
   std::shared_ptr<RGWEncryptKeyMap> curr_db;
+
+  uint64_t reload_interval;
+
+  time_t last_reload_for_unknown_key = 0;
 
   CryptoKeyHandler *get_key_handler(const bufferptr &secret)
   {
@@ -83,21 +88,18 @@ protected:
   CryptoKey make_unique_key(const RGWEncryptKey& encrypt_key, const std::string& differentiator);
 };
 
-static RGWSecretEncrypterImpl *TheSecretEncrypter = nullptr;
+// It is made shared_ptr and re-initializable to help unit tests.
+static std::unique_ptr<RGWSecretEncrypterImpl> TheSecretEncrypter;
 
-int init_encrypter(CephContext *const cct, bool enable, const std::string &encrypt_key_file)
+int init_encrypter(CephContext *const cct, bool enable, const std::string &encrypt_key_file, uint64_t reload_interval)
 {
-  if (TheSecretEncrypter) {
-    std::cerr << "ERROR: only one secret encrypter is allowed" << std::endl;
-    return -EINVAL;
-  }
-  TheSecretEncrypter = new RGWSecretEncrypterImpl(cct, enable, encrypt_key_file);
+  TheSecretEncrypter = std::make_unique<RGWSecretEncrypterImpl>(cct, enable, encrypt_key_file, reload_interval);
   return 0;
 }
 
 RGWSecretEncrypter *encrypter()
 {
-  return TheSecretEncrypter;
+  return TheSecretEncrypter.get();
 }
 
 // Stolen from rgw_admin.cc
@@ -199,6 +201,9 @@ int RGWSecretEncrypterImpl::reload_keys(uint32_t expect_key_id)
   if (new_db->empty() || 
      (!new_db->empty() && new_db->rbegin()->first >= expect_key_id)) {
     curr_db.swap(new_db);
+    if (!curr_db->empty()) {
+      ldout(cct, 1) << "Reloaded keys with the latest key be " << curr_db->rbegin()->first << " and expected key be " << expect_key_id << dendl;
+    }
     return 0;
   } else {
     ldout(cct, 1) << "WARNING: key reloading doesn't cover key id " << expect_key_id << " with " << (new_db->empty() ? 0 : new_db->rbegin()->first) << dendl;
@@ -225,14 +230,6 @@ CryptoKey RGWSecretEncrypterImpl::make_unique_key(const RGWEncryptKey &encrypt_k
 std::tuple<bool, uint32_t, bufferlist> RGWSecretEncrypterImpl::decrypt(uint32_t key_id, const bufferlist &secret, bufferptr&iv, const std::string &differentiator)
 {
   auto db_in_use = curr_db; // Hold a reference of it
-  if (key_id > 0 && !db_in_use->empty() && db_in_use->rbegin()->first < key_id) {
-    // The secret was encrypted by a key that is newer than any in curr_db. 
-    // Key file must be reloaded or we are going to DoS the client.
-    if (reload_keys(key_id) < 0) {
-      ldout(cct, 1) << "ERROR: Unknown encrypt key ID [" << key_id << "] even after key reload" << dendl;
-      return std::make_tuple(false, 0, std::move(secret));
-    }
-  }
 
   auto suggested_key = enabled ? get_key_to_use(*db_in_use.get()) : RGWEncryptKey{0, ""};
 
@@ -242,9 +239,24 @@ std::tuple<bool, uint32_t, bufferlist> RGWSecretEncrypterImpl::decrypt(uint32_t 
   }
 
   auto key_found = db_in_use->find(key_id);
+  auto now = ceph_clock_now().sec();
+  // Condition to reload key file:
+  // 1. Secret is encrypted by an unknown key.
+  // 2. Either this key is newer than all knowns keys or it has been at least 5 seconds since the last reload
+  if (key_found == db_in_use->end() &&
+      (now >= (last_reload_for_unknown_key + (time_t)reload_interval) ||
+      (!db_in_use->empty() && db_in_use->rbegin()->first < key_id))) {
+    last_reload_for_unknown_key = now;
+    if (reload_keys(key_id) < 0) {
+      ldout(cct, 1) << "ERROR: Unknown encrypt key ID [" << key_id << "] after failed key reload" << dendl;
+      return std::make_tuple(false, 0, std::move(secret));
+    }
+    db_in_use = curr_db; // Pick up the newly reloaded key DB.
+    key_found = db_in_use->find(key_id);
+  }
 
   if (key_found == db_in_use->end()) {
-    ldout(cct, 1) << "ERROR: Unknown encrypt key ID [" << key_id << "] provided for encryption" << dendl;
+    ldout(cct, 1) << "ERROR: Unknown encrypt key ID [" << key_id << "] provided for decryption" << dendl;
     return std::make_tuple(false, 0, std::move(secret));
   }
 

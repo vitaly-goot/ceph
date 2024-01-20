@@ -3812,3 +3812,12 @@ options:
     - rgw
   flags:
     - startup
+- name: rgw_secret_encrypt_key_reload_interval
+  type: uint
+  level: advanced
+  desc: The key file reload (upon unknown key) interval in seconds
+  default: 5
+  services:
+    - rgw
+  flags:
+    - startup

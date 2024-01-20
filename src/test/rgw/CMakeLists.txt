@@ -112,6 +112,19 @@ target_link_libraries(ceph_test_rgw_obj
   )
 install(TARGETS ceph_test_rgw_obj DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+set(test_rgw_secret_encrypt_srcs test_rgw_secret_encrypt.cc)
+add_executable(unittest_rgw_secret_encrypt
+  ${test_rgw_secret_encrypt_srcs}
+  )
+add_ceph_unittest(unittest_rgw_secret_encrypt)
+target_link_libraries(unittest_rgw_secret_encrypt
+  ${rgw_libs}
+  global
+  ${CMAKE_DL_LIBS}
+  ${UNITTEST_LIBS}
+  ${CRYPTO_LIBS}
+  )
+
 set(test_rgw_crypto_srcs test_rgw_crypto.cc)
 add_executable(unittest_rgw_crypto
   ${test_rgw_crypto_srcs}

@@ -32,7 +32,7 @@ public:
   virtual std::tuple<bool, uint32_t, bufferlist> decrypt(uint32_t key_id, const bufferlist &secret, bufferptr& iv, const std::string &differentiator) = 0;
 };
 
-int init_encrypter(CephContext *const cct, bool enabled, const std::string &encrypt_key_file);
+int init_encrypter(CephContext *const cct, bool enabled, const std::string &encrypt_key_file, uint64_t reload_interval);
 
 RGWSecretEncrypter *encrypter();
 

@@ -4284,7 +4284,8 @@ int main(int argc, const char **argv)
     // Must be initialized before creating the storage store object.
     rgw::secret::init_encrypter(g_ceph_context,
                                 g_conf().get_val<bool>("rgw_secret_encrypt_enabled"),
-                                g_conf().get_val<std::string>("rgw_secret_encrypt_key_file"));
+                                g_conf().get_val<std::string>("rgw_secret_encrypt_key_file"),
+                                g_conf().get_val<uint64_t>("rgw_secret_encrypt_key_reload_interval"));
 
     raw_storage_op = (raw_storage_ops_list.find(opt_cmd) != raw_storage_ops_list.end() ||
 			   raw_period_update || raw_period_pull);
