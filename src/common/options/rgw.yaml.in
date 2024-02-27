@@ -3821,3 +3821,10 @@ options:
     - rgw
   flags:
     - startup
+- name: rgw_post_check_null_byte_in_filename
+  type: bool
+  level: advanced
+  desc: If enabled, RGW will deny POST requests if the uploaded object's name contains a null character (\0) in the middle.
+  default: true
+  services:
+  - rgw

@@ -4519,8 +4519,15 @@ void RGWPostObj::execute(optional_yield y)
       ldpp_dout(this, 15) << "supplied_md5=" << supplied_md5 << dendl;
     }
 
+    std::string filename = get_current_filename();
+    ldpp_dout(this, 15) << "post form processing file [" << filename.length() << "] " << filename << dendl;
+    if (g_conf().get_val<bool>("rgw_post_check_null_byte_in_filename") && filename.find('\0') != std::string::npos) {
+      ldpp_dout(this, 1) << "ERROR: reject request since uploaded filename includes a null character midway." << filename << dendl;
+      op_ret = -ERR_ZERO_IN_URL;
+      return;
+    } 
     std::unique_ptr<rgw::sal::Object> obj =
-		     s->bucket->get_object(rgw_obj_key(get_current_filename()));
+                    s->bucket->get_object(rgw_obj_key(filename));
     if (s->bucket->versioning_enabled()) {
       obj->gen_rand_obj_instance_name();
     }
