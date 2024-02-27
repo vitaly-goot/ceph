@@ -1,0 +1,96 @@
+=============================================================================
+JIRA OBJGEN1-660 research illegal object names
+
+Developer: @vgoot
+Code Review: @sung
+
+[Description]
+The rmomapkey.out is a C-implemented helper tool designed to work with librados for deleting object keys containing the null byte \x00. Handling strings with null bytes can be challenging in programming due to the common use of \x00 as a string terminator. To address this, I utilize a method that writes the key to a temporary file in binary format, which is then passed to the rmomapkey.out utility.
+
+Here's how to use it:
+
+Compile rmomapkey.cc
+1. Use g++ to compile:
+<code>
+cd src/tools/akamai
+g++ rmomapkey.cc -lrados -I../../../src/include -L../../../build/lib/ -g -o rmomapkey.out
+</code>
+
+2. Deploy the Tool
+Copy rmomapkey.out to the RGW machine.
+
+3. Identify Bucket ID and Shard Count
+Use radosgw-admin to find the bucket ID and number of shards for the bucket you would like to check
+
+<code>
+$ radosgw-admin bucket stats --bucket=test | jq '{id, num_shards}'
+{
+  "id": "a05279fa-60f1-4571-b195-21a54aadb90e.15292584.1",
+  "num_shards": 11
+}
+</code>
+
+4. Use tool to scan that bucket. It will detect and report object with zero byte. 
+<code>
+
+$ id=a05279fa-60f1-4571-b195-21a54aadb90e.15292584.1
+$ ./rmomapkey_r3.out $id 11 --scan
+Running in scan mode
+Scanning shard 0 =======> Object: .dir.d8c6ebd1-2bab-414d-9d6b-73bf9bc8fc5a.100123318.10468.0
+Scanning shard 1 =======> Object: .dir.d8c6ebd1-2bab-414d-9d6b-73bf9bc8fc5a.100123318.10468.1
+key_len: 7 val_len 226
+\x73\x73\x73\x00\x73\x73\x73
+Scanning shard 2 =======> Object: .dir.d8c6ebd1-2bab-414d-9d6b-73bf9bc8fc5a.100123318.10468.2
+Scanning shard 3 =======> Object: .dir.d8c6ebd1-2bab-414d-9d6b-73bf9bc8fc5a.100123318.10468.3
+...
+</code>
+
+5. Preserve reported object in file as UTF-8 binary
+<code>
+echo -en '\x73\x73\x73\x00\x73\x73\x73' > /tmp/bad_key
+</code>
+
+5. Use tool to Delete that Object. It will respond with success or failure and error code.
+<code>
+$ ./rmomapkey.out $id 11 /tmp/bad_key
+.dir.a05279fa-60f1-4571-b195-21a54aadb90e.19765212.1.0 -1785217655 0
+Key sss.sss
+ size 7
+Keys removed successfully.
+Done
+</code>
+
+[File Changed]
+src/tools/akamai/rmomapkey.cc
+
+=============================================================================
+JIRA OBJGEN1-666 disallow zero byte in object names
+
+Developer: @vgoot
+Code Review: @sung
+
+[Description]
+Object with null bytes are restricted in RGW level when PUT API is used. However it is possible to insert such using presigned POST API. This JIRA should restrict it as well.
+
+[Config] 
+SERVICE: rgw
+TAG: rgw_post_check_null_byte_in_filename
+TYPE: bool
+DEFAULT: true
+DESC: If enabled, RGW will deny POST requests if the uploaded object's name contains a null byte ('\0') in the middle.
+
+[Logging]
+/var/log/ceph/ceph-client.rgw.*.log
+print new log line when processing POST request form for each uploaded object 
+ldpp_dout(this, 15) << "post form processing file [" << filename.length() << "] " << filename << dendl;
+
+print error line when object with null byte is detected in the POST form and throw exception (POST request shuold end-up with HTTP 400) 
+ldpp_dout(this, 1) << "ERROR: reject request since uploaded filename includes a null character midway." << filename << dendl;
+
+
+[Rollback] 
+The feature is enabled by default. However, you can disable it by setting 'rgw_post_check_null_byte_in_filename' to false and then restarting the RGW service.
+  
+[File Changed]
+src/common/options/rgw.yaml.in
+src/rgw/rgw_op.cc
