@@ -455,7 +455,51 @@ option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
 option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)
 
 if(WITH_RADOSGW)
-  find_package(EXPAT REQUIRED)
+  # OBJGEN-627 begin.
+  # Build Expat in-tree so we are sure of the version.
+  include(FetchContent)
+
+  set(RGW_EXPAT_RELEASE_TAG R_2_6_0)
+
+  # libexpat spews a bunch of messages at level STATUS. Suppress it. (This is
+  # a CMake >= 3.17 feature, on earlier versions it does nothing.)
+  set(_saved_CMAKE_MESSAGE_LOG_LEVEL ${CMAKE_MESSAGE_LOG_LEVEL})
+  set(CMAKE_MESSAGE_LOG_LEVEL NOTICE)
+
+  # Don't confuse matters by having an in-tree shared library version of
+  # expat. We only want the static library.
+  set(EXPAT_SHARED_LIBS OFF)
+  set(EXPAT_BUILD_TESTS OFF)
+
+  # SOURCE_SUBDIR is a CMake 3.18 feature. Ubuntu 20.04's version is 3.16.3.
+  FetchContent_Declare(
+    expat
+    GIT_REPOSITORY https://github.com/libexpat/libexpat.git
+    GIT_TAG ${RGW_EXPAT_RELEASE_TAG}
+    GIT_SHALLOW TRUE
+    GIT_PROGRESS TRUE
+
+    # When we can rely on CMake >= 3.18, SOURCE_SUBDIR will come to life and
+    # we can remove the add_subdirectory() call immediately below.
+    SOURCE_SUBDIR expat
+  )
+  FetchContent_MakeAvailable(expat)
+
+  # Ubuntu 20.04 ships CMake 3.16.x, which doesn't support SOURCE_SUBDIR. We
+  # need to add the subdirectory manually.
+  if(${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION} VERSION_LESS "3.18")
+    add_subdirectory(${expat_SOURCE_DIR}/expat)
+  endif()
+
+  # Reset the message level.
+  set(CMAKE_MESSAGE_LOG_LEVEL ${_saved_CMAKE_MESSAGE_LOG_LEVEL})
+
+  message(STATUS "expat_SOURCE_DIR:      ${expat_SOURCE_DIR}")
+  message(STATUS "RGW_EXPAT_RELEASE_TAG: ${RGW_EXPAT_RELEASE_TAG}")
+
+  set(EXPAT_LIBRARIES expat)
+  # OBJGEN1-627 end.
+
   find_package(OATH REQUIRED)
 
 # https://curl.haxx.se/docs/install.html mentions the
