@@ -36,6 +36,9 @@ git clean -dxf
 vers=$(git describe --match "v*" | sed s/^v//)
 ./make-dist $vers
 #
+# Call trivy (Or anything on the command line, but the intent is trivy)
+$2
+#
 # rename the tarbal to match debian conventions and extract it
 #
 mv ceph-$vers.tar.bz2 $releasedir/ceph_$vers.orig.tar.bz2
@@ -63,15 +66,20 @@ if [ "$chvers" != "$dvers" ]; then
    DEBEMAIL="contact@ceph.com" dch -D $VERSION_CODENAME --force-distribution -b -v "$dvers" "new version"
 fi
 #
+# Add a -j option if $DEB_BUILD_OPTIONS doesn't have parallel=n in it.
+# Default: use half of the available processors
+PARALLEL="parallel"
+if [[ ! $DEB_BUILD_OPTIONS =~ $PARALLEL ]] ; then
+   : ${NPROC:=$(($(nproc) / 2))}
+   if test $NPROC -gt 1 ; then
+      j=-j${NPROC}
+   fi
+fi
+#
 # create the packages
 # a) with ccache to speed things up when building repeatedly
 # b) do not sign the packages
-# c) use half of the available processors
 #
-: ${NPROC:=$(($(nproc) / 2))}
-if test $NPROC -gt 1 ; then
-    j=-j${NPROC}
-fi
 PATH=/usr/lib/ccache:$PATH dpkg-buildpackage $j -uc -us
 cd ../..
 mkdir -p $VERSION_CODENAME/conf
