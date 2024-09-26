@@ -37,7 +37,11 @@ vers=$(git describe --match "v*" | sed s/^v//)
 ./make-dist $vers
 #
 # Call trivy (Or anything on the command line, but the intent is trivy)
-$2
+if [[ -n "$2" ]]; then 
+    echo "** Running extra command '$2'" 
+    $2
+    echo "** Extra command '$2' completed"
+fi
 #
 # rename the tarbal to match debian conventions and extract it
 #
