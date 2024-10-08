@@ -245,6 +245,11 @@ rgw::auth::Strategy::authenticate(const DoutPrefixProvider* dpp, const req_state
       engine_result = engine.authenticate(dpp, s, y);
     } catch (const int err) {
       engine_result = result_t::deny(err);
+    } catch (...) {
+      /* STOROBJ-2831: Some exceptions are not being caught on Debian builds.
+       * This is a temporary measure to catch all exceptions and log them. */
+      ldpp_dout(dpp, 0) << "caught unknown exception type in rgw::auth::Strategy::authenticate, return deny(-EACCES)" << dendl;
+      engine_result = result_t::deny(-EACCES);
     }
 
     bool try_next = true;
