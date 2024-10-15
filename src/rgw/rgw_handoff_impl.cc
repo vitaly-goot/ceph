@@ -887,6 +887,9 @@ HandoffAuthResult HandoffHelperImpl::_grpc_auth(
   // Fill in the request protobuf. Seem to have to create strings from
   // string_view, which is a shame.
   req.set_transaction_id(s->trans_id);
+  if (disable_local_authorization_) {
+    req.set_skip_authorization(true);
+  }
   req.set_string_to_sign(std::string { string_to_sign });
   req.set_authorization_header(auth);
   // If we synthesised the Authorization header, we need to set this flag so
