@@ -132,12 +132,10 @@ AuthorizationParameters::AuthorizationParameters(const DoutPrefixProvider* dpp_i
   for (const auto& kv : s->cio->get_env().get_map()) {
     std::string key = kv.first;
     // HTTP headers are uppercased and have hyphens replaced with underscores.
-    if (ba::starts_with(key, "HTTP_X_AMZ_")) {
-      key = key.substr(5);
-      ba::replace_all(key, "_", "-");
-      ba::to_lower(key);
-      http_headers_.emplace(key, kv.second);
-    }
+    key = key.substr(5);
+    ba::replace_all(key, "_", "-");
+    ba::to_lower(key);
+    http_headers_.emplace(key, kv.second);
   }
 
   // This is the path element of the URI, up to the '?'.
@@ -1501,12 +1499,10 @@ std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(con
     for (const auto& kv : s->cio->get_env().get_map()) {
       std::string key = kv.first;
       // HTTP headers are uppercased and have hyphens replaced with underscores.
-      if (ba::starts_with(key, "HTTP_X_AMZ_")) {
-        key = key.substr(5);
-        ba::replace_all(key, "_", "-");
-        ba::to_lower(key);
-        awz_headers->emplace(key, kv.second);
-      }
+      key = key.substr(5);
+      ba::replace_all(key, "_", "-");
+      ba::to_lower(key);
+      awz_headers->emplace(key, kv.second);
     }
 
     // Load the IAM environment into the request.
