@@ -1426,12 +1426,23 @@ std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(con
     ldpp_dout(dpp, 0) << "{}: ERROR: req_state->trans_id cannot be empty" << dendl;
     return std::nullopt;
   }
-  std::string trans_id = s->trans_id;
+  // The nomenclature is a bit confusing in req_state. We have req_id and
+  // trans_id. req_id is from (SAL)driver->zone_unique_id, and s->trans_id is
+  // from (SAL)driver->zone_unique_trans_id. The latter appears specific to
+  // SWIFT, which we don't care about. Use the req_id, because that appears in
+  // almost all log messages whereas the trans_id only appears once.
+  //
+  // The confusion is worsened by the fact that I (André) initially chose to
+  // use the trans_id, so the HandoffAuthzState object uses that name. Ideally
+  // it would use req_id as well, but it's a big API change for a relatively
+  // small benefit.
+  //
+  std::string req_id = s->req_id;
   auto& suffix = s->handoff_authz->trans_id_suffix();
   if (suffix) {
-    trans_id += "-" + *suffix;
+    req_id += "-" + *suffix;
   }
-  ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("{}: trans_id={}"), __func__, trans_id) << dendl;
+  ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("{}: req_id={}"), __func__, req_id) << dendl;
 
   // If extra data are required, load them first. We can't mutate the
   // questions loaded into the request later.
@@ -1465,7 +1476,7 @@ std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(con
 
     // Different trans ID for each question.
     // XXX this needs be modifyable for e-d requests.
-    common->set_authorization_id(fmt::format(FMT_STRING("{}-{}-{}"), trans_id, n, subrequest_index));
+    common->set_authorization_id(fmt::format(FMT_STRING("{}-{}-{}"), req_id, n, subrequest_index));
     SetAuthorizationCommonTimestamp(common);
     question->set_opcode(*opcode);
 

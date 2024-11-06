@@ -1472,6 +1472,28 @@ TEST_F(HandoffHelperImplSubsysTest, TestReturnCodeMapping)
   EXPECT_EQ(res.code(), EACCES);
 }
 
+// Regression: Don't return an empty grpc::ChannelArguments().
+TEST(TestHandoffGRPCChannel, DefaultChannelArgsAreNotEmpty)
+{
+  HandoffGRPCChannel gc("foo");
+  grpc::ChannelArguments args = gc.get_default_channel_args(g_ceph_context);
+  grpc_channel_args ca = args.c_channel_args();
+  ASSERT_TRUE(ca.num_args > 0) << "Expected at least one argument";
+  std::unordered_map<std::string, int> int_args;
+  for (size_t n = 0; n < ca.num_args; n++) {
+    if (ca.args[n].type == GRPC_ARG_INTEGER) {
+      int_args[ca.args[n].key] = ca.args[n].value.integer;
+    }
+  }
+  // We expect at least three items to be set, there may be more depending on
+  // the return from grpc::ChannelArguments().
+  ASSERT_GE(int_args.size(), 3) << "Expected at least three integer arguments";
+  // These defaults may change, the test will have to be updated to match.
+  EXPECT_EQ(int_args["grpc.initial_reconnect_backoff_ms"], 1000);
+  EXPECT_EQ(int_args["grpc.min_reconnect_backoff_ms"], 20000);
+  EXPECT_EQ(int_args["grpc.max_reconnect_backoff_ms"], 120000);
+}
+
 /* #region authz-grpc */
 
 class TestAuthzImpl final : public authorizer::v1::AuthorizerService::Service {

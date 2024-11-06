@@ -43,7 +43,7 @@ grpc::ChannelArguments HandoffGRPCChannel::get_default_channel_args(CephContext*
       cct->_conf->rgw_handoff_grpc_arg_max_reconnect_backoff_ms)
                  << dendl;
 
-  return grpc::ChannelArguments();
+  return args;
 }
 
 void HandoffGRPCChannel::set_channel_args(CephContext* const cct, grpc::ChannelArguments& args)
