@@ -6245,12 +6245,13 @@ std::shared_ptr<rgw::HandoffHelper> rgw::auth::s3::g_handoff_helper;
 
 void rgw::auth::s3::HandoffEngine::init(CephContext* const cct, rgw::sal::Driver* store)
 {
+  static std::string plugin_name = "Akamai Handoff Authentication and Authorization";
   // init() can be called more than once. Only log our present-but-disabled
   // state exactly once.
   static std::once_flag logged_presence;
   if (!cct->_conf->rgw_s3_auth_use_handoff) {
     std::call_once(logged_presence, [&]() {
-      ldout(cct, 1) << "Akamai Handoff Authentication present but disabled" << dendl;
+      ldout(cct, 1) << plugin_name << " present but disabled" << dendl;
     });
     return;
   }
@@ -6259,7 +6260,7 @@ void rgw::auth::s3::HandoffEngine::init(CephContext* const cct, rgw::sal::Driver
   // once, and only set the g_handoff_helper shared_ptr once.
   static std::once_flag hhinit;
   std::call_once(hhinit, [&]() {
-    ldout(cct, 1) << "Akamai Handoff Authentication present and enabled" << dendl;
+    ldout(cct, 1) << plugin_name << " present and enabled" << dendl;
     handoff_helper_ = std::make_shared<rgw::HandoffHelper>();
     handoff_helper_->init(cct, store);
     // Set a globally-accessible shared_ptr to the one true HandoffHelper.

@@ -84,14 +84,42 @@ HandoffAuthResult HandoffHelper::anonymous_authorize(const DoutPrefixProvider* d
   return impl_->anonymous_authorize(dpp, s, y);
 };
 
+int HandoffHelper::verify_permission(const RGWOp* op, req_state* s, uint64_t operation, optional_yield y)
+{
+  return impl_->verify_permission(op, s, operation, y);
+};
+
+std::vector<int> HandoffHelper::verify_permissions(const RGWOp* op, req_state* s, std::vector<uint64_t>& operations, optional_yield y)
+{
+  return impl_->verify_permissions(op, s, operations, y);
+};
+
 bool HandoffHelper::anonymous_authorization_enabled() const
 {
   return impl_->anonymous_authorization_enabled();
 };
 
-bool HandoffHelper::local_authorization_bypass_allowed(
-    const req_state *s) const {
-  return impl_->local_authorization_bypass_allowed(s);
+bool HandoffHelper::disable_local_authorization() const
+{
+  return impl_->disable_local_authorization();
+}
+
+bool HandoffHelper::reject_filtered_commands() const
+{
+  return impl_->reject_filtered_commands();
+}
+
+bool HandoffHelper::allow_native_copy_object() const
+{
+  return impl_->allow_native_copy_object();
+}
+
+HandoffAuthzState::HandoffAuthzState(std::shared_ptr<HandoffHelper> helper)
+{
+  // helper may be nullptr, you MUST check before dereferencing!
+  if (helper) {
+    enabled_ = helper->disable_local_authorization();
+  }
 }
 
 } /* namespace rgw */

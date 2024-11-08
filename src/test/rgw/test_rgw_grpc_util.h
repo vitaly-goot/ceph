@@ -43,6 +43,8 @@ protected:
   std::string address_;
   std::unique_ptr<grpc::Server> server_;
 
+  std::shared_ptr<T> service_instance_;
+
 public:
   /**
    * @brief Construct a new GRPCTestServer object. Don't start the server,
@@ -92,10 +94,11 @@ public:
     }
     initialising = true;
     server_thread_ = std::thread([this]() {
-      T service;
+      // T service;
+      service_instance_ = std::make_shared<T>();
       grpc::ServerBuilder builder;
       builder.AddListeningPort(address(), grpc::InsecureServerCredentials());
-      builder.RegisterService(&service);
+      builder.RegisterService(service_instance_.get());
       server_ = builder.BuildAndStart();
       if (!server_) {
         fmt::print(stderr, "Failed to BuildAndStart() for {}\n", address());
@@ -128,6 +131,23 @@ public:
     if (server_thread_.joinable()) {
       server_thread_.join();
     }
+    service_instance_.reset();
+  }
+
+  /**
+   * @brief Get a shared pointer to the service instance. This makes it easy
+   * to call methods on your service class.
+   *
+   * Throws a runtime_error if the server is not running.
+   *
+   * @return std::shared_ptr<T> pointer to the running service instance.
+   */
+  std::shared_ptr<T> instance()
+  {
+    if (!running) {
+      throw new std::runtime_error("no running service instance");
+    }
+    return service_instance_;
   }
 
   static constexpr uint16_t port_base = 58000;

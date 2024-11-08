@@ -218,6 +218,24 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
     }
   }
 
+  if (s->handoff_authz->enabled()) {
+    // Copy some state from the request into handoff authz state. This makes
+    // handoff authz a lot easier to test, because we don't have to mock
+    // rgw::sal::Bucket and rgw::sal::Object just to get their names.
+    if (s->bucket_name != "") {
+      // This is set without a bucket object in RGWCreateBucket.
+      s->handoff_authz->set_bucket_name(s->bucket_name);
+    } else if (s->bucket) {
+      // I don't know why we'd not set the name when creating the bucket
+      // object, but let's be safe.
+      s->handoff_authz->set_bucket_name(s->bucket->get_name());
+    }
+    if (s->object) {
+      // There's no equivalent 'object_name' field, alas.
+      s->handoff_authz->set_object_key_name(s->object->get_name());
+    }
+  }
+
   ldpp_dout(op, 2) << "verifying op permissions" << dendl;
   {
     auto span = tracing::rgw::tracer.add_span("verify_permission", s->trace);
@@ -299,6 +317,9 @@ int process_request(const RGWProcessEnv& penv,
   s->host_id = driver->get_host_id();
   s->yield = yield;
   s->handoff_helper = penv.handoff_helper; // May be empty.
+  // Initialise authz state, using a pointer to the (possibly empty)
+  // HandoffHelper object.
+  s->handoff_authz = std::make_unique<::rgw::HandoffAuthzState>(s->handoff_helper);
 
   ldpp_dout(s, 2) << "initializing for trans_id = " << s->trans_id << dendl;
 

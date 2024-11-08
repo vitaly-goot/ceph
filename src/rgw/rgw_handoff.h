@@ -20,9 +20,13 @@
 
 #pragma once
 
+#include <cstdint>
 #include <fmt/format.h>
 #include <iosfwd>
+#include <stack>
 #include <string>
+
+#include <boost/container/flat_map.hpp>
 
 #include "common/async/yield_context.h"
 #include "common/dout.h"
@@ -225,6 +229,55 @@ public:
       optional_yield y);
 
   /**
+   * @brief Authorize the operation via the external Authorizer.
+   *
+   * Call out to the external Authorizer to verify the operation, using a
+   * combination of the req_state, our saved authorization state (if any), and
+   * the operation code (e.g. rgw::IAM::GetObject).
+   *
+   * Frustratingly, \p s is contained in \op, but it's a protected member so
+   * we provide it explicitly.
+   *
+   * \p s is non-const because we might have to modify it, e.g. by loading
+   * bucket or object tags that live in the environment, or by setting
+   * additional authz state.
+   *
+   * The single-operation version calls verify_permissions() and
+   * returns the first (and only) result of that call.
+   *
+   * @param op The RGWOp-subclass object pointer.
+   * @param s The req_state object.
+   * @param operation The operation code.
+   * @param y optional yield.
+   * @return int return code. 0 for success, <0 for error, typically -EACCES.
+   */
+  int verify_permission(const RGWOp* op, req_state* s,
+      uint64_t operation, optional_yield y);
+
+  /**
+   * @brief Authorize multiple operations via the external Authorizer.
+   *
+   * Call out to the external Authorizer to verify the operations, using a
+   * combination of the req_state, our saved authorization state (if any), and
+   * the operation code (e.g. rgw::IAM::GetObject).
+   *
+   * Frustratingly, \p s is contained in \op, but it's a protected member so
+   * we provide it explicitly.
+   *
+   * \p s is non-const because we might have to modify it, e.g. by loading
+   * bucket or object tags that live in the environment, or by setting
+   * additional authz state.
+   *
+   *
+   * @param op The RGWOp-subclass object pointer.
+   * @param s The req_state object.
+   * @param operations A vector of operation codes.
+   * @param y optional yield.
+   * @return std::vector<int> A vector of return codes, one for each operation.
+   */
+  std::vector<int> verify_permissions(const RGWOp* op, req_state* s, std::vector<uint64_t>& operations, optional_yield y);
+
+  /**
    * @brief Return true if anonymous authorization is enabled, false otherwise.
    *
    * @return true Anonymous authorization is enabled.
@@ -244,6 +297,449 @@ public:
    * @return false Local authorization MUST NOT be bypassed.
    */
   bool local_authorization_bypass_allowed(const req_state *s) const;
+
+  /**
+   * @brief Return true if Handoff is configured to disable *all* local
+   * authorization checks in favour of external authorization.
+   *
+   * This is intended for use in subordinate functions of process_request() -
+   * mostly rgw_process_authenticated() - to determine whether or not we
+   * should attempt local authorization.
+   *
+   * @return true Local authorization is disabled.
+   * @return false Local authorization is enabled and should not be bypassed.
+   */
+  bool disable_local_authorization() const;
+
+  /**
+   * @brief Return true if Handoff Authz is configured to reject commands that
+   * should be filtered out by the microservices platform.
+   *
+   * @return true S3 commands that should be filtered out should be rejected
+   * and an error logged.
+   * @return false RGW should attempt to authorize all commands.
+   */
+  bool reject_filtered_commands() const;
+
+  /**
+   * @brief Return true if Handoff is configured to allow native copy-object.
+   *
+   * @return true copy-object should be processed normally.
+   * @return false copy-object should be rejected with INVALID REQUEST.
+   */
+  bool allow_native_copy_object() const;
 };
+
+/**
+ * @brief Per-request state information for the Handoff authorization client.
+ *
+ * Try not to couple this too hard with the HandoffHelper. The moment you put
+ * a std::shared_ptr<HandoffHelper> in here, it makes things much harder to
+ * test. This should just be a carrier for authorization state.
+ *
+ * The most basic state it carries is whether or not Handoff Authorization is
+ * even enabled. As a method on an object that always exists, it makes the
+ * test for authz much easier to read:
+ *
+ * ```
+ *  if (s->handoff_authz().enabled()) {
+ *      ...
+ *   } else {
+ *     ...
+ *   }
+ * ```
+ *
+ * It has a constructor with a HandoffHelper pointer simply so it can call
+ * methods on the helper to initialise itself. Other constructors will server
+ * for unit tests.
+ *
+ * It also has a pair of stacks, one for the 'target' of the request (bucket
+ * and object key names), and one for the extra data requirements of the
+ * request. These are unlikely to be used for all but the most complex of
+ * requests. They're intended to be used in the rare cases where a request has
+ * to perform multiple authorizations (more sophisticated than simply asking
+ * for authorization of multiple operations in a single RPC), and where not
+ * all of those authorizations involve the same target and/or extra data
+ * requirements settings.
+ *
+ * When issuing multiple calls to verify_permission()/verify_permissions() per
+ * S3 request, you MUST call set_trans_id_suffix() and set a different value
+ * each time. It may help the SREs to set the suffix to something helpful,
+ * e.g. 'source' for the copy source. This will, as the name suggests, be
+ * appended to the RGW transaction ID when constructing the authorization ID
+ * field that goes into each RPC question.
+ */
+class HandoffAuthzState {
+
+public:
+  /**
+   * @brief Container for the 'target' of a request, i.e. the bucket and
+   * object key name.
+   *
+   * Bundling the target this way makes it easy to have a stack of targets,
+   * for operations (e.g. copy-object) that have to send multiple
+   * AuthorizeV2() requests involving differing buckets and/or object keys.
+   */
+  struct Target {
+    std::string bucket_name;
+    std::string object_key_name;
+
+    Target() = default;
+    Target(const std::string& bucket_name, const std::string& object_key_name)
+        : bucket_name(bucket_name)
+        , object_key_name(object_key_name)
+    {
+    }
+  }; // struct HandoffAuthzState::Target
+
+  /**
+   * @brief Container for the extra data requirements of a request.
+   *
+   * For a single extra data requirement this seems like overkill, but let's
+   * not assume this is the only one we'll ever have.
+   *
+   * Bundling the requirements this way makes it easy to have a stack of
+   * requirements.
+   */
+  struct Requirements {
+    bool object_tags_required = false;
+  }; // struct HandoffAuthzState::Requirements
+
+private:
+  bool enabled_ = false;
+  std::optional<std::string> trans_id_suffix_;
+
+  Target target_;
+  std::stack<Target> saved_targets_;
+
+  struct AuthenticatorParameters {
+    std::string canonical_user_id_;
+    std::string user_arn_;
+    std::optional<std::string> assuming_user_arn_;
+    std::string account_arn_;
+    std::optional<std::string> role_arn_;
+  }; // struct AuthenticatorParameters
+
+  mutable AuthenticatorParameters authenticator_params_;
+
+  Requirements requirements_;
+  std::stack<Requirements> saved_requirements_;
+
+public:
+  HandoffAuthzState() = delete;
+  /// Construct explicitly (for tests).
+  explicit HandoffAuthzState(bool enabled)
+      : enabled_(enabled)
+  {
+  }
+
+  /**
+   * @brief Construct a new Handoff Authz State object using a HandoffHelper.
+   *
+   * Construct using an existing HandoffHelper. This keeps Handoff-specific
+   * initialisation code out of rgw_process.cc.
+   *
+   * @param helper a pointer to the shared HandoffHelper object. May be nullptr!
+   */
+  explicit HandoffAuthzState(std::shared_ptr<HandoffHelper> helper);
+
+  /// Return true if Handoff Authorization is enabled.
+
+  /**
+   * @brief Return true if Handoff Authorization is enabled.
+   *
+   * Note that disabled() is present too, and is just the negation of this
+   * method. Having both means one can write the 'if' test that reads most
+   * clearly.
+   *
+   * @return true Handoff Authorization is enabled.
+   * @return false Handoff Authorization is disabled.
+   */
+  bool enabled() const noexcept { return enabled_; }
+
+  /**
+   * @brief Return true if Handoff Authorization is disabled.
+   *
+   * Just the negation of enabled() - having both means one can write the 'if'
+   * test that reads most clearly.
+   *
+   * @return true Handoff Authorization is disabled.
+   * @return false Handoff Authorization is enabled.
+   */
+  bool disabled() const noexcept { return !enabled_; }
+
+  /**
+   * @brief Return the transaction ID suffix, which may be nullopt.
+   *
+   * @return std::optional<std::string> The transaction ID suffix, or
+   * std::nullopt.
+   */
+  const std::optional<std::string>& trans_id_suffix() const { return trans_id_suffix_; }
+
+  void set_trans_id_suffix(const std::string& suffix)
+  {
+    trans_id_suffix_ = suffix;
+  }
+
+  void clear_trans_id_suffix()
+  {
+    trans_id_suffix_ = std::nullopt;
+  }
+
+  /**
+   * @brief Return the bucket name.
+   *
+   * @return std::string The bucket name.
+   */
+  std::string bucket_name() const noexcept { return target_.bucket_name; }
+
+  /**
+   * @brief Set the bucket name.
+   *
+   * This lives in the HandoffAuthzState object in order to make the
+   * authorization code easier to test. Without a 'safe' place for the bucket
+   * name to be stored, we'd have to pass a req_state around with enough
+   * support to fetch the object key name. That either means parsing URL
+   * fields (which assumes that's even safe to do), or actually loading the
+   * bucket which is completely impractical - the bucket is an
+   * rgw::sal::Bucket instance, with a million pure virtual methods.
+   *
+   * So we just copy the string into the state object. Easy to do, easy to
+   * test.
+   *
+   * @param name The bucket name.
+   */
+  void set_bucket_name(const std::string& name) noexcept { target_.bucket_name = name; }
+
+  /**
+   * @brief Return the object key name.
+   *
+   * This lives in the HandoffAuthzState object in order to make the
+   * authorization code easier to test. Without a 'safe' place for the object
+   * key name to be stored, we'd have to pass a req_state around with enough
+   * support to fetch the object key name. That either means parsing URL
+   * fields (which assumes that's even safe to do), or actually loading the
+   * object which is completely impractical - the object key is an
+   * rgw::sal::Object instance, with a million pure virtual methods.
+   *
+   * So we just copy the string into the state object. Easy to do, easy to
+   * test.
+   *
+   * @return std::string The object key name.
+   */
+  std::string object_key_name() const noexcept { return target_.object_key_name; }
+
+  /**
+   * @brief Set the object key name.
+   *
+   * @param name The object key name.
+   */
+  void set_object_key_name(const std::string& name) noexcept { target_.object_key_name = name; }
+
+  /**
+   * @brief Push the current Target onto the stack, setting the current Target
+   * to empty.
+   */
+  void push_target()
+  {
+    saved_targets_.push(target_);
+    target_ = Target(); // Clean (all-false) requirements.
+  }
+
+  /**
+   * @brief Push a new Target onto the stack, setting the current Target to
+   * the given values.
+   *
+   * @param bucket_name The new target bucket name.
+   * @param object_key_name The new target object key name.
+   */
+  void push_target(const std::string& bucket_name, const std::string& object_key_name)
+  {
+    saved_targets_.push(target_);
+    target_ = Target(bucket_name, object_key_name);
+  }
+
+  /**
+   * @brief Pop the top Target off the stack, setting the current Target to
+   * the popped value.
+   *
+   * Will assert if the stack is empty!
+   */
+  void pop_target()
+  {
+    ceph_assertf(!saved_targets_.empty(), "Attempt to pop empty Authz state target stack");
+    target_ = saved_targets_.top();
+    saved_targets_.pop();
+  }
+
+  /// @brief Return true if the target stack is empty.
+  bool target_stack_empty()
+  {
+    return saved_targets_.empty();
+  }
+
+  /**
+   * @brief Preserve ID-related fields returned by the Authenticator.
+   *
+   * These are the fields in the authenticator.v1.AuthenticateResponse
+   * message, which we'll replay to the Authorizer.
+   *
+   * We are doing some gymnastics here to deal with the fact that we'll
+   * normally be dealing with a pointer to a member field (HandoffAuthzState)
+   * of a const pointer to req_state, but we need to be able to modify the
+   * authorization state. So we're using mutable fields to allow this, and
+   * this method is marked const to allow it to be called. It sucks.
+   *
+   * @param canonical_user_id Corresponding field in AuthenticateResponse.
+   * @param user_arn Corresponding field in AuthenticateResponse.
+   * @param assuming_user_arn Corresponding field in AuthenticateResponse.
+   * @param account_arn Corresponding field in AuthenticateResponse.
+   * @param role_arn Corresponding field in AuthenticateResponse.
+   */
+  void set_authenticator_id_fields(const std::string& canonical_user_id,
+      const std::string& user_arn,
+      const std::optional<std::string>& assuming_user_arn,
+      const std::string& account_arn,
+      const std::optional<std::string>& role_arn) const noexcept
+  {
+    authenticator_params_.canonical_user_id_ = canonical_user_id;
+    authenticator_params_.user_arn_ = user_arn;
+    authenticator_params_.assuming_user_arn_ = assuming_user_arn;
+    authenticator_params_.account_arn_ = account_arn;
+    authenticator_params_.role_arn_ = role_arn;
+  }
+
+  /**
+   * @brief Return the canonical user ID.
+   *
+   * This is an Authenticator AuthenticateRESTResponse field that we reflect
+   * back to the Authorizer.
+   *
+   * @return std::string The canonical user ID.
+   */
+  std::string canonical_user_id() const noexcept { return authenticator_params_.canonical_user_id_; }
+
+  /**
+   * @brief Return the user ARN.
+   *
+   * This is an Authenticator AuthenticateRESTResponse field that we reflect
+   * back to the Authorizer.
+   *
+   * @return std::string The user ARN.
+   */
+  std::string user_arn() const noexcept { return authenticator_params_.user_arn_; }
+
+  /**
+   * @brief Return the assuming user ARN.
+   *
+   * This is an Authenticator AuthenticateRESTResponse field that we reflect
+   * back to the Authorizer.
+   *
+   * @return std::optional<std::string> The assuming user ARN.
+   */
+  std::optional<std::string> assuming_user_arn() const noexcept { return authenticator_params_.assuming_user_arn_; }
+
+  /**
+   * @brief Return the role ARN.
+   *
+   * This is another Authenticator AuthenticateRESTResponse field that we reflect
+   * back to the Authorizer.
+   *
+   * @return std::optional<std::string> The role ARN.
+   */
+  std::optional<std::string> role_arn() const noexcept { return authenticator_params_.role_arn_; }
+
+  /**
+   * @brief Return the account ARN.
+   *
+   * This is an Authenticator AuthenticateRESTResponse field that we reflect
+   * back to the Authorizer.
+   *
+   * @return std::string The account ARN.
+   */
+  std::string account_arn() const noexcept { return authenticator_params_.account_arn_; }
+
+  /**
+   * @brief Return true if *any* extra data field must be provided.
+   *
+   * This must be updated if more extra data fields are added in the future.
+   * It's how PopulateAuthorizeRequest() knows whether or not to include the
+   * extra_data_provided and extra_data fields.
+   *
+   * @return true One or more piece of extra data is required.
+   * @return false No extra data are required.
+   */
+  bool extra_data_required() const noexcept
+  {
+    return requirements_.object_tags_required;
+  }
+
+  /**
+   * @brief Return true if object tags are required.
+   *
+   * @return true Object tags are required.
+   * @return false Object tags are not required.
+   */
+  bool object_tags_required() const noexcept { return requirements_.object_tags_required; }
+
+  /**
+   * @brief Set whether or not object tags are required.
+   *
+   * @param required true if object tags are required, false otherwise.
+   */
+  void set_object_tags_required(bool required) noexcept { requirements_.object_tags_required = required; }
+
+  /**
+   * @brief Push the current Requirements onto the stack, setting the
+   * new Requirements to empty.
+   */
+  void push_requirements()
+  {
+    saved_requirements_.push(requirements_);
+    requirements_ = Requirements(); // Clean (all-false) requirements.
+  }
+
+  /**
+   * @brief Pop the top Requirements off the stack, setting the current
+   * Requirements to the popped value.
+   *
+   * Will assert if the stack is empty!
+   */
+  void pop_requirements()
+  {
+    ceph_assertf(!saved_requirements_.empty(), "Attempt to pop empty Authz state requirements stack");
+    requirements_ = saved_requirements_.top();
+    saved_requirements_.pop();
+  }
+
+  /// @brief Return true if the requirements stack is empty.
+  bool requirements_stack_empty()
+  {
+    return saved_requirements_.empty();
+  }
+
+  /**
+   * @brief Push target and requirements state onto their stacks, setting the
+   * current states to empty values.
+   */
+  void push()
+  {
+    push_target();
+    push_requirements();
+  }
+
+  /**
+   * @brief Pop target and requirements state off their stacks, setting the
+   * current states to the popped values.
+   *
+   * Will assert if either stack is empty!
+   */
+  void pop()
+  {
+    pop_target();
+    pop_requirements();
+  }
+
+}; // class HandoffAuthzState
 
 } /* namespace rgw */

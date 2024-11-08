@@ -78,6 +78,7 @@ set(librgw_common_srcs
   rgw_es_query.cc
   rgw_formats.cc
   rgw_handoff.cc
+  rgw_handoff_grpcutil.cc
   rgw_handoff_impl.cc
   rgw_http_client.cc
   rgw_keystone.cc
@@ -344,6 +345,7 @@ if(WITH_RADOSGW_GRPC)
   # EDIT THIS to specify .proto source files. Omit the '.proto' suffix!
   set(grpc_source
     authenticator/v1/authenticator
+    authorizer/v1/authorizer
 
     # These are 'standard' protobufs for the 'Richer error model'
     # (https://grpc.io/docs/guides/error/). They're not installed anywhere by

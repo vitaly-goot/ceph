@@ -31,6 +31,10 @@
 #include "rgw_bucket_sync.h"
 #include "rgw_sync_policy.h"
 
+// We need the non-fwd declarations of HandoffAuthzState for the req_state
+// constructor implementation.
+#include "rgw_handoff.h"
+
 #include "services/svc_zone.h"
 
 #include <sstream>

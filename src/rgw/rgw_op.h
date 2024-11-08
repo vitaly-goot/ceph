@@ -2074,6 +2074,11 @@ protected:
   bool bypass_perm;
   bool bypass_governance_mode;
 
+  // In Handoff Authz we'll send one authz request per item. Rather than
+  // change the signature of handle_individual_object(), just keep count and
+  // use the counter to mutate the transaction ID.
+  uint64_t handoff_item_count = 0;
+
 public:
   RGWDeleteMultiObj() {
     quiet = false;

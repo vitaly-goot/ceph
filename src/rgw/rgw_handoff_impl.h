@@ -24,6 +24,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "google/rpc/status.pb.h"
 #include <fmt/format.h>
 #include <grpc/grpc.h>
 #include <grpcpp/channel.h>
@@ -40,7 +41,12 @@
 #include "authenticator/v1/authenticator.pb.h"
 using namespace ::authenticator::v1;
 
+#include "authorizer/v1/authorizer.grpc.pb.h"
+#include "authorizer/v1/authorizer.pb.h"
+using namespace ::authorizer::v1;
+
 #include "rgw_handoff.h"
+#include "rgw_handoff_grpcutil.h"
 
 namespace rgw {
 
@@ -90,10 +96,11 @@ class HandoffDoutStateProvider : public HandoffDoutPrefixPipe {
 
 public:
   /**
-   * @brief Construct a new Handoff Dout Pipe Provider object with an existing
-   * provider and the request state.
+   * @brief Construct a new Log provider object with an existing provider and
+   * the request state.
    *
-   * Use our HandoffDoutPrefixPipe implementation for implementation.
+   * Use our HandoffDoutPrefixPipe implementation for implementation. Add a
+   * standard prefix 'HandoffEngine'.
    *
    * @param dpp An existing DoutPrefixProvider reference.
    * @param s The request state.
@@ -102,12 +109,27 @@ public:
       : HandoffDoutPrefixPipe {
         dpp, fmt::format(FMT_STRING("HandoffEngine trans_id={}"), s->trans_id)
       } {};
+
+  /**
+   * @brief Construct a new Log provider object with an existing provider, a
+   * string prefix, and the request state.
+   *
+   * Use our HandoffDoutPrefixPipe implementation for implementation.
+   *
+   * @param dpp An existing DoutPrefixProvider reference.
+   * @param prefix A string prefix for the log message.
+   * @param s The request state.
+   */
+  HandoffDoutStateProvider(const DoutPrefixProvider& dpp, const std::string prefix, const req_state* s)
+      : HandoffDoutPrefixPipe {
+        dpp, fmt::format(FMT_STRING("{} trans_id={}"), prefix, s->trans_id)
+      } {};
 };
 
 /****************************************************************************/
 
 /**
- * @brief gRPC client wrapper for rgw/auth/v1/AuthService.
+ * @brief gRPC client wrapper for authenticator/v1/AuthenticatorService.
  *
  * Very thin wrapper around the gRPC client. Construct with a channel to
  * create a stub. Call services via the corresponding methods, with sanitised
@@ -226,6 +248,13 @@ public:
    * original_user_id field of the response message, as we have no current use
    * for it.
    *
+   * If authz_state is non-null, a successful authentication will populate
+   * authorization-related fields using
+   * authz_state->set_authenticator_id_fields(). This method can punch through
+   * the fact that authz_state is a const pointer. This is not ideal, but is
+   * necessary because the internal API calls authenticate() with a const
+   * req_state*, and that's where our authz_state is stored.
+   *
    * On error, parse the result for an S3ErrorDetails message embedded in the
    * details field. (Richer error model.) If we find one, return the error
    * message and embed the contained HTTP status code. It's up to the caller
@@ -246,9 +275,11 @@ public:
    *
    * @param req the filled-in authentication request protobuf
    * (rgw::auth::v1::AuthRequest).
+   * @param authz_state The authorization state, if available. On success,
+   * this _will_ be modified, even though it's a const pointer (see method docs).
    * @return HandoffAuthResult A completed auth result.
    */
-  HandoffAuthResult Auth(const AuthenticateRESTRequest& req);
+  HandoffAuthResult Auth(const AuthenticateRESTRequest& req, const HandoffAuthzState* authz_state = nullptr);
 
   /**
    * @brief Map an Authenticator gRPC error code onto an error code that RGW
@@ -456,9 +487,9 @@ enum class AuthParamMode {
  *
  * As of 20231127, T must implement (with the same signature as
  * HandoffHelperImpl):
- *   - get_default_channel_args()
- *   - set_channel_args()
- *   - set_channel_uri()
+ *   - get_authn_channel()  (returned type needs to implement
+ *       HandoffGRPCChannel's interface, doesn't need to return exactly
+ *       HandoffGRPCChannel&))
  *   - set_signature_v2()
  *   - set_authorization_mode()
  *   - set_chunked_upload_mode()
@@ -525,9 +556,12 @@ public:
 
   const char** get_tracked_conf_keys() const
   {
+    // Note that these are keys that support runtime alteration. Keys that are
+    // set at startup time only do not need to appear here.
     static const char* keys[] = {
       "rgw_handoff_authparam_always",
       "rgw_handoff_authparam_withtoken",
+      "rgw_handoff_authz_grpc_uri",
       "rgw_handoff_enable_anonymous_authorization",
       "rgw_handoff_enable_chunked_upload",
       "rgw_handoff_enable_signature_v2",
@@ -545,12 +579,16 @@ public:
   {
     // You should bundle any gRPC arguments changes into this first block.
     if (changed.count("rgw_handoff_grpc_arg_initial_reconnect_backoff_ms") || changed.count("rgw_handoff_grpc_arg_max_reconnect_backoff_ms") || changed.count("rgw_handoff_grpc_arg_min_reconnect_backoff_ms")) {
-      auto args = helper_.get_default_channel_args(cct_);
-      helper_.set_channel_args(cct_, args);
+      auto args = helper_.get_authn_channel().get_default_channel_args(cct_);
+      helper_.get_authn_channel().set_channel_args(cct_, args);
+      helper_.get_authz_channel().set_channel_args(cct_, args);
     }
     // The gRPC channel change needs to come after the arguments setting, if any.
     if (changed.count("rgw_handoff_grpc_uri")) {
-      helper_.set_channel_uri(cct_, conf->rgw_handoff_grpc_uri);
+      helper_.get_authn_channel().set_channel_uri(cct_, conf->rgw_handoff_grpc_uri);
+    }
+    if (changed.count("rgw_handoff_authz_grpc_uri")) {
+      helper_.get_authz_channel().set_channel_uri(cct_, conf->rgw_handoff_authz_grpc_uri);
     }
     if (changed.count("rgw_handoff_enable_anonymous_authorization")) {
       helper_.set_anonymous_authorization(cct_, conf->rgw_handoff_enable_anonymous_authorization);
@@ -571,6 +609,246 @@ private:
   CephContext* cct_ = nullptr;
   bool observer_added_ = false;
 };
+
+/****************************************************************************/
+
+/**
+ * @brief Wrapper for gRPC calls to the Authorizer service.
+ *
+ * Attempt to make calls to the Authorizer service easier to test, by
+ * encapsulating the actual calls and error handling.
+ */
+class AuthorizerClient {
+private:
+  std::unique_ptr<AuthorizerService::Stub> stub_;
+
+public:
+  /**
+   * @brief Construct a new Authorizer Client object. You must use set_stub
+   * before using any gRPC calls, or the object's behaviour is undefined.
+   */
+  AuthorizerClient() { }
+
+  /**
+   * @brief Construct a new Authorizer Client object and initialise the gRPC
+   * stub.
+   *
+   * @param channel pointer to the grpc::Channel object to be used.
+   */
+  explicit AuthorizerClient(std::shared_ptr<::grpc::Channel> channel)
+      : stub_(AuthorizerService::NewStub(channel))
+  {
+  }
+
+  // Copy constructors can't work with the stub unique_ptr.
+  AuthorizerClient(const AuthorizerClient&) = delete;
+  AuthorizerClient& operator=(const AuthorizerClient&) = delete;
+
+  // Moves are fine.
+  AuthorizerClient(AuthorizerClient&&) = default;
+  AuthorizerClient& operator=(AuthorizerClient&&) = default;
+
+  /**
+   * @brief Set the gRPC stub for this object.
+   *
+   * @param channel the gRPC channel pointer.
+   */
+  void set_stub(std::shared_ptr<::grpc::Channel> channel)
+  {
+    stub_ = AuthorizerService::NewStub(channel);
+  }
+
+  /**
+   * @brief Call the Authorizer Ping() endpoint.
+   *
+   * @param id The authorization_id field to be echoed back.
+   * @return true The call succeeded and the ID was echoed back properly.
+   * @return false The call failed for some reason.
+   */
+  bool Ping(const std::string& id);
+
+  /**
+   * @brief Collection of results from the Authorizer Authorize() RPC endpoint.
+   *
+   * There are a a lot of potential results from an Authorize() call. In the
+   * successful RPC case we want to inspect the response protobuf message. In
+   * failure cases, we want at the grpc::Status.
+   *
+   * Rather than use a tuple response, bit the bullet and encapsulate the lot.
+   * That way we can standardise display code and error handling.
+   */
+  class AuthorizeResult {
+    bool success_;
+    bool has_request_ = false;
+    AuthorizeV2Request request_;
+    bool has_response_ = false;
+    AuthorizeV2Response response_;
+    bool has_status_ = false;
+    ::grpc::Status status_;
+    bool has_message_ = false;
+    std::string message_;
+
+  public:
+    /**
+     * @brief Construct a new Authorize Result object, saving the success
+     * (taking into account the answers in the response) and moving the
+     * response itself.
+     *
+     * @param success Whether or not the response indicates that all questions
+     * received an ALLOW response.
+     * @param response The AuthorizeV2Response message. This will be moved;
+     * the original response value will become useless.
+     */
+    AuthorizeResult(bool success, AuthorizeV2Response& response)
+        : success_ { success }
+        , has_response_ { true }
+        , response_ { std::move(response) }
+    {
+    }
+
+    /**
+     * @brief Construct a new Authorize Result object, saving the success
+     * (taking into account the answers in the response) and moving the
+     * request and response into this object.
+     *
+     * @param success Whether or not the response indicates that all questions
+     * received an ALLOW response.
+     * @param request The AuthorizeV2Request message. This will be moved; the
+     * original request value will become useless.
+     * @param response The AuthorizeV2Response message. This will be moved;
+     * the original response value will become useless.
+     */
+    AuthorizeResult(bool success, AuthorizeV2Request& request, AuthorizeV2Response& response)
+        : success_ { success }
+        , has_request_ { true }
+        , request_ { std::move(request) }
+        , has_response_ { true }
+        , response_ { std::move(response) }
+    {
+    }
+
+    /**
+     * @brief Construct a new failure-type Authorize Result object, moving the
+     * request and response objects into this object, and saving the provided
+     * error message.
+     *
+     * @param request Will be moved into this object.
+     * @param response Will be moved into this object.
+     * @param message The error message.
+     */
+    AuthorizeResult(AuthorizeV2Request& request, AuthorizeV2Response& response, const std::string& message)
+        : success_(false)
+        , has_request_(true)
+        , request_(std::move(request))
+        , has_response_(true)
+        , response_(std::move(response))
+        , has_message_(true)
+        , message_(message)
+    {
+    }
+
+    /**
+     * @brief Construct a failure-type Authorize Result object, saving the
+     * gRPC status code.
+     *
+     * @param status the ::grpc::Status response from the RPC call.
+     */
+    explicit AuthorizeResult(const ::grpc::Status& status)
+        : success_(false)
+        , has_status_(true)
+        , status_(status)
+    {
+    }
+
+    /**
+     * @brief Construct a failure-type Authorize Result object, saving the
+     * error message given by the caller.
+     *
+     * @param message The error message.
+     */
+    explicit AuthorizeResult(const std::string& message)
+        : success_(false)
+        , has_message_(true)
+        , message_(message)
+    {
+    }
+
+    AuthorizeResult(const AuthorizeResult&) = delete;
+    AuthorizeResult& operator=(const AuthorizeResult&) = delete;
+    AuthorizeResult(AuthorizeResult&&) = default;
+    AuthorizeResult& operator=(AuthorizeResult&&) = default;
+
+    /**
+     * @brief Return true iff the call has been made and the call succeeded
+     * with a success (ALLOW) result.
+     *
+     * @return true The call has been made and the call returned ALLOW status.
+     * @return false The call has not been made, or the call failed, or the
+     * call did not return ALLOW status.
+     */
+    bool ok() const noexcept { return success_; }
+    /**
+     * @brief Return true if the call has not yet been made, or if the call
+     * did not succeed with a success (ALLOW) result.
+     *
+     * @return true The call has not been made, or the call failed, or the
+     * call did not return ALLOW status.
+     * @return false The call has been made and the call returned ALLOW status.
+     */
+    bool err() const noexcept { return !ok(); }
+
+    /**
+     * @brief Utility function to determine if the call failed due to an extra
+     * data requirement.
+     *
+     * If there's no saved response, or the gRPC call returned failure, this
+     * will simply return false. It will only return true if one or more of
+     * the answers in a response contained AUTHZ_STATUS_EXTRA_DATA_REQUIRED.
+     *
+     * @return true if any answer in the response required extra data.
+     */
+    bool is_extra_data_required() const;
+
+    /// @brief Return true if the call has a request.
+    bool has_request() const noexcept { return has_request_; }
+    /// @brief Return true if the call has a response.
+    bool has_response() const noexcept { return has_response_; }
+    /// @brief Return true if the call has a status.
+    bool has_status() const noexcept { return has_status_; }
+    /// @brief Return true if the call has an error message.
+    bool has_message() const noexcept { return has_message_; }
+
+    /// @brief Return a reference to the AuthorizeRequest message that was
+    /// sent to the server, if any.
+    const AuthorizeV2Request& request() const noexcept { return request_; }
+    /// @brief Return a reference to the AuthorizeResponse message resulting
+    /// from the RPC call, if any.
+    const AuthorizeV2Response& response() const noexcept { return response_; }
+    /// @brief Return the gRPC status object from the RPC call, if any. Having
+    /// a status object means the call did not succeed.
+    const ::grpc::Status& status() const noexcept { return status_; }
+    /// @brief Return the error message, if any. Having an error message
+    /// means the call did not succeed.
+    std::string message() const noexcept { return message_; }
+
+    friend std::ostream& operator<<(std::ostream& os, const AuthorizerClient::AuthorizeResult& ep);
+  }; // class AuthorizerClient::AuthorizeResult
+
+  /**
+   * @brief Call the Authorizer Authorize() endpoint.
+   *
+   * Note that, if successful, this will *move* the request protobuf into the
+   * result!
+   *
+   * If the common.timestamp is set to 0, the client will fill in the current
+   * time as this is almost always the correct thing to do.
+   *
+   * @param req The AuthorizeRequest message.
+   * @return AuthorizeResponse the AuthorizeResponse message from the server.
+   */
+  AuthorizerClient::AuthorizeResult AuthorizeV2(AuthorizeV2Request& req);
+
+}; // class AuthorizerClient
 
 /****************************************************************************/
 
@@ -598,17 +876,19 @@ private:
   mutable std::shared_mutex m_config_;
   bool grpc_mode_ = true; // Not runtime-alterable.
   bool presigned_expiry_check_ = false; // Not runtime-alterable.
+  bool disable_local_authorization_ = false; // Not runtime-alterable.
+  bool reject_filtered_commands_ = true; // Not runtime-alterable.
+  bool allow_native_copy_object_ = true; // Not runtime-alterable.
+
   bool enable_anonymous_authorization_ = true; // Runtime-alterable.
   bool enable_signature_v2_ = true; // Runtime-alterable.
   bool enable_chunked_upload_ = true; // Runtime-alterable.
   AuthParamMode authorization_mode_ = AuthParamMode::ALWAYS; // Runtime-alterable.
 
-  // The gRPC channel pointer needs to be behind a mutex. Changing channel_,
-  // channel_args_ or channel_uri_ must be under a unique lock of m_channel_.
-  mutable std::shared_mutex m_channel_;
-  std::shared_ptr<grpc::Channel> channel_;
-  std::optional<grpc::ChannelArguments> channel_args_;
-  std::string channel_uri_;
+  // The gRPC channel for authentication.
+  HandoffGRPCChannel authn_channel_ { "handoff-authn" };
+  // The gRPC channel for authorization.
+  HandoffGRPCChannel authz_channel_ { "handoff-authz" };
 
 public:
   /**
@@ -630,6 +910,8 @@ public:
    * @param store Pointer to the sal::Store object.
    * @param grpc_uri Optional URI for the gRPC server. If empty (the default),
    * config value rgw_handoff_grpc_uri is used.
+   * @param grpc_authz_uri Optional URI for the gRPC authorization server. If
+   * empty (the default), config value rgw_handoff_authz_grpc_uri is used.
    * @return 0 on success, otherwise failure.
    *
    * Store long-lived state.
@@ -640,23 +922,30 @@ public:
    * later use. This will manage the persistent connection(s) for all gRPC
    * communications.
    */
-  int init(CephContext* const cct, rgw::sal::Driver* store, const std::string& grpc_uri = "");
+  int init(CephContext* const cct, rgw::sal::Driver* store, const std::string& grpc_uri = "", const std::string& authz_grpc_uri = "");
 
   /**
-   * @brief Set the gRPC channel URI.
+   * @brief Return a reference to the the authentication channel wrapper object.
    *
-   * This is used by init() and by the config observer. If no channel
-   * arguments have been set via set_channel_args(), this will set them to the
-   * default values (via get_default_channel_args).
+   * This object always exists. Note that the underlying gRPC channel may not
+   * be set (non-nullptr).
    *
-   * Do not call from auth() unless you _know_ you've not taken a lock on
-   * m_config_!
-   *
-   * @param grpc_uri
-   * @return true on success.
-   * @return false on failure.
+   * @return HandoffGRPCChannel& a reference to this HandoffHelperImpl's
+   * authentication channel wrapper.
    */
-  bool set_channel_uri(CephContext* const cct, const std::string& grpc_uri);
+  HandoffGRPCChannel& get_authn_channel() { return authn_channel_; }
+
+  /**
+   * @brief Return a reference to the the authorization channel wrapper
+   * object.
+   *
+   * This object always exists. Note that the underlying gRPC channel may not
+   * be set (non-nullptr).
+   *
+   * @return HandoffGRPCChannel& a reference to this HandoffHelperImpl's
+   * authorization channel wrapper.
+   */
+  HandoffGRPCChannel& get_authz_channel() { return authz_channel_; }
 
   /**
    * @brief Configure support for AWS signature v2.
@@ -715,14 +1004,56 @@ public:
   bool anonymous_authorization_enabled() const;
 
   /**
-   * @brief Return true if local authorization may be bypassed because we've
-   * already authorized the request.
+   * @brief Return true if Handoff is configured to disable *all* local
+   * authorization checks in favour of external authorization.
    *
-   * @param s The request.
-   * @return true Local authorization may be bypassed.
-   * @return false Local authorization MUST NOT be bypassed.
+   * This is intended for use in subordinate functions of process_request() -
+   * mostly rgw_process_authenticated() - to determine whether or not we
+   * should attempt local authorization.
+   *
+   * @return true Local authorization is disabled.
+   * @return false Local authorization is enabled and should not be bypassed.
    */
-  bool local_authorization_bypass_allowed(const req_state *s) const;
+  bool disable_local_authorization() const
+  {
+    // This is a simple bool set at init() time, there's no need for locking
+    // etc.
+    return disable_local_authorization_;
+  }
+
+  /**
+   * @brief Return true if Handoff Authz is configured to reject filtered
+   * commands.
+   *
+   * This is intended for use in operation verify_permission() overrides,
+   * where we can decide whether or not a command that we don't expect to see
+   * in the presence of the microservices environment should be rejected with
+   * a failure code, rather than attempting to authorize it.
+   *
+   * The aim here is to assist testing, by allowing tests to operate in the
+   * absence of the microservices environment.
+   *
+   * @return true Handoff Authz is configured to reject filtered commands.
+   * @return false Handoff Authz should attempt to authorize commands that
+   * would normally be filtered.
+   */
+  bool reject_filtered_commands() const
+  {
+    // This is a simple bool set at init() time, there's no need for locking
+    // etc.
+    return reject_filtered_commands_;
+  }
+
+  /**
+   * @brief Return true if Handoff is configured to allow native copy-object.
+   *
+   * @return true copy-object should be processed normally.
+   * @return false copy-object should be rejected with INVALID REQUEST.
+   */
+  bool allow_native_copy_object() const
+  {
+    return allow_native_copy_object_;
+  }
 
   /**
    * @brief Authenticate the transaction using the Handoff engine.
@@ -762,7 +1093,8 @@ public:
    *   the HTTP arm (_http_auth()) and return the result.
    *
    */
-  HandoffAuthResult auth(const DoutPrefixProvider* dpp,
+  HandoffAuthResult
+  auth(const DoutPrefixProvider* dpp,
       const std::string_view& session_token,
       const std::string_view& access_key_id,
       const std::string_view& string_to_sign,
@@ -857,40 +1189,6 @@ public:
                   const req_state *const s, optional_yield y);
 
   /**
-   * @brief Get our default grpc::ChannelArguments value.
-   *
-   * When calling set_channel_args(), you should first call this function to
-   * get application defaults, and then modify the settings you need.
-   *
-   * Currently the backoff timers are set here, based on configuration
-   * variables. These are runtime-alterable, but have sensible defaults.
-   *
-   * @return grpc::ChannelArguments A default set of channel arguments.
-   */
-  grpc::ChannelArguments get_default_channel_args(CephContext* const cct);
-
-  /**
-   * @brief Set custom gRPC channel arguments. Intended for testing.
-   *
-   * You should modify the default channel arguments obtained with
-   * get_default_channel_args(). Don't start from scratch.
-   *
-   * Keep this simple. If you set vtable args you'll need to worry about the
-   * lifetime of those is longer than the HandoffHelperImpl object that will
-   * store a copy of the ChannelArguments object.
-   *
-   * Do not call from auth() unless you _know_ you've not taken a lock on
-   * m_config_!
-   *
-   * @param args A populated grpc::ChannelArguments object.
-   */
-  void set_channel_args(CephContext* const cct, grpc::ChannelArguments& args)
-  {
-    std::unique_lock l { m_channel_ };
-    channel_args_ = std::make_optional(args);
-  }
-
-  /**
    * @brief Construct an Authorization header from the parsed query string
    * parameters.
    *
@@ -915,6 +1213,63 @@ public:
       const req_state* s);
 
   /**
+   * @brief Authorize the operation via the external Authorizer.
+   *
+   * Call out to the external Authorizer to verify the operation, using a
+   * combination of the req_state (in the \p s field of the \p op parameter),
+   * our saved authorization state (if any), and the operation code (e.g.
+   * rgw::IAM::GetObject).
+   *
+   * \p s is non-const because we might modify it by, say, loading bucket or
+   * object tags.
+   *
+   * This single-operation version calls verify_permissions() and
+   * returns the first (and only) result in the vector.
+   *
+   * @param op The RGWOp-subclass object pointer.
+   * @param s The req_state object.
+   * @param operation The operation code.
+   * @param y Optional yield.
+   * @return int Return code. 0 for success, <0 for error, typically -EACCES.
+   */
+  int verify_permission(const RGWOp* op, req_state* s,
+      uint64_t operation, optional_yield y);
+
+  /**
+   * @brief Authorize the operation via the external Authorizer.
+   *
+   * Call out to the external Authorizer to check each operation, using a
+   * combination of the req_state (in the \p s field of the \p op parameter),
+   * our saved authorization state (if any), and the operation code (e.g.
+   * rgw::IAM::GetObject).
+   *
+   * \p s is non-const because we might modify it by, say, loading bucket or
+   * object tags.
+   *
+   * @param op The RGWOp-subclass object pointer.
+   * @param s The req_state object.
+   * @param operations A vector of operation codes to check.
+   * @param y Optional yield.
+   * @return std::vector<int> A vector of return codes, one for each code in
+   * \p operations in order. 0 for success, <0 for error, typically -EACCES.
+   */
+  std::vector<int> verify_permissions(const RGWOp* op, req_state* s,
+      const std::vector<uint64_t>& operations, optional_yield y);
+
+  /**
+   * @brief Update in s->handoff_authz the set of required extra data as
+   * specified by the Authorizer.
+   *
+   * @param dpp The DoutPrefixProvider.
+   * @param extra_spec The ExtraDataSpecification to load.
+   * @param op The RGWOp object.
+   * @param s The req_state.
+   */
+  void verify_permission_update_authz_state(const DoutPrefixProvider* dpp,
+      const ExtraDataSpecification& extra_spec,
+      const RGWOp* op, const req_state* s);
+
+  /**
    * @brief Assuming an already-parsed (via synthesize_auth_header) presigned
    * header URL, check that the given expiry time has not expired. Note that
    * in v17.2.6, this won't get called - RGW checks the expiry time before
@@ -937,6 +1292,183 @@ public:
   bool valid_presigned_time(const DoutPrefixProvider* dpp, const req_state* s, time_t now);
 
 }; // class HandoffHelperImpl
+
+/****************************************************************************/
+
+/**
+ * @brief Set the Authorization Common Timestamp object to 'now'.
+ *
+ * @param common a mutable AuthorizationCommon object.
+ */
+void SetAuthorizationCommonTimestamp(::authorizer::v1::AuthorizationCommon* common);
+
+// The type we'll use to store object tags. Note that Amazon has a limit of
+// max 10 object tags.
+using objtag_map_type = boost::container::flat_map<std::string, std::string>;
+
+// Function used to provide an alternate implementation to load object tags.
+// Intended for unit testing without having to mock giant swathes of the SAL.
+using load_object_tags_function = std::function<int(
+    const DoutPrefixProvider* dpp,
+    const req_state* s,
+    objtag_map_type& obj_tags,
+    optional_yield y)>;
+
+/**
+ * @brief Given a req_state, a HandoffAuthzState and a vector of operation
+ * code, create and populate an ::authorizer::v1::AuthorizeV2Request protobuf
+ * message.
+ *
+ * On failure, return std::nullopt.
+ *
+ * All the state required to fill the request should be contained in the
+ * request and in the HandoffAuthzState, except for the actual operation codes
+ * which are provided. Each operation code is an enum value, e.g.
+ * rgw::IAM::GetObject, which will be mapped onto the equivalent
+ * ::authorizer::v1::S3Opcode value.
+ *
+ * Note that the extra data fields of the request will only be filled in if
+ * the corresponding toggles (HandoffAuthzState::set_bucket_tags_required(),
+ * HandoffAuthzState::set_object_tags_required()) are set to true.
+ *
+ * We may modify \p s. For example, loading extra data such as tags may
+ * require modification of s->env.
+ *
+ * @param dpp A DoutPrefixProvider for logging.
+ * @param s The req_state. May be modified!
+ * @param operations A vector of opcodes. Use the values defined in
+ * <rgw/rgw_iam_policy.h> with prefix 's3'.
+ * @param subrequest_index The subrequest index.
+ * @param y Optional yield.
+ * @param alt_load Optional alternative implementation of the object tag
+ * loader function.
+ * @return std::optional<::authorizer::v1::AuthorizeRequest> A populated
+ * AuthorizeRequest message on success, std::nullopt on failure.
+ */
+std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(const DoutPrefixProvider* dpp,
+    req_state* s, std::vector<uint64_t> operations, uint32_t subrequest_index, optional_yield y,
+    std::optional<load_object_tags_function> alt_load = std::nullopt);
+
+/**
+ * @brief Single operation version of PopulateAuthorizeRequest.
+ *
+ * A shorthand for the common case where we only need to authorize a single
+ * operation.
+ *
+ * @param dpp A DoutPrefixProvider for logging.
+ * @param s The req_state. May be modified!
+ * @param operation An opcode.
+ * @param subrequest_index The subrequest index.
+ * @param y Optional yield.
+ * @param alt_load Optional alternative implementation of the object tag
+ * loader function.
+ * @return std::optional<::authorizer::v1::AuthorizeV2Request> A populated
+ * AuthorizeRequest message on success, std::nullopt on failure.
+ */
+inline std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(const DoutPrefixProvider* dpp,
+    req_state* s, uint64_t operation, uint32_t subrequest_index, optional_yield y,
+    std::optional<load_object_tags_function> alt_load = std::nullopt)
+{
+  return PopulateAuthorizeRequest(dpp, s, std::vector<uint64_t> { operation }, subrequest_index, y, alt_load);
+}
+
+/**
+ * @brief Populate ExtraData and ExtraDataSpecification using the SAL, or a
+ * provided alternative implementation.
+ *
+ * @param dpp The DouPrefixProvider.
+ * @param s The req_state.
+ * @param extra_data_provided an ExtraDataProvided to populate.
+ * @param extra_data an ExtraData to populate.
+ * @param y Optional yield.
+ * @param alt_load Optional alternative implementation of the object tag
+ * loader function.
+ * @return int Zero on success, <0 error code on failure.
+ */
+int PopulateExtraDataObjectTags(const DoutPrefixProvider* dpp, const req_state* s,
+    ::authorizer::v1::ExtraDataSpecification* extra_data_provided,
+    ::authorizer::v1::ExtraData* extra_data, optional_yield y,
+    std::optional<load_object_tags_function> alt_load = std::nullopt);
+
+/**
+ * @brief Given a req_state with a populated HandoffAuthzState, load whatever
+ * extra data into the request that the HandoffAuthzState says is required.
+ *
+ * Note the alt_load parameter is for unit testing only. It should be
+ * std::nullopt in production, but in tests it provides an alternative way of
+ * loading extra data that doesn't reuire mocking the SAL.
+ *
+ * @param dpp
+ * @param s
+ * @param spec The ExtraDataSpecification message to update.
+ * @param extra_data The ExtraData message to update.
+ * @param y Optional yield.
+ * @param alt_load Optional alternative implementation of the object tag
+ * loader function.
+ * @return int The error code. 0 on success, <0 on failure.
+ */
+int PopulateAuthorizeRequestLoadExtraData(const DoutPrefixProvider* dpp, req_state* s,
+    ::authorizer::v1::ExtraDataSpecification* spec, ::authorizer::v1::ExtraData* extra_data,
+    optional_yield y,
+    std::optional<load_object_tags_function> alt_load = std::nullopt);
+
+/**
+ * @brief Given a req_state and an existing AuthorizeV2Request, populate the
+ * environment field of the protobuf with the IAM environment variables set in
+ * the req_state.
+ *
+ * This will clear any existing data in the environment field. That makes it
+ * suitable for use in the resubmit workflow, where we want to pick up the
+ * differences in the IAM environment variables caused by, say, loading bucket
+ * or object tags.
+ *
+ * @param dpp A DoutPrefixProvider for logging.
+ * @param s The req_state.
+ * @param question The AuthorizeV2Question message.
+ */
+void PopulateAuthorizeRequestIAMEnvironment(const DoutPrefixProvider* dpp,
+    req_state* s, ::authorizer::v1::AuthorizeV2Question* question);
+
+/**
+ * @brief Format a protobuf as a JSON string, or an error message on failure.
+ *
+ * Use:
+ * ```
+ *   ldpp_dout(dpp, 20) << "Request: " << proto_to_JSON(req) << dendl;
+ * ```
+ *
+ * The compiler should be able to infer the appropriate type for the template.
+ *
+ * @tparam T The protobuf message type
+ * @param proto The protobuf message.
+ * @return std::string The output string, or an error message if the
+ * formatting failed.
+ */
+template <typename T>
+std::string proto_to_JSON(const T& proto)
+{
+  using namespace google::protobuf::util;
+  JsonPrintOptions options;
+  options.always_print_primitive_fields = true;
+  std::string out;
+  auto status = google::protobuf::util::MessageToJsonString(proto, &out, options);
+  if (status.ok()) {
+    return out;
+  } else {
+    return fmt::format(FMT_STRING("Error formatting protobuf as JSON: {}"), status.ToString());
+  }
+}
+
+/// Output stream operator for ::authorizer::v1:AuthorizeRequest.
+extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::AuthorizeV2Request& res);
+/// Output stream operator for ::authorizer::v1::AuthorizeResponse.
+extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::AuthorizeV2Response& res);
+/// Output stream operator for ::authorizer::v1::ExtraData.
+extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraData& res);
+/// Output stream operator for ::authorizer::v1::ExtraDataSpecification.
+extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraDataSpecification& res);
+
+/****************************************************************************/
 
 } /* namespace rgw */
 

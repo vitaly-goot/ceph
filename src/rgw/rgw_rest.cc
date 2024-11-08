@@ -1868,19 +1868,26 @@ static http_op op_from_method(const char *method)
 
 int RGWHandler_REST::init_permissions(RGWOp* op, optional_yield y)
 {
+  // HANDOFF: Visited.
   if (op->get_type() == RGW_OP_CREATE_BUCKET) {
     // We don't need user policies in case of STS token returned by AssumeRole, hence the check for user type
     if (! s->user->get_id().empty() && s->auth.identity->get_identity_type() != TYPE_ROLE) {
-      try {
-        if (auto ret = s->user->read_attrs(s, y); ! ret) {
-          auto user_policies = get_iam_user_policy_from_attr(s->cct, s->user->get_attrs(), s->user->get_tenant());
-          s->iam_user_policies.insert(s->iam_user_policies.end(),
-                                      std::make_move_iterator(user_policies.begin()),
-                                      std::make_move_iterator(user_policies.end()));
+      if (s->handoff_authz->enabled()) {
+        // XXX do we have a shortcut for create_bucket with STS? or do we just
+        // allow standard processing? I prefer the latter.
+        ldpp_dout(s, 20) << "handoff authz: RGWHandler_REST::init_permissions(): skip OP_CREATE_BUCKET attr read" << dendl;
 
+      } else {
+        try {
+          if (auto ret = s->user->read_attrs(s, y); !ret) {
+            auto user_policies = get_iam_user_policy_from_attr(s->cct, s->user->get_attrs(), s->user->get_tenant());
+            s->iam_user_policies.insert(s->iam_user_policies.end(),
+                std::make_move_iterator(user_policies.begin()),
+                std::make_move_iterator(user_policies.end()));
+          }
+        } catch (const std::exception& e) {
+          ldpp_dout(op, -1) << "Error reading IAM User Policy: " << e.what() << dendl;
         }
-      } catch (const std::exception& e) {
-        ldpp_dout(op, -1) << "Error reading IAM User Policy: " << e.what() << dendl;
       }
     }
     rgw_build_iam_environment(driver, s);
@@ -1892,6 +1899,7 @@ int RGWHandler_REST::init_permissions(RGWOp* op, optional_yield y)
 
 int RGWHandler_REST::read_permissions(RGWOp* op_obj, optional_yield y)
 {
+  // HANDOFF: Visited.
   bool only_bucket = false;
 
   switch (s->op) {

@@ -1001,6 +1001,54 @@ options:
   flags:
   - runtime
   with_legacy: true
+- name: rgw_handoff_authz_allow_native_copy_object
+  type: bool
+  level: advanced
+  desc: Don't filter copy-object requests in gen2 environments.
+  long_desc: If enabled, RGW will not filter copy-object requests in a gen2
+    environment, as the microservices environment may still pass copy-object
+    requests verbatim.
+  default: true
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_handoff_authz_disable_local
+  type: bool
+  level: advanced
+  desc: Disable all local authorization checks in favour of external
+    authorization
+  long_desc: Only effective if Handoff is enabled. Disable all authorization
+    checks using internal policies and acls, in favour of an authorization
+    handoff.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_handoff_authz_grpc_uri
+  type: str
+  level: advanced
+  desc: URI for the S3 authorization handoff service via gRPC.
+  long_desc: The gRPC server address to use. This value is passed unchanged to
+    grpc::CreateCustomChannel() so may be in any format supported by the C++
+    gRPC library.
+  default: dns:127.0.0.1:8003
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_handoff_authz_reject_filtered_commands
+  type: bool
+  level: advanced
+  desc: Refuse S3 commands that we expect to have been filtered by the
+    microservice environment.
+  long_desc: If enabled, RGW will explicitly reject commands we do not expect
+    to see in a gen2 cluster, because the microservices environment is
+    expected to have handled them by other means.
+  default: true
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_handoff_enable_anonymous_authorization
   type: bool
   level: advanced
@@ -1008,20 +1056,6 @@ options:
   long_desc: If enabled, the authentication service will be passed
     authorization parameters by Handoff for anonymous requests as well as
     S3-authenticated requests.
-  default: true
-  services:
-  - rgw
-  flags:
-  - runtime
-  with_legacy: true
-- name: rgw_handoff_enable_local_authorization_bypass
-  type: bool
-  level: advanced
-  desc: Enable bypassing of local authorization checks.
-  long_desc: If enabled, assume it is safe to bypass local ACL and policy
-    checks, because the request will have been authorized by the Handoff
-    external service. NOTE If Handoff isn't in use, this parameter will be
-    ignored and local authorization will be used.
   default: true
   services:
   - rgw

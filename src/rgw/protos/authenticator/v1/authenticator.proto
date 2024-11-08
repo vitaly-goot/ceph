@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package authenticator.v1;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "bits.linode.com/LinodeApi/obj-endpoint/gen/proto/authenticator/v1";
 
 // Errors mapping to S3 errors.
@@ -55,10 +57,32 @@ message S3ErrorDetails {
     // Authorization attempted for a bucket that does not exist
     // 404 Not Found.
     TYPE_NO_SUCH_BUCKET = 15;
+    // This error might occur for the following reasons:
+    // - The specified argument was not valid.
+    // - The request was missing a required header.
+    // - The specified argument was incomplete or in the wrong format.
+    // - The specified argument must have a length greater than or equal to 3.
+    // 400 Bad Request.
+    TYPE_INVALID_ARGUMENT = 16;
+    // A header that you provided implies functionality that is not implemented.
+    // 501 Not Implemented.
+    TYPE_NOT_IMPLEMENTED = 17;
+    // The account is suspended
+    TYPE_ACCOUT_SUSPENDED = 18;
   }
 
+  // The error code.
   Type type = 1;
+  // The HTTP status code for the error.
   int32 http_status_code = 2;
+  // The human-readable error message.
+  string message = 3;
+  // The ID of the request (trace ID).
+  string request_id = 4;
+  // An identifier for the server instance which handled the request.
+  string host_id = 5;
+  // The resource being requested (bucket and object key).
+  optional string resource = 6;
 }
 
 // AuthenticatorService provides RPCs for authenticating S3 requests.
@@ -69,6 +93,8 @@ service AuthenticatorService {
   rpc AuthenticatePresignedURL(AuthenticatePresignedURLRequest) returns (AuthenticatePresignedURLResponse);
   // Request a signing key for the given request.
   rpc GetSigningKey(GetSigningKeyRequest) returns (GetSigningKeyResponse);
+  // AssumeRole generates temp creds for trusted use.
+  rpc AssumeRole(AssumeRoleRequest) returns (AssumeRoleResponse);
 }
 
 // Request message for authenticating REST API S3 requests.
@@ -109,6 +135,9 @@ message AuthenticateRESTRequest {
   // timestamp are validated differently for Presigned URLs, so we instead skip timestamp validation logic for RGW since
   // RGW already validates timestamps. You should not enable this unless you're absolutely sure.
   optional bool skip_timestamp_validation = 10;
+  // When enabled, the Authenticator service will skip the Authorization step. This is intended for use with
+  // RGW, CopyObject and ListMultipartUpload microservices only, as these services will call AuthorizeV2() independently.
+  optional bool skip_authorization = 11;
 }
 
 // Response message for REST authentications.
@@ -125,6 +154,8 @@ message AuthenticateRESTResponse {
   optional string assuming_user_arn = 4;
   // The ARN of the account of the user to authenticate as.
   string account_arn = 5;
+  // When STS is used, this field consists of the ARN of role. role ARN is asociated with auth-z.
+  optional string role_arn = 6;
 }
 
 // Request message for authenticating Presigned URL S3 requests.
@@ -151,6 +182,9 @@ message AuthenticatePresignedURLRequest {
   // When enabled, the Authenticator service will skip its timestamp validation logic. This is intended for use with
   // RGW only. You should not enable this unless you're absolutely sure.
   optional bool skip_timestamp_validation = 7;
+  // When enabled, the Authenticator service will skip the Authorization step. This is intended for use with
+  // RGW, CopyObject and ListMultipartUpload microservices only, as these services will call AuthorizeV2() independently.
+  optional bool skip_authorization = 8;
 }
 
 // Response message for Presigned URL authentications.
@@ -167,6 +201,8 @@ message AuthenticatePresignedURLResponse {
   optional string assuming_user_arn = 4;
   // The ARN of the account of the user to authenticate as.
   string account_arn = 5;
+  // When STS is used, this field consists of the ARN of role. role ARN is asociated with auth-z.
+  optional string role_arn = 6;
 }
 
 message GetSigningKeyRequest {
@@ -178,4 +214,41 @@ message GetSigningKeyRequest {
 
 message GetSigningKeyResponse {
   bytes signing_key = 1;
+}
+
+message AssumeRoleRequest {
+  // desired role arn - OSARole or AdminRole.
+  string role_arn = 1;
+  // session name used in spans
+  string role_session_name = 2;
+  // user-arn requesting the service, should be auth-n/z before calling this API.
+  string user_arn = 3;
+  // optional inline policy attached to the identify above in ceph_uid.
+  optional string inline_policy = 4;
+  // optional transaction ID, may be useful for log and span correlation
+  optional string transaction_id = 5;
+  // optional duration for STS credentials.
+  optional uint32 duration_seconds = 6;
+}
+
+message AssumeRoleResponse {
+  AssumeRoleResults assume_role_results = 1;
+  Credentials credentials = 2;
+  AssumeRoleResponseMetadata response_metadata = 3;
+}
+
+message Credentials {
+  string access_key_id = 1;
+  string secret_access_key = 2;
+  string session_token = 3;
+  google.protobuf.Timestamp expiration = 4;
+}
+
+message AssumeRoleResponseMetadata {
+  string request_id = 1;
+}
+
+message AssumeRoleResults {
+  string assumed_role_id = 1;
+  string assumed_role_arn = 2;
 }
