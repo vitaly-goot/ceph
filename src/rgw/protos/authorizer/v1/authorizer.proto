@@ -74,7 +74,7 @@ message AuthorizeRequest {
     optional string object_key = 5;
     // A map of all query string parameters from the user's S3 REST request.
     map<string, string> query_parameters = 6;
-    // A map of all relevant x-amz-* headers from the user's S3 REST request.
+    // A map of all relevant x-amz-* headers from the user's S3 REST request. The map keys must be normalised to lower-case.
     map<string, string> x_amz_headers = 7;
     // A generic resource key, used when neither object_key or bucket_name make sense.
     optional string resource = 8;
@@ -154,11 +154,11 @@ enum S3Opcode {
     S3_OPCODE_DELETE_BUCKET = 16;
     S3_OPCODE_LIST_BUCKET = 17;
     S3_OPCODE_LIST_BUCKET_VERSIONS = 18;
-    S3_OPCODE_LIST_ALL_MY_BUCKETS = 19;
-    S3_OPCODE_LIST_BUCKET_MULTIPART_UPLOADS = 20;
-    S3_OPCODE_GET_ACCELERATE_CONFIGURATION = 21;
-    S3_OPCODE_PUT_ACCELERATE_CONFIGURATION = 22;
-    S3_OPCODE_GET_BUCKET_ACL = 23;
+    S3_OPCODE_LIST_ALL_MY_BUCKETS = 19; // global
+    S3_OPCODE_LIST_BUCKET_MULTIPART_UPLOADS = 20; // bucket
+    S3_OPCODE_GET_ACCELERATE_CONFIGURATION = 21; // object
+    S3_OPCODE_PUT_ACCELERATE_CONFIGURATION = 22; // object
+    S3_OPCODE_GET_BUCKET_ACL = 23; // bucket
     S3_OPCODE_PUT_BUCKET_ACL = 24;
     S3_OPCODE_GET_BUCKET_CORS = 25;
     S3_OPCODE_PUT_BUCKET_CORS = 26;
@@ -179,32 +179,32 @@ enum S3Opcode {
     S3_OPCODE_GET_BUCKET_WEBSITE = 41;
     S3_OPCODE_PUT_BUCKET_WEBSITE = 42;
     S3_OPCODE_DELETE_BUCKET_WEBSITE = 43;
-    S3_OPCODE_GET_LIFECYCLE_CONFIGURATION = 44;
+    S3_OPCODE_GET_LIFECYCLE_CONFIGURATION = 44;  // lifecycle
     S3_OPCODE_PUT_LIFECYCLE_CONFIGURATION = 45;
-    S3_OPCODE_PUT_REPLICATION_CONFIGURATION = 46;
+    S3_OPCODE_PUT_REPLICATION_CONFIGURATION = 46; // replicaiton
     S3_OPCODE_GET_REPLICATION_CONFIGURATION = 47;
     S3_OPCODE_DELETE_REPLICATION_CONFIGURATION = 48;
-    S3_OPCODE_GET_OBJECT_TAGGING = 49;
+    S3_OPCODE_GET_OBJECT_TAGGING = 49; // object
     S3_OPCODE_PUT_OBJECT_TAGGING = 50;
     S3_OPCODE_DELETE_OBJECT_TAGGING = 51;
     S3_OPCODE_GET_OBJECT_VERSION_TAGGING = 52;
     S3_OPCODE_PUT_OBJECT_VERSION_TAGGING = 53;
     S3_OPCODE_DELETE_OBJECT_VERSION_TAGGING = 54;
-    S3_OPCODE_PUT_BUCKET_OBJECT_LOCK_CONFIGURATION = 55;
+    S3_OPCODE_PUT_BUCKET_OBJECT_LOCK_CONFIGURATION = 55; // object
     S3_OPCODE_GET_BUCKET_OBJECT_LOCK_CONFIGURATION = 56;
     S3_OPCODE_PUT_OBJECT_RETENTION = 57;
     S3_OPCODE_GET_OBJECT_RETENTION = 58;
     S3_OPCODE_PUT_OBJECT_LEGAL_HOLD = 59;
     S3_OPCODE_GET_OBJECT_LEGAL_HOLD = 60;
-    S3_OPCODE_BYPASS_GOVERNANCE_RETENTION = 61;
-    S3_OPCODE_GET_BUCKET_POLICY_STATUS = 62;
-    S3_OPCODE_PUT_PUBLIC_ACCESS_BLOCK = 63;
+    S3_OPCODE_BYPASS_GOVERNANCE_RETENTION = 61; // bypass governance
+    S3_OPCODE_GET_BUCKET_POLICY_STATUS = 62; // bucket
+    S3_OPCODE_PUT_PUBLIC_ACCESS_BLOCK = 63; // Access block
     S3_OPCODE_GET_PUBLIC_ACCESS_BLOCK = 64;
     S3_OPCODE_DELETE_PUBLIC_ACCESS_BLOCK = 65;
     S3_OPCODE_GET_BUCKET_PUBLIC_ACCESS_BLOCK = 66;
     S3_OPCODE_PUT_BUCKET_PUBLIC_ACCESS_BLOCK = 67;
     S3_OPCODE_DELETE_BUCKET_PUBLIC_ACCESS_BLOCK = 68;
-    S3_OPCODE_GET_BUCKET_ENCRYPTION = 69;
+    S3_OPCODE_GET_BUCKET_ENCRYPTION = 69; // bucket
     S3_OPCODE_PUT_BUCKET_ENCRYPTION = 70;
 }
 
@@ -265,7 +265,7 @@ message AuthorizeV2Question
 
     // All the query parameters from the S3 request.
     map<string, string> query_parameters = 9;
-    // All the x-amz-* headers from the S3 request.
+    // All the x-amz-* headers from the S3 request. The map keys must be normalised to lower-case.
     map<string, string> x_amz_headers = 10;
 
     message IAMMapEntry { repeated string values = 1; }

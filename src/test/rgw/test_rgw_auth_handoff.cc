@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 smarttab
 
 #include <cstdint>
+#include <grpcpp/support/channel_arguments.h>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -901,16 +902,25 @@ constexpr int SMALLEST_RECONNECT_DELAY_MS = 105;
 TEST_F(HandoffHelperImplGRPCTest, ChannelRecoversFromDeadAtStartup)
 {
   ceph_assert(g_ceph_context != nullptr);
-  // Set everything to 1ms. As descrived for SMALLEST_RECONNECT_DELAY_MS,
-  // we'll still have to wait 100ms + a few more millis for any reconnect.
-  auto args = hh_.get_authn_channel().get_default_channel_args(g_ceph_context);
+
+  // We *don't* want to use get_authn_channel().get_default_channel_args()
+  // here - that will set the channel arguments to the values in
+  // configuration, which isn't helpful. Further, it will also make it very
+  // difficult to change those configured arguments because of the way
+  // ChannelArguments works. Better to just set the values we care about in an
+  // empty object.
+  //
+  // To explain further: grpc::ChannelArguments encapsulates a list of
+  // arguments. It's not a map, so setting the same key more than once will
+  // set that key more than once in the ChannelArguments object. Not only is
+  // this wasteful, but it's apparently not predictable which one of the
+  // multiple instances of the key will be used. It's safer to just not set
+  // the key more than once.
+
+  auto args = grpc::ChannelArguments();
   args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 1);
   args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 1);
   args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 1);
-  // // This is an alternate means of setting the reconnect delay, but it too
-  // // bounded below at 100ms by the library.
-  // args.SetInt("grpc.testing.fixed_fixed_reconnect_backoff_ms", 0);
-  // Program the helper's channel.
   hh_.get_authn_channel().set_channel_args(dpp_.get_cct(), args);
 
   helper_init();
@@ -928,7 +938,7 @@ TEST_F(HandoffHelperImplGRPCTest, ChannelRecoversFromDeadAtStartup)
 
   server().start();
   // Wait as short a time as the library allows, plus a few millisecond.
-  std::this_thread::sleep_for(std::chrono::milliseconds(SMALLEST_RECONNECT_DELAY_MS + 5));
+  std::this_thread::sleep_for(std::chrono::milliseconds(SMALLEST_RECONNECT_DELAY_MS));
   res = hh_.auth(&dpp_, "", t.access_key, string_to_sign, t.signature, &s, y_);
   EXPECT_TRUE(res.is_ok()) << "should now succeed";
   EXPECT_EQ(res.err_type(), HandoffAuthResult::error_type::NO_ERROR) << "should now show no error";
