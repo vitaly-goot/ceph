@@ -42,14 +42,14 @@ logrotate -f /etc/logrotate.d/ceph-common-debug
 for host in $(ceph osd tree | grep host | awk '{print $4}'); do echo $host; logrotate -f /etc/logrotate.d/ceph-common-debug; done
 ```
 
-###Start the Log Debugger
+### Start the Log Debugger
 Do not run this script from cron, as /srv/unwindpmp writes to the TTY, which does not work well with cron over ssh. Instead, start it in a separate session (e.g., with tmux):
 ```
 tmux new -s osd
 while true; do /srv/osd-debugger.sh& sleep 60; done
 ```
 
-###Script Default Configuration
+### Script Default Configuration
 The following default configurations can be modified directly in the script:
 
 ```
