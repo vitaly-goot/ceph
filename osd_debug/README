@@ -1,0 +1,44 @@
+
+# install on one MON (which will be a control panel) 
+/srv/osd-debugger.sh
+
+# complile and install on each OSD, Mark's profiler tool https://github.com/markhpc/uwpmp
+/srv/unwindpmp
+
+#for example for ubuntu:focal
+docker run -it ubuntu:focal /bin/bash
+apt update; apt install git cmake elfutils g++ autoconf automake libtool libelf-dev libdw-dev
+git clone https://github.com/markhpc/uwpmp.git
+cd uwpmp; mkdir build; cd build
+cmake ..
+make
+
+# install to all OSD hosts
+-- optionally OSD binaries compiled with debug symbols 
+/srv/unwind_attach.sh
+/etc/logrotate.d/ceph-common-debug
+/srv/elevate_osd_log.sh
+/srv/gdb_attach.sh    # currently commented in the script but it is possible to attach with gdb and collect backtraces from all threads on affected OSD with gdb as well (assumes gdn is installed)
+
+
+# before each run: 
+#   force log rotation on all OSD hosts 
+logrotate -f /etc/logrotate.d/ceph-common-debug
+for host in $(ceph osd tree | grep host | awk '{print $4}'); do echo $host; logrotate -f /etc/logrotate.d/ceph-common-debug; done
+#   force log rotation on all OSD hosts 
+
+# start log debugger in separate session (e.g. tmux) 
+# do not run it from cron since /srv/unwindpmp writes to TTY which not working properly with combination of cron and ssh 
+tmux new -s osd
+while true; do /srv/osd-debugger.sh& sleep 60;done
+# script default configuration (you can modify directly in the script) 
+    debugfolder=/var/log/debug/$(date +%Y-%m-%d)  # debug folder all debug data will be fetched
+    process_hist_ops=1                            # inspect hist_ops
+    process_inflight_ops=1                        # inspect inflight_ops
+    slow_ops_threshold=10                         # condition to trigger debug inspection (number of slowdown seen)
+    op_duration_threshold=1                       # condition to trigger debug inspection (slow down duration in sec)
+    unwind_profiler_probes=100                    # number of probes to collect, if 0 -> profiler disabled
+    profiler_run_delay=300                        # profiler run will be scheduled with delay                           
+    log_elevation_duration=0                      # elevate log debug level for acting OSD only for specified duration 
+    session_max_duration=400                      # stop debug seesion after specified duration. To run new debug session delete /srv/osd-debugger.rc 
+    fetch_timeout=$(( $profiler_run_delay + $log_elevation_duration + 1 )) # affected OSD logs will be gathered after specified duration 
