@@ -21,20 +21,22 @@ count=$(ps -ef|grep $0|grep -v grep|grep -c bash)
 #echo -n "$count at $(date) " >> $LOG_FILE
 if [ "$count" -gt 2 ]
 then
-  #echo "Aborting" >> $LOG_FILE
+  #echo "Aborting"
   exit 1
 fi
-echo "$start_time Iteration started" >> $LOG_FILE
 
 if [[ $DEBUG -eq 1 ]]; then
     debugfolder=/var/log/debug/$(date +%Y-%m-%d)
     slowosds="osd.125"
     process_hist_ops=1
     process_inflight_ops=0
-    slow_ops_threshold=0
-    op_duration_threshold=0
+    slow_ops_size_threshold=0
+    slow_ops_duration_threshold=0
     unwind_profiler_probes=100
     profiler_run_delay=300
+    collect_perf_record=1
+    attach_gdb=1
+    restart_osd=0
     log_elevation_duration=0
     session_max_duration=86400
     fetch_timeout=0
@@ -42,21 +44,30 @@ else
     debugfolder=/var/log/debug/$(date +%Y-%m-%d)
     process_hist_ops=1
     process_inflight_ops=0
-    slow_ops_threshold=10
-    op_duration_threshold=1
-    unwind_profiler_probes=100
-    profiler_run_delay=30
+    slow_ops_size_threshold=10
+    slow_ops_duration_threshold=1
+    unwind_profiler_probes=0
+    profiler_run_delay=0
+    collect_perf_record=1
+    attach_gdb=0
+    restart_osd=1
     log_elevation_duration=0
-    session_max_duration=400
-    fetch_timeout=$(( $profiler_run_delay + $log_elevation_duration + 1 ))
+    session_max_duration=36000
+    fetch_timeout=0
 fi	
 
 source /srv/osd-debugger.rc 
 
+if [[ -v session_halt ]]; then
+  exit 2
+fi
+
 if [[ ! -v session_start ]]; then
     session_start=$start_time
     echo "============================================" >> $LOG_FILE
-    echo "$session_start session started" >> $LOG_FILE  
+    echo "$session_start New Session started" >> $LOG_FILE  
+else
+    echo "$start_time Session iteration started" >> $LOG_FILE
 fi
 
 if [[ ! -v profiler_schedule ]]; then
@@ -74,6 +85,9 @@ fi
 cur_time=$(date +%s)
 if [[ $cur_time > $session_end_schedule ]]; then
   echo "Session limit reached. To start new session remove /srv/osd-debugger.rc" >> $LOG_FILE
+cat <<EOF >> /srv/osd-debugger.rc
+export session_halt=1
+EOF
   exit 2
 fi
 
@@ -102,12 +116,11 @@ export fetch_schedule=$fetch_schedule
 export session_end_schedule=$session_end_schedule
 EOF
 
-sleep 5
-exit 0
-
 slowosds=$(ceph health detail -f json | jq -r 2>/dev/null '.checks.SLOW_OPS.summary.message | capture("(?<osds>osd\\.([0-9]+)(,osd\\.[0-9]+)*)").osds | split(",")[]') || slowosds=""
 if [ "$slowosds" = "" ]
 then
+  #for host in $(ceph osd tree | grep host | awk '{print $4}'); do rsync -a $host:${debugfolder} /var/log/debug/; done
+  #log_message $start_time "fetch log"
   log_message $start_time "all clear"
   exit 0
 fi
@@ -165,14 +178,26 @@ process_remote_osd() {
         ssh -t root@${osdhost} "/srv/unwind_attach.sh $osdpid $osdid ${log_prefix}-unwindpmp $unwind_profiler_probes"
         log_message $start_time "/srv/unwind_attach.sh $osdpid $osdid ${log_prefix}-unwindpmp $unwind_profiler_probes"
     fi    
+    if [[ $collect_perf_record -eq 1 ]]; then
+        log_message $start_time "starting perf record"
+        #ssh root@${osdhost} "perf record -p $osdpid -F 20 --call-graph dwarf -o ${log_prefix}-perf-data-dwarf  -- sleep 10" > /dev/null 2>&1 
+        ssh root@${osdhost} "perf record -p $osdpid -F 20 -g -o $debugfolder/perf-data-${timestamp}-$osd  -- sleep 10"
+        log_message $start_time "perf record -p $osdpid"
+    fi
+    if [[ $restart_osd -eq 1 ]]; then
+        log_message $start_time "Restarting OSD: $osdid on host $osdhost $log_prefix"
+        ssh root@${osdhost} "systemctl restart ceph-osd@$osdid"
+    fi    
+    if [[ $attach_gdb -eq 1 ]]; then
+        log_message $start_time "attaching gdb"
+        ssh root@${osdhost} "/srv/gdb_attach.sh $osdpid $osdid ${log_prefix}-gdb"
+        log_message $start_time "/srv/gdb_attach.sh $osdpid $osdid ${log_prefix}-gdb"
+    fi
+    log_message $start_time "processed OSD: $osdid on host $osdhost"
 
     #    perf record -p $osdpid -F 20 --call-graph dwarf -o ${log_prefix}-perf-data-dwarf  -- sleep 10 > /dev/null 2>&1 
     #ceph tell $osd perf dump > ${log_prefix}-perfdump & 
     #log_message $start_time "perf dump"
-    #ssh root@${osdhost} "/srv/gdb_attach.sh $osdpid $osdid ${log_prefix}-gdb"
-    #log_message $start_time "gdb_attach.sh"
-    #ssh root@${osdhost} "perf record -p $osdpid -F 20 -g -o $debugfolder/perf-data-${timestamp}-$osd  -- sleep 10"&
-    #log_message $start_time "perf record"
 }
 
 slow_ops_inspect() {
@@ -180,10 +205,10 @@ slow_ops_inspect() {
     local opsnumber=$2
     local run_process=$3
     local msg=$4
-    if [ $opsnumber -gt $slow_ops_threshold ]; then
-        pglist=$(jq --argjson duration "$op_duration_threshold"  -r '.ops[] | select(.description | contains("osd_op")) | select(.duration > $duration) | (.description | capture("(?<pg>[0-9]+\\.[0-9a-z]+s[0-9])").pg | sub("s[0-9]$"; ""))' $inspect | sort | uniq)
+    if [ $opsnumber -gt $slow_ops_size_threshold ]; then
+        pglist=$(jq --argjson duration "$slow_ops_duration_threshold"  -r '.ops[] | select(.description | contains("osd_op")) | select(.duration > $duration) | (.description | capture("(?<pg>[0-9]+\\.[0-9a-z]+s[0-9])").pg | sub("s[0-9]$"; ""))' $inspect | sort | uniq)
         pgs=$(echo "$pglist" | tr '\n' ' ')
-        log_message $start_time "$msg slow operation inspect $inspect, threshold $op_duration_threshold seconds, affected PGs ( $pgs)"
+        log_message $start_time "$msg slow operation inspect $inspect, threshold $slow_ops_duration_threshold seconds, affected PGs ( $pgs)"
         for pg in $pglist; do
             acting_osds=$(ceph pg map $pg | grep 'acting' | awk -F'[][]' '{print $2}')
             log_message $start_time "pg $pg acting_osds $acting_osds"
@@ -195,6 +220,9 @@ slow_ops_inspect() {
                 fi
                 for acting_osd in $(echo $acting_osds | tr ',' ' '); do
                     process_remote_osd $acting_osd
+                    if [[ $restart_osd -eq 1 ]]; then
+                        return 0
+                    fi
                 done
             else     
                 log_message $start_time "skipping remote OSD processing..."
@@ -208,7 +236,9 @@ do
     osdhost=`ceph osd find $osd| jq '.host'|cut -d . -f 1|cut -f 2 -d '"'`
     osdid=$(echo $osd|cut -f 2 -d .)
     log_prefix=${debugfolder}/${timestamp}-${osdhost}-osd.${osdid}
+    log_message $start_time "ssh root@${osdhost} ceph daemon $osd dump_historic_ops"
     ssh root@${osdhost} "ceph daemon $osd dump_historic_ops" > ${log_prefix}-historic_ops
+    log_message $start_time "ssh root@${osdhost} ceph daemon $osd dump_ops_in_flight"
     ssh root@${osdhost} "ceph daemon $osd dump_ops_in_flight" > ${log_prefix}-inflight
     #opsnumber=$(grep -c osd_op ${log_prefix}-inflight)
     n_hist=$(grep -c osd_op ${log_prefix}-historic_ops)
@@ -221,6 +251,7 @@ do
     slow_ops_inspect ${log_prefix}-historic_ops $n_hist $process_hist_ops "hist_ops" 
     slow_ops_inspect ${log_prefix}-inflight $n_inflight $process_inflight_ops "inflight_ops"
 done
+
 
 if [[ $do_log_fetch -gt 0 ]]
     if [ ${#hosts[@]} -gt 0 ]; then

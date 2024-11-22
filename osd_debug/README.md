@@ -56,11 +56,14 @@ The following default configurations can be modified directly in the script:
   debugfolder=/var/log/debug/$(date +%Y-%m-%d)  # Folder for all debug data
   process_hist_ops=1                            # Inspect hist_ops
   process_inflight_ops=1                        # Inspect inflight_ops
-  slow_ops_threshold=10                         # Trigger condition: number of slow ops
-  op_duration_threshold=1                       # Trigger condition: slow ops duration (seconds)
+  slow_ops_size_threshold=10                    # Trigger condition: number of slow ops
+  slow_ops_duration_threshold=1                 # Trigger condition: slow ops duration (seconds)
   unwind_profiler_probes=100                    # Number of profiler probes to collect (0 disables profiler)
   profiler_run_delay=300                        # Delay before profiler run
+  collect_perf_record=1                         # Capture performance data with 'perf record'
+  attach_gdb=0                                  # Attach with gdb and capture a snapshot of all threads.
   log_elevation_duration=0                      # Duration to elevate log debug level for acting OSDs
+  restart_osd=0                                 # Restart *primary* OSD for affected PG when slow_ops_size_threshold && slow_ops_duration_threshold confition met 
   session_max_duration=400                      # Maximum debug session duration
   fetch_timeout=$(( $profiler_run_delay + $log_elevation_duration + 1 )) # Timeout for fetching affected OSD logs
 ```
