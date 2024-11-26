@@ -25,6 +25,8 @@ then
   exit 1
 fi
 
+cur_time=$(date +%s)
+timestamp=$(date +%Y-%m-%d-%H-%M-%S)
 if [[ $DEBUG -eq 1 ]]; then
     debugfolder=/var/log/debug/$(date +%Y-%m-%d)
     slowosds="osd.125"
@@ -39,94 +41,153 @@ if [[ $DEBUG -eq 1 ]]; then
     restart_osd=0
     log_elevation_duration=0
     session_max_duration=86400
-    fetch_timeout=0
+    session_end_enforced=1
 else
     debugfolder=/var/log/debug/$(date +%Y-%m-%d)
-    process_hist_ops=1
+    process_hist_ops=0
     process_inflight_ops=0
     slow_ops_size_threshold=10
     slow_ops_duration_threshold=1
     unwind_profiler_probes=0
     profiler_run_delay=0
-    collect_perf_record=1
+    collect_perf_record=0
     attach_gdb=0
     restart_osd=1
     log_elevation_duration=0
-    session_max_duration=36000
-    fetch_timeout=0
+    session_max_duration=86400
+    session_end_enforced=0
 fi	
+
+push_unique_to_logs_tobe_fetched() {
+    local key=$1
+    local value=$2
+
+    # Retrieve existing list as a space-separated string
+    local existing_array="${logs_tobe_fetched[$key]}"
+
+    # Check if the value already exists in the list
+    if [[ " $existing_array " =~ " $value " ]]; then
+        echo "Value '$value' already exists for key '$key'. Skipping."
+        return
+    fi
+
+    # Append the new value (space-separated)
+    if [[ -z "$existing_array" ]]; then
+        logs_tobe_fetched[$key]="$value"
+    else
+        logs_tobe_fetched[$key]="${existing_array} $value"
+    fi
+}
+
+dump_logs_tobe_fetched_as_shell_script() {
+    local filename=$1
+    > "$filename"  # Clear the file
+    echo "declare -g -A logs_tobe_fetched=()" > "$filename"
+    for key in "${!logs_tobe_fetched[@]}"; do
+        echo "logs_tobe_fetched[\"$key\"]=\"${logs_tobe_fetched[$key]}\"" >> "$filename"
+    done
+}
+
+fetch_logs() {
+    log_message $start_time "fetch_logs"
+    for host in "${!logs_tobe_fetched[@]}"; do
+        echo "$host:"
+        rsync -a $host:${debugfolder}/ ${debugfolder} 
+
+        # Extract the space-separated string into an array
+        IFS=' ' read -r -a osd_list <<< "${logs_tobe_fetched[$host]}"
+
+        echo fetch_osd $osd_list
+        for osdid in "${osd_list[@]}"; do
+            ssh $host "gzip -c /var/log/ceph/ceph-osd.${osdid}.log" > ${debugfolder}/${session_start}-${host}-osd.${osdid}.log.gz
+            log_message $start_time "$host gzip -c /var/log/ceph/ceph-osd.${osdid}.log > ${debugfolder}/${session_start}-${host}-osd.${osdid}.log.gz"
+        done
+    done
+}
+
+function test_fetch_logs() {
+    echo "declare -g -A logs_tobe_fetched=()" >> /tmp/log_fetch_test
+    source /tmp/log_fetch_test
+    push_unique_to_logs_tobe_fetched "bs3133-lax3" "567" 
+    dump_logs_tobe_fetched_as_shell_script /tmp/log_fetch_test
+    source /tmp/log_fetch_test
+    push_unique_to_logs_tobe_fetched "bs3135-lax3" "621" 
+    push_unique_to_logs_tobe_fetched "bs3139-lax3" "815" 
+    dump_logs_tobe_fetched_as_shell_script /tmp/log_fetch_test
+    source /tmp/log_fetch_test
+    push_unique_to_logs_tobe_fetched "bs3133-lax3" "567" 
+    push_unique_to_logs_tobe_fetched "bs3139-lax3" "815" 
+    dump_logs_tobe_fetched_as_shell_script /tmp/log_fetch_test
+    source /tmp/log_fetch_test
+    fetch_logs
+}
+
+report_time_wait() {
+    for host in $(ceph osd tree | grep host | awk '{print $4}'); do 
+        log_message $start_time "Sockets stats $host $(ss -ant | awk '{print $1}' | sort | uniq -c | grep -v State | awk '{printf "%s: %s, ", $2, $1}' | sed 's/, $//')"
+    done
+}
 
 source /srv/osd-debugger.rc 
 
-if [[ -v session_halt ]]; then
-  exit 2
-fi
-
 if [[ ! -v session_start ]]; then
     session_start=$start_time
+    echo "declare -g -A logs_tobe_fetched=()" > /srv/osd-debugger_session_$session_start.rc
     echo "============================================" >> $LOG_FILE
-    echo "$session_start New Session started" >> $LOG_FILE  
-else
-    echo "$start_time Session iteration started" >> $LOG_FILE
+    echo "$timestamp New Session started" >> $LOG_FILE  
 fi
+
+
+source /srv/osd-debugger_session_$session_start.rc
+
+if [[ -v session_halt ]]; then
+    exit 2
+fi
+
+echo "$timestamp Session iteration started" >> $LOG_FILE
 
 if [[ ! -v profiler_schedule ]]; then
     profiler_schedule=$(( $session_start + $profiler_run_delay ))
-fi    
-
-if [[ ! -v fetch_schedule ]]; then
-    fetch_schedule=$(( $session_start + $fetch_timeout ))
 fi    
 
 if [[ ! -v session_end_schedule ]]; then
     session_end_schedule=$(( $session_start + $session_max_duration ))
 fi    
 
-cur_time=$(date +%s)
-if [[ $cur_time > $session_end_schedule ]]; then
-  echo "Session limit reached. To start new session remove /srv/osd-debugger.rc" >> $LOG_FILE
-cat <<EOF >> /srv/osd-debugger.rc
-export session_halt=1
-EOF
-  exit 2
+if (( $cur_time > $session_end_schedule || $session_end_enforced )); then
+    echo "Session limit reached. To start new session remove /srv/osd-debugger.rc" >> $LOG_FILE
+    fetch_logs
+    cp $LOG_FILE  ${debugfolder}/osd-debugger-session-${session_start}-timeline
+    echo "export session_halt=1" >> /srv/osd-debugger.rc
+    exit 0
 fi
 
-
-if [[ $cur_time < $profiler_schedule ]]; then
+if (( $cur_time < $profiler_schedule )); then
     unwind_profiler_probes=0 # disable profiler
 else 
     profiler_schedule=$(( $start_time + profiler_run_delay ))
 fi
 
-if [[ fetch_timeout -eq 0 || $cur_time < $fetch_schedule ]]; then
-    do_log_fetch=0 # disable OSD log fetching
-else 
-    fetch_schedule=$(( $start_time + fetch_timeout ))
-    do_log_fetch=1 
-fi
-
-log_message $start_time "session elaped time $(( $cur_time - $session_start )), session ends in $(( $session_end_schedule -  $cur_time )), fetch log $do_log_fetch, run profiler $unwind_profiler_probes"
-
-
 # Saving variables to osd-debugger.rc
 cat <<EOF > /srv/osd-debugger.rc
 export session_start=$session_start
 export profiler_schedule=$profiler_schedule
-export fetch_schedule=$fetch_schedule
 export session_end_schedule=$session_end_schedule
 EOF
+
+log_message $start_time "session elaped time $(( $cur_time - $session_start )), session ends in $(( $session_end_schedule -  $cur_time ))"
+
+report_time_wait
 
 slowosds=$(ceph health detail -f json | jq -r 2>/dev/null '.checks.SLOW_OPS.summary.message | capture("(?<osds>osd\\.([0-9]+)(,osd\\.[0-9]+)*)").osds | split(",")[]') || slowosds=""
 if [ "$slowosds" = "" ]
 then
   #for host in $(ceph osd tree | grep host | awk '{print $4}'); do rsync -a $host:${debugfolder} /var/log/debug/; done
-  #log_message $start_time "fetch log"
   log_message $start_time "all clear"
   exit 0
 fi
 
 freespace=$(df $debugfolder|tail -n1 | awk '{print $4}')
-timestamp=$(date +%Y-%m-%d-%H-%M-%S)
 #freelimit=52428800 #50G in 1k blocks
 #if [ $freespace -gt $freelimit ]
 #then
@@ -158,42 +219,49 @@ elevate_osd_log() {
     "    
 }
 
-declare -A hosts
-
 process_remote_osd() {
     local osdid=$1	
     local osdhost=$(ceph osd find $osdid| jq '.host'|cut -d . -f 1|cut -f 2 -d '"')
     local osdpid=$(ssh root@${osdhost} "ps -ef | grep 'id $osdid' | grep -v grep | awk '{print \$2}'")
     local log_prefix=${debugfolder}/${timestamp}-${osdhost}-osd.${osdid}
     log_message $start_time "Processing OSD: $osdid on host $osdhost $log_prefix"
-    hosts["$osdhost"]="$osdid"
+    push_unique_to_logs_tobe_fetched "$osdhost" "$osdid" 
+
 
     ssh root@${osdhost} "
         [ -d $debugfolder ] || mkdir -p $debugfolder
         [ ! -f ${log_prefix}-historic_ops ] && ceph daemon osd.$osdid dump_historic_ops > ${log_prefix}-historic_ops 2>&1 
         [ ! -f ${log_prefix}-inflight ] && ceph daemon osd.$osdid dump_ops_in_flight > ${log_prefix}-inflight  2>&1 
     " 
+    log_message $start_time "Histograms of historic_ops and inflight were dumped."
+    ssh root@${osdhost} "iostat -x 1 10" > ${log_prefix}-iostat 2>&1
+    log_message $start_time "iostat -x 1 10 in ${log_prefix}-iostat"
+    log_message $start_time "Offended OSD Sockets stats $(python3 process_ss_output.py)"
     if [[ $unwind_profiler_probes -gt 0 ]]; then 
-        log_message $start_time "starting profiler"
+        log_message $start_time "starting unwind profiler"
         ssh -t root@${osdhost} "/srv/unwind_attach.sh $osdpid $osdid ${log_prefix}-unwindpmp $unwind_profiler_probes"
         log_message $start_time "/srv/unwind_attach.sh $osdpid $osdid ${log_prefix}-unwindpmp $unwind_profiler_probes"
     fi    
     if [[ $collect_perf_record -eq 1 ]]; then
         log_message $start_time "starting perf record"
         #ssh root@${osdhost} "perf record -p $osdpid -F 20 --call-graph dwarf -o ${log_prefix}-perf-data-dwarf  -- sleep 10" > /dev/null 2>&1 
-        ssh root@${osdhost} "perf record -p $osdpid -F 20 -g -o $debugfolder/perf-data-${timestamp}-$osd  -- sleep 10"
+        ssh root@${osdhost} "perf record -p $osdpid -F 20 -g -o ${log_prefix}-perf-data  -- sleep 10"
         log_message $start_time "perf record -p $osdpid"
     fi
-    if [[ $restart_osd -eq 1 ]]; then
-        log_message $start_time "Restarting OSD: $osdid on host $osdhost $log_prefix"
-        ssh root@${osdhost} "systemctl restart ceph-osd@$osdid"
-    fi    
     if [[ $attach_gdb -eq 1 ]]; then
         log_message $start_time "attaching gdb"
         ssh root@${osdhost} "/srv/gdb_attach.sh $osdpid $osdid ${log_prefix}-gdb"
         log_message $start_time "/srv/gdb_attach.sh $osdpid $osdid ${log_prefix}-gdb"
     fi
-    log_message $start_time "processed OSD: $osdid on host $osdhost"
+    if [[ $restart_osd -eq 1 ]]; then
+        log_message $start_time "Restarting OSD: $osdid on host $osdhost $log_prefix"
+        ssh root@${osdhost} "systemctl restart ceph-osd@$osdid"
+        echo "==== post restart ===="  >> ${log_prefix}-iostat
+        ssh root@${osdhost} "iostat -x 1 10" >> ${log_prefix}-iostat 2>&1
+        log_message $start_time "iostat -x 1 10 after restart appended  to ${log_prefix}-iostat"
+        log_message $start_time "Offended OSD Sockets stats after restart $(python3 process_ss_output.py)"
+    fi    
+    log_message $start_time "processed OSD: $osdid on host $osdhost, sockets in time-wait $(ssh $host ss -ant state time-wait | wc -l)"
 
     #    perf record -p $osdpid -F 20 --call-graph dwarf -o ${log_prefix}-perf-data-dwarf  -- sleep 10 > /dev/null 2>&1 
     #ceph tell $osd perf dump > ${log_prefix}-perfdump & 
@@ -231,6 +299,7 @@ slow_ops_inspect() {
     fi
 }
 
+[ -d $debugfolder ] || mkdir -p $debugfolder
 for osd in $slowosds
 do
     osdhost=`ceph osd find $osd| jq '.host'|cut -d . -f 1|cut -f 2 -d '"'`
@@ -252,23 +321,7 @@ do
     slow_ops_inspect ${log_prefix}-inflight $n_inflight $process_inflight_ops "inflight_ops"
 done
 
-
-if [[ $do_log_fetch -gt 0 ]]
-    if [ ${#hosts[@]} -gt 0 ]; then
-        log_message $start_time "do_log_fetch"
-        for host in "${!hosts[@]}"; do
-            if [[ $log_elevation_duration -gt 0 ]]; then
-                rsync -a $host:${debugfolder} /var/log/debug/
-                log_message $start_time "rsync elevated osd log from $host"
-            else
-                rsync -a $host:${debugfolder} /var/log/debug/
-                ssh $host "gzip -c /var/log/ceph/ceph-osd.${hosts[$host]}.log" > ${debugfolder}/${timestamp}-${host}-osd.${hosts[$host]}.log.gz
-                log_message $start_time "ssh $host \"gzip -c /var/log/ceph/ceph-osd.${hosts[$host]}.log\" > ${debugfolder}/${host}-osd.${hosts[$host]}.log"
-            fi
-        done
-    fi
-    cp $LOG_FILE  ${debugfolder}/${session_start}-timeline
-fi
+dump_logs_tobe_fetched_as_shell_script /srv/osd-debugger_session_$session_start.rc
 
 log_message $start_time "all set"
 exit 0

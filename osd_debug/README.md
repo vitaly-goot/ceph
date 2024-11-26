@@ -32,11 +32,12 @@ Ensure the following files and scripts are deployed:
   /srv/unwind_attach.sh
   /etc/logrotate.d/ceph-common-debug
   /srv/elevate_osd_log.sh
-  /srv/gdb_attach.sh    # This script is currently commented out but can be used to attach gdb and collect backtraces from all threads on an affected OSD (requires gdb to be installed).
+  /srv/gdb_attach.sh               
+  /srv/process_ss_output.py  # detailed socket stat info 
 ```
 
 ### Before Each Run: Force Log Rotation on All OSD Hosts
-Execute the following to ensure logs are rotated across all hosts: 
+Optionally execute the following to trim OSD logs before debug session start: 
 ```
 logrotate -f /etc/logrotate.d/ceph-common-debug
 for host in $(ceph osd tree | grep host | awk '{print $4}'); do echo $host; logrotate -f /etc/logrotate.d/ceph-common-debug; done
@@ -64,7 +65,7 @@ The following default configurations can be modified directly in the script:
   attach_gdb=0                                  # Attach with gdb and capture a snapshot of all threads.
   log_elevation_duration=0                      # Duration to elevate log debug level for acting OSDs
   restart_osd=0                                 # Restart *primary* OSD for affected PG when slow_ops_size_threshold && slow_ops_duration_threshold confition met 
-  session_max_duration=400                      # Maximum debug session duration
-  fetch_timeout=$(( $profiler_run_delay + $log_elevation_duration + 1 )) # Timeout for fetching affected OSD logs
+  session_max_duration=400                      # Maximum duration for a debug session; at the end, logs from affected OSDs are retrieved from remote hosts to $debugfolder.
+  session_end_enforced=0                        # Forcefully terminate the debug session and fetch all logs.
 ```
 
