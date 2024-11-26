@@ -1416,6 +1416,7 @@ TEST_F(HandoffHelperImplSubsysTest, AuthorizationParamConstruct)
 
     TestClient cio;
     // Set a header that should be included in the params.
+    // Note the populate code must strip the HTTP_ prefix.
     cio.get_env().set("HTTP_X_AMZ_FOO", "bar");
     s.cio = &cio;
 
@@ -1889,6 +1890,7 @@ TEST_F(AuthzGRPCTest, PopulateAuthorizeRequestXAmzHeaders)
 {
   DEFINE_REQ_STATE;
   TestClient cio;
+  // Note the populate code must strip the HTTP_ prefix.
   cio.get_env().set("HTTP_X_AMZ_FOO", "bar");
   s.cio = &cio;
 
@@ -1902,6 +1904,7 @@ TEST_F(AuthzGRPCTest, PopulateAuthorizeRequestXAmzHeaders)
 
   ASSERT_EQ(req.questions(0).x_amz_headers_size(), 1);
   auto& xah = req.questions(0).x_amz_headers();
+  ASSERT_NE(xah.find("x-amz-foo"), xah.end());
   ASSERT_EQ(xah.at("x-amz-foo"), "bar");
 }
 

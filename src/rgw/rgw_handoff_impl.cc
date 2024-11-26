@@ -32,6 +32,7 @@
 #include "rgw_handoff_impl.h"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/container/flat_map.hpp>
 #include <cerrno>
 #include <cstring>
@@ -131,8 +132,11 @@ AuthorizationParameters::AuthorizationParameters(const DoutPrefixProvider* dpp_i
   ceph_assert(s->cio != nullptr); // Give a helpful error to unit tests.
   for (const auto& kv : s->cio->get_env().get_map()) {
     std::string key = kv.first;
+    // Headers received from the client start with HTTP_.
+    if (ba::starts_with(key, "HTTP_")) {
+      key = key.substr(5);
+    }
     // HTTP headers are uppercased and have hyphens replaced with underscores.
-    key = key.substr(5);
     ba::replace_all(key, "_", "-");
     ba::to_lower(key);
     http_headers_.emplace(key, kv.second);
@@ -1509,8 +1513,11 @@ std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(con
     ceph_assert(s->cio != nullptr); // Give a helpful error to unit tests.
     for (const auto& kv : s->cio->get_env().get_map()) {
       std::string key = kv.first;
+      // Headers received from the client start with HTTP_.
+      if (ba::starts_with(key, "HTTP_")) {
+        key = key.substr(5);
+      }
       // HTTP headers are uppercased and have hyphens replaced with underscores.
-      key = key.substr(5);
       ba::replace_all(key, "_", "-");
       ba::to_lower(key);
       awz_headers->emplace(key, kv.second);
