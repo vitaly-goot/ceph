@@ -40,8 +40,8 @@ public:
 TEST_F(GetTraceIdFromTraceparent, NoHeader)
 {
   RGWEnv env;
-  std::string traceparent;
-  auto opt_traceid = get_traceid_from_traceparent(dpp, env);
+  std::string traceparent = "";
+  auto opt_traceid = get_traceid_from_traceparent(dpp, traceparent);
   ASSERT_THAT(opt_traceid, ::testing::Eq(std::nullopt));
 }
 
@@ -49,9 +49,8 @@ TEST_F(GetTraceIdFromTraceparent, NoHeader)
 TEST_F(GetTraceIdFromTraceparent, ValidHeader)
 {
   RGWEnv env;
-  env.set("HTTP_TRACEPARENT", "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01");
-  std::string traceparent;
-  auto opt_traceid = get_traceid_from_traceparent(dpp, env);
+  std::string traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+  auto opt_traceid = get_traceid_from_traceparent(dpp, traceparent);
   ASSERT_THAT(opt_traceid, ::testing::Ne(std::nullopt));
   ASSERT_EQ(*opt_traceid, "0123456789abcdef0123456789abcdef");
 }
@@ -60,9 +59,8 @@ TEST_F(GetTraceIdFromTraceparent, ValidHeader)
 TEST_F(GetTraceIdFromTraceparent, HeaderBogusCharacter)
 {
   RGWEnv env;
-  env.set("HTTP_TRACEPARENT", "00-x123456789abcdef0123456789abcdef-0123456789abcdef-01");
-  std::string traceparent;
-  auto opt_traceid = get_traceid_from_traceparent(dpp, env);
+  std::string traceparent = "00-x123456789abcdef0123456789abcdef-0123456789abcdef-01";
+  auto opt_traceid = get_traceid_from_traceparent(dpp, traceparent);
   ASSERT_THAT(opt_traceid, ::testing::Eq(std::nullopt));
 }
 
@@ -70,9 +68,8 @@ TEST_F(GetTraceIdFromTraceparent, HeaderBogusCharacter)
 TEST_F(GetTraceIdFromTraceparent, TraceIdTooLong)
 {
   RGWEnv env;
-  env.set("HTTP_TRACEPARENT", "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01-");
-  std::string traceparent;
-  auto opt_traceid = get_traceid_from_traceparent(dpp, env);
+  std::string traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01-";
+  auto opt_traceid = get_traceid_from_traceparent(dpp, traceparent);
   ASSERT_THAT(opt_traceid, ::testing::Eq(std::nullopt));
 }
 
@@ -80,9 +77,8 @@ TEST_F(GetTraceIdFromTraceparent, TraceIdTooLong)
 TEST_F(GetTraceIdFromTraceparent, TraceIdTooShort)
 {
   RGWEnv env;
-  env.set("HTTP_TRACEPARENT", "00-0123456789abcdef0123456789abcdef-0123456789abcdef-0");
-  std::string traceparent;
-  auto opt_traceid = get_traceid_from_traceparent(dpp, env);
+  std::string traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-0";
+  auto opt_traceid = get_traceid_from_traceparent(dpp, traceparent);
   ASSERT_THAT(opt_traceid, ::testing::Eq(std::nullopt));
 }
 

@@ -7,6 +7,8 @@
 #include "include/buffer.h"
 
 #ifdef HAVE_JAEGER
+#include "opentelemetry/context/propagation/text_map_propagator.h"
+#include "opentelemetry/trace/propagation/http_trace_context.h"
 #include "opentelemetry/trace/provider.h"
 
 using jspan = opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>;
@@ -36,13 +38,16 @@ class Tracer {
   // if false is given to `trace_is_enabled` param, noop span will be returned
   jspan start_trace(opentelemetry::nostd::string_view trace_name, bool trace_is_enabled);
 
+  // creates and returns a new span with `trace_name`, with parent span
+  // configured using the traceparent and optionally the tracestate header.
+  jspan start_trace_with_req_state_parent(opentelemetry::nostd::string_view trace_name, bool trace_is_enabled, const std::string& traceparent_header, const std::string& tracestate_header);
+
   // creates and returns a new span with `span_name` which parent span is `parent_span'
   jspan add_span(opentelemetry::nostd::string_view span_name, const jspan& parent_span);
   // creates and return a new span with `span_name`
   // the span is added to the trace which it's context is `parent_ctx`.
   // parent_ctx contains the required information of the trace.
   jspan add_span(opentelemetry::nostd::string_view span_name, const jspan_context& parent_ctx);
-
 };
 
 void encode(const jspan_context& span, ceph::buffer::list& bl, uint64_t f = 0);
@@ -50,6 +55,36 @@ void decode(jspan_context& span_ctx, ceph::buffer::list::const_iterator& bl);
 
 } // namespace tracing
 
+// Container for HTTP headers. Copied from
+// src/jaegertracing/opentelemetry-cpp/examples/http/tracer_common.h with
+// modifications.
+template <typename T>
+class HttpTextMapCarrier : public opentelemetry::context::propagation::TextMapCarrier {
+public:
+  HttpTextMapCarrier<T>(T& headers)
+      : headers_(headers)
+  {
+  }
+  HttpTextMapCarrier() = default;
+  virtual opentelemetry::nostd::string_view Get(
+      opentelemetry::nostd::string_view key) const noexcept override
+  {
+    std::string key_to_compare = key.data();
+    auto it = headers_.find(key_to_compare);
+    if (it != headers_.end()) {
+      return it->second;
+    }
+    return "";
+  }
+
+  virtual void Set(opentelemetry::nostd::string_view key,
+      opentelemetry::nostd::string_view value) noexcept override
+  {
+    headers_.insert(std::pair<std::string, std::string>(std::string(key), std::string(value)));
+  }
+
+  T headers_;
+};
 
 #else  // !HAVE_JAEGER
 

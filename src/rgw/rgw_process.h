@@ -147,8 +147,6 @@ extern int process_request(const RGWProcessEnv& penv,
                            std::string* user,
                            ceph::coarse_real_clock::duration* latency,
                            int* http_ret = nullptr);
-// Utility function for process_request(), used also by unit tests.
-extern std::optional<std::string> get_traceid_from_traceparent(DoutPrefixProvider* dpp, const RGWEnv& env);
 
 extern int rgw_process_authenticated(RGWHandler_REST* handler,
                                      RGWOp*& op,
