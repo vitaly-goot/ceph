@@ -61,7 +61,7 @@ void decode(jspan_context& span_ctx, ceph::buffer::list::const_iterator& bl);
 template <typename T>
 class HttpTextMapCarrier : public opentelemetry::context::propagation::TextMapCarrier {
 public:
-  HttpTextMapCarrier<T>(T& headers)
+  HttpTextMapCarrier(T& headers)
       : headers_(headers)
   {
   }
