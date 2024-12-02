@@ -1,7 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#include "common/errno.h"
 #include "common/Throttle.h"
 #include "common/WorkQueue.h"
 #include "include/scope_guard.h"
@@ -280,6 +279,53 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
   return 0;
 }
 
+/**
+ * @brief Get the OpenTelemetery trace ID from the HTTP traceparent header in
+ * \p env.
+ *
+ * This assumes RGWEnv is set up as would be for process_request(). The
+ * traceparent header will be in \p env as 'HTTP_TRACEPARENT'. The format is
+ * strictly defined here:
+ *   https://uptrace.dev/opentelemetry/opentelemetry-traceparent.html
+ *
+ * Go to reasonable lengths to ensure the header is well-formed and safe to
+ * include in a log file. If the header is not present, or is malformed,
+ * return std::nullopt. Otherwise, return the trace ID as a string.
+ *
+ * @param dpp DoutPrefixProvider. May not be nullptr.
+ * @param env An RGWEnv reference, containing the HTTP headers.
+ * @return std::optional<std::string> A trace ID as string, otherwise
+ * std::nullopt. Errors will be sent to \p dpp at level 1.
+ */
+std::optional<std::string> get_traceid_from_traceparent(DoutPrefixProvider* dpp, const RGWEnv& env)
+{
+  namespace ba = boost::algorithm;
+  static constexpr size_t tp_expected_len = 55;
+
+  ceph_assert(dpp != nullptr);
+
+  const char* traceparent_char = env.get("HTTP_TRACEPARENT");
+  if (!traceparent_char) {
+    return std::nullopt;
+  }
+  std::string traceparent(traceparent_char);
+  // Trim any whitespace that might have crept in.
+  ba::trim(traceparent);
+  // Strictly enforce the header length.
+  if (traceparent.size() != tp_expected_len) {
+    ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("TRACEPARENT header length {} != expected length {}"), traceparent.size(), tp_expected_len) << dendl;
+    return std::nullopt;
+  }
+  // Only hex digits and hyphens are valid.
+  if (!std::all_of(traceparent.begin(), traceparent.end(), [](char c) { return std::isxdigit(c) || c == '-'; })) {
+    ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("TRACEPARENT header contents invalid")) << dendl;
+    return std::nullopt;
+  }
+  // Just return the substring. Whilst the trace ID may still be invalid, it
+  // is at least safe to output to a log file.
+  return traceparent.substr(3, 32);
+}
+
 int process_request(const RGWProcessEnv& penv,
                     RGWRequest* const req,
                     const std::string& frontend_prefix,
@@ -291,14 +337,33 @@ int process_request(const RGWProcessEnv& penv,
                     int* http_ret)
 {
   int ret = client_io->init(g_ceph_context);
-  dout(1) << "====== starting new request req=" << hex << req << dec
-	  << " =====" << dendl;
   perfcounter->inc(l_rgw_req);
 
   RGWEnv& rgw_env = client_io->get_env();
 
   req_state rstate(g_ceph_context, penv, &rgw_env, req->id);
   req_state *s = &rstate;
+
+  // Check for the traceparent header.
+  auto opt_traceid = get_traceid_from_traceparent(s, rgw_env);
+  std::string tracestr;
+  if (opt_traceid) {
+    ldpp_dout(s, 20) << "TRACEPARENT header found, trace_id=" << *opt_traceid << dendl;
+    // Set the trace ID for req_state s. This will helpfully flow through
+    // automatically to op, set below, because RGWOp::gen_prefix() will use
+    // its consituent req_state to generate the prefix.
+    s->otel_trace_id = *opt_traceid;
+    // The the trace ID in the RGWRequest passed in to us. This allows us to
+    // use it in the beast access log line, which is output by the caller of
+    // process_request().
+    req->otel_trace_id = *opt_traceid;
+    // This is used in the 'starting' and 'req done' log lines below, which
+    // use dout() instead of ldpp_dout().
+    tracestr = " trace_id " + *opt_traceid;
+  }
+
+  dout(1) << "====== starting new request req=" << hex << req << dec
+          << tracestr << " =====" << dendl;
 
   s->ratelimit_data = penv.ratelimiting->get_active();
 
@@ -484,12 +549,12 @@ done:
   if (latency) {
     *latency = lat;
   }
-  dout(1) << "====== req done req=" << hex << req << dec
-	  << " op status=" << op_ret
-	  << " http_status=" << s->err.http_ret
-	  << " latency=" << lat
-	  << " ======"
-	  << dendl;
+  dout(1) << "====== req done req=" << hex << req << dec << tracestr
+          << " op status=" << op_ret
+          << " http_status=" << s->err.http_ret
+          << " latency=" << lat
+          << " ======"
+          << dendl;
 
   return (ret < 0 ? ret : s->err.ret);
 } /* process_request */
