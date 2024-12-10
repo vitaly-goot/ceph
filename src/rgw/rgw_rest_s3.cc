@@ -309,6 +309,18 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
 
   dst_zone_trace = s->info.args.get(RGW_SYS_PARAM_PREFIX "if-not-replicated-to");
 
+  // optional part number
+  auto optstr = s->info.args.get_optional("partNumber");
+  if (optstr) {
+    string err;
+    multipart_part_num = strict_strtol(optstr->c_str(), 10, &err);
+    if (!err.empty()) {
+      s->err.message = "Invalid partNumber: " + err;
+      ldpp_dout(s, 10) << "bad part number " << *optstr << ": " << err << dendl;
+      return -ERR_INVALID_PART;
+    }
+  }
+
   return RGWGetObj_ObjStore::get_params(y);
 }
 
@@ -455,7 +467,10 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
       }
     } catch (const buffer::error&) {} // omit x-rgw-replicated-from headers
   }
-
+  if (multipart_parts_count) {
+    dump_header(s, "x-amz-mp-parts-count", *multipart_parts_count);
+  }
+  
   if (! op_ret) {
     if (! lo_etag.empty()) {
       /* Handle etag of Swift API's large objects (DLO/SLO). It's entirerly

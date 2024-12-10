@@ -591,9 +591,10 @@ int AppendObjectProcessor::process_first_chunk(bufferlist &&data, rgw::sal::Data
 
 int AppendObjectProcessor::prepare(optional_yield y)
 {
-  RGWObjState *astate;
-  int r = store->get_obj_state(dpp, &obj_ctx, bucket_info, head_obj,
-                               &astate, &cur_manifest, y);
+  RGWObjState *astate = nullptr;
+  constexpr bool follow_olh = true;
+  int r = store->get_obj_state(dpp, &obj_ctx, bucket_info, head_obj, &astate,
+                               &cur_manifest, follow_olh, y);
   if (r < 0) {
     return r;
   }
