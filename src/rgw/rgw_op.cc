@@ -6763,9 +6763,18 @@ void RGWInitMultipart::pre_exec()
 
 void RGWInitMultipart::execute(optional_yield y)
 {
-  multipart_trace = tracing::rgw::tracer.start_trace(tracing::rgw::MULTIPART, s->trace_enabled);
   bufferlist aclbl, tracebl;
   rgw::sal::Attrs attrs;
+
+  if (!s->otel_traceparent.empty()) {
+    multipart_trace = tracing::rgw::tracer.start_trace_with_req_state_parent(tracing::rgw::MULTIPART,
+        s->trace_enabled, s->otel_traceparent, s->otel_tracestate);
+  } else {
+    multipart_trace = tracing::rgw::tracer.start_trace(tracing::rgw::MULTIPART, s->trace_enabled);
+  }
+  if (s->cct->_conf->rgw_jaeger_agent_extra_attributes) {
+    set_extra_trace_attributes(s, multipart_trace);
+  }
 
   op_ret = get_params(y);
   if (op_ret < 0) {
@@ -6805,7 +6814,6 @@ void RGWInitMultipart::execute(optional_yield y)
   }
   s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, upload_id);
   multipart_trace->UpdateName(tracing::rgw::MULTIPART + upload_id);
-
 }
 
 int RGWCompleteMultipart::verify_permission(optional_yield y)

@@ -1,14 +1,18 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include "tracer.h"
 #include "common/ceph_context.h"
 #include "global/global_context.h"
-#include "tracer.h"
+#include <opentelemetry/trace/experimental_semantic_conventions.h>
+#include <opentelemetry/trace/span_startoptions.h>
 
 #ifdef HAVE_JAEGER
+#include "opentelemetry/context/propagation/global_propagator.h"
+#include "opentelemetry/exporters/jaeger/jaeger_exporter.h"
 #include "opentelemetry/sdk/trace/batch_span_processor.h"
 #include "opentelemetry/sdk/trace/tracer_provider.h"
-#include "opentelemetry/exporters/jaeger/jaeger_exporter.h"
+#include "opentelemetry/trace/propagation/http_trace_context.h"
 
 namespace tracing {
 
@@ -50,6 +54,38 @@ jspan Tracer::start_trace(opentelemetry::nostd::string_view trace_name, bool tra
     return tracer->StartSpan(trace_name);
   }
   return noop_tracer->StartSpan(trace_name);
+}
+
+jspan Tracer::start_trace_with_req_state_parent(opentelemetry::nostd::string_view trace_name,
+    bool trace_is_enabled,
+    const std::string& traceparent_header, const std::string& tracestate_header)
+{
+  if (!trace_is_enabled) {
+    return noop_tracer->StartSpan(trace_name);
+  }
+
+  using namespace opentelemetry;
+
+  // Set global propagator
+  opentelemetry::context::propagation::GlobalTextMapPropagator::SetGlobalPropagator(
+      nostd::shared_ptr<opentelemetry::context::propagation::TextMapPropagator>(
+          new opentelemetry::trace::propagation::HttpTraceContext()));
+
+  // Get global propagator
+  HttpTextMapCarrier<opentelemetry::ext::http::client::Headers> carrier;
+  carrier.Set("traceparent", traceparent_header);
+  carrier.Set("tracestate", tracestate_header);
+  auto propagator = opentelemetry::context::propagation::GlobalTextMapPropagator::GetGlobalPropagator();
+
+  // Extract headers to context
+  auto current_ctx = opentelemetry::context::RuntimeContext::GetCurrent();
+  auto new_context = propagator->Extract(carrier, current_ctx);
+  auto remote_span = opentelemetry::trace::GetSpan(new_context);
+
+  trace::StartSpanOptions span_opts;
+  span_opts.parent = remote_span->GetContext();
+
+  return tracer->StartSpan(trace_name, {}, span_opts);
 }
 
 jspan Tracer::add_span(opentelemetry::nostd::string_view span_name, const jspan& parent_span) {

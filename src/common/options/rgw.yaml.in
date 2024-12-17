@@ -4031,3 +4031,14 @@ options:
   default: true
   services:
   - rgw
+- name: rgw_jaeger_agent_extra_attributes
+  type: bool
+  level: advanced
+  desc: Enable extra attributes in Jaeger agent traces
+  long_desc: If true, extra attributes will be added to Jaeger agent traces.
+    These attributes are specific to RGW requests, such as the processed URIs
+    and request method.
+  default: true
+  services:
+  - rgw
+  with_legacy: true

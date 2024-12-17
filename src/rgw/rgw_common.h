@@ -1223,6 +1223,8 @@ struct req_state : DoutPrefixProvider {
   std::string dialect;
   std::string req_id;
   std::string trans_id;
+  std::string otel_traceparent; // OpenTelemetery traceparent header (verbatim).
+  std::string otel_tracestate; // OpenTelemetery tracestate header (verbatim).
   std::string otel_trace_id; // OpenTelemetery traceparent id.
   uint64_t id;
 
