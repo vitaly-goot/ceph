@@ -194,7 +194,11 @@ protected:
     bufferlist data;
     std::tie(rv, data) = rgw_rest_read_all_input(s, max_len);
     if (rv >= 0) {
-      do_aws4_auth_completion();
+      if (g_ceph_context->_conf->rgw_akamai_ceph_200_revert) {
+        do_aws4_auth_completion();
+      } else {
+        rv = do_aws4_auth_completion();
+      }
     }
 
     return std::make_tuple(rv, std::move(data));
@@ -205,7 +209,11 @@ protected:
                      uint64_t max_len, bool *empty) {
     int r = rgw_rest_get_json_input(cct, s, out, max_len, empty);
     if (r >= 0) {
-      do_aws4_auth_completion();
+      if (g_ceph_context->_conf->rgw_akamai_ceph_200_revert) {
+        do_aws4_auth_completion();
+      } else {
+        r = do_aws4_auth_completion();
+      }
     }
     return r;
   }

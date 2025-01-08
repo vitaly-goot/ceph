@@ -4042,3 +4042,12 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_akamai_ceph_200_revert
+  type: bool
+  level: advanced
+  desc: Revert Akamai CEPH-200 fix behaviour
+  long_desc: Revert to pre-CEPH-200 behaviour.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
