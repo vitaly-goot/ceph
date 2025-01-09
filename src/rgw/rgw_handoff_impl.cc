@@ -240,11 +240,15 @@ std::ostream& operator<<(std::ostream& os, const AuthorizationParameters& ep)
  *
  ****************************************************************************/
 
-HandoffAuthResult AuthServiceClient::Auth(const AuthenticateRESTRequest& req, const HandoffAuthzState* authz_state)
-{
+HandoffAuthResult AuthServiceClient::Auth(const AuthenticateRESTRequest &req,
+                                          const HandoffAuthzState *authz_state,
+                                          std::optional<jspan> opt_span) {
   ::grpc::ClientContext context;
   AuthenticateRESTResponse resp;
 
+  if (opt_span) {
+    populate_trace_context(&context, *opt_span);
+  }
   ::grpc::Status status = stub_->AuthenticateREST(&context, req, &resp);
 
   using namespace authenticator::v1;
@@ -298,11 +302,15 @@ HandoffAuthResult AuthServiceClient::Auth(const AuthenticateRESTRequest& req, co
 }
 
 AuthServiceClient::GetSigningKeyResult
-AuthServiceClient::GetSigningKey(const GetSigningKeyRequest req)
-{
+AuthServiceClient::GetSigningKey(const GetSigningKeyRequest req,
+                                 std::optional<jspan> opt_span) {
   ::grpc::ClientContext context;
+  if (opt_span) {
+    populate_trace_context(&context, *opt_span);
+  }
   GetSigningKeyResponse resp;
 
+  // populate_trace_context(&context, s->trace);
   ::grpc::Status status = stub_->GetSigningKey(&context, req, &resp);
   if (status.ok()) {
     auto key = resp.signing_key();
@@ -942,9 +950,7 @@ HandoffAuthResult HandoffHelperImpl::_grpc_auth(
   }
   ldpp_dout(dpp, 1) << "Sending gRPC auth request" << dendl;
 
-  // Note that we're passing s->handoff_authz as a naked pointer. Auth()
-  // checks for nullptr so this is safe.
-  auto result = client.Auth(req, s->handoff_authz.get());
+  auto result = client.Auth(req, s->handoff_authz.get(), optional_trace(s));
 
   // The client returns a fully-populated HandoffAuthResult, but we want to
   // issue some helpful log messages before returning it.
@@ -1049,7 +1055,7 @@ HandoffHelperImpl::get_signing_key(const DoutPrefixProvider* dpp,
     client.set_stub(new_channel);
   }
   ldpp_dout(dpp, 1) << "Sending gRPC signing key request" << dendl;
-  auto result = client.GetSigningKey(req);
+  auto result = client.GetSigningKey(req, optional_trace(s));
   if (!result.ok()) {
     ldpp_dout(dpp, 1) << "Failed to fetch signing key: " << result.error_message() << dendl;
     return std::nullopt;
@@ -1116,7 +1122,7 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
    *
    * Note that this will std::move req! It gets moved to the result object.
    */
-  auto result = client.AuthorizeV2(req);
+  auto result = client.AuthorizeV2(req, optional_trace(s));
 
   if (result.is_extra_data_required()) {
 
@@ -1169,7 +1175,7 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
         << fmt::format(FMT_STRING("{}: Resubmitting request with extra data: {}"), __func__, proto_to_JSON(req)) << dendl;
     /* Again, this will std::move the request! */
     auto req = opt_req.value();
-    result = client.AuthorizeV2(req);
+    result = client.AuthorizeV2(req, optional_trace(s));
   }
 
   /* We get here after performing either a single AuthorizeV2 request, or two
@@ -1543,12 +1549,17 @@ std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(con
 
 /****************************************************************************/
 
-AuthorizerClient::AuthorizeResult AuthorizerClient::AuthorizeV2(AuthorizeV2Request& req)
-{
+AuthorizerClient::AuthorizeResult
+AuthorizerClient::AuthorizeV2(AuthorizeV2Request &req,
+                              std::optional<jspan> opt_span) {
   using namespace ::authorizer::v1;
 
   ::grpc::ClientContext context;
   AuthorizeV2Response resp;
+
+  if (opt_span) {
+    populate_trace_context(&context, *opt_span);
+  }
 
   ::grpc::Status status = stub_->AuthorizeV2(&context, req, &resp);
   if (status.ok()) {

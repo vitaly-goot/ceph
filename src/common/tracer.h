@@ -10,10 +10,12 @@
 #include "opentelemetry/context/propagation/text_map_propagator.h"
 #include "opentelemetry/trace/propagation/http_trace_context.h"
 #include "opentelemetry/trace/provider.h"
+#include <opentelemetry/trace/span_context.h>
 
 using jspan = opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span>;
 using jspan_context = opentelemetry::trace::SpanContext;
 using jspan_attribute = opentelemetry::common::AttributeValue;
+using jscope = opentelemetry::trace::Scope;
 
 namespace tracing {
 
@@ -48,6 +50,13 @@ class Tracer {
   // the span is added to the trace which it's context is `parent_ctx`.
   // parent_ctx contains the required information of the trace.
   jspan add_span(opentelemetry::nostd::string_view span_name, const jspan_context& parent_ctx);
+
+  jscope WithActiveSpan(jspan span) { return tracer->WithActiveSpan(span); }
+
+private:
+  // Initialise the OTLP Tracer, and configure opentelemetry library logging.
+  // Called from init() if configuration specifies OTLP tracing.
+  void init_otlp(opentelemetry::nostd::string_view service_name);
 };
 
 void encode(const jspan_context& span, ceph::buffer::list& bl, uint64_t f = 0);
@@ -112,6 +121,7 @@ struct span_stub {
   const jspan_context& GetContext() { return _ctx; }
   void UpdateName(std::string_view) {}
   bool IsRecording() { return false; }
+  void End() {}
 };
 
 class jspan {
@@ -133,6 +143,13 @@ struct Tracer {
   jspan start_trace(std::string_view, bool enabled = true) { return {}; }
   jspan add_span(std::string_view, const jspan&) { return {}; }
   jspan add_span(std::string_view span_name, const jspan_context& parent_ctx) { return {}; }
+  jspan
+  start_trace_with_req_state_parent(std::string_view trace_name,
+                                    bool trace_is_enabled,
+                                    const std::string &traceparent_header,
+                                    const std::string &tracestate_header) {
+    return {};
+  };
   void init(std::string_view service_name) {}
 };
   inline void encode(const jspan_context& span, bufferlist& bl, uint64_t f=0) {}
