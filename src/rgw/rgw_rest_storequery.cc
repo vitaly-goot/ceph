@@ -29,7 +29,7 @@ void RGWStoreQueryOp_Base::send_response_pre()
     set_req_state_err(s, -EINVAL);
   }
   dump_errno(s);
-  end_header(s, this, "application/json");
+  end_header(s, this, "application/json", CHUNKED_TRANSFER_ENCODING, true, op_ret == -ENOENT);
   dump_start(s);
 }
 
