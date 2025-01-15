@@ -29,6 +29,8 @@ void RGWStoreQueryOp_Base::send_response_pre()
     set_req_state_err(s, -EINVAL);
   }
   dump_errno(s);
+  // override end_header() defaults: set force_no_error = true when ENOENT
+  // this disables standard NoSuchKey s3 error message, to use our own.
   end_header(s, this, "application/json", CHUNKED_TRANSFER_ENCODING, true, op_ret == -ENOENT);
   dump_start(s);
 }
