@@ -5649,8 +5649,7 @@ int RGWRados::get_olh_target_state(const DoutPrefixProvider *dpp,
   ceph_assert(olh_state->is_olh);
 
   rgw_obj target;
-  int r = RGWRados::follow_olh(dpp, bucket_info, obj_ctx, olh_state, obj,
-                               &target); /* might return -EAGAIN */
+  int r = RGWRados::follow_olh(dpp, bucket_info, obj_ctx, olh_state, obj, &target); /* might return -EAGAIN */
   if (r < 0) {
     return r;
   }
@@ -5659,7 +5658,7 @@ int RGWRados::get_olh_target_state(const DoutPrefixProvider *dpp,
 }
 
 int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp,
-                                 RGWObjectCtx *octx, RGWBucketInfo &bucket_info,
+                                 RGWObjectCtx *rctx, RGWBucketInfo &bucket_info,
                                  const rgw_obj &obj, RGWObjStateManifest **psm,
                                  bool follow_olh, optional_yield y,
                                  bool assume_noent) {
@@ -5669,14 +5668,14 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp,
 
   bool need_follow_olh = follow_olh && obj.key.instance.empty();
 
-  RGWObjStateManifest *sm = octx->get_state(obj);
+  RGWObjStateManifest *sm = rctx->get_state(obj);
   RGWObjState *s = &(sm->state);
-  ldpp_dout(dpp, 20) << "get_obj_state: octx=" << (void *)octx << " obj=" << obj << " state=" << (void *)s << " s->prefetch_data=" << s->prefetch_data << dendl;
+  ldpp_dout(dpp, 20) << "get_obj_state: rctx=" << (void *)rctx << " obj=" << obj << " state=" << (void *)s << " s->prefetch_data=" << s->prefetch_data << dendl;
   *psm = sm;
 
   if (s->has_attrs) {
     if (s->is_olh && need_follow_olh) {
-      return get_olh_target_state(dpp, *octx, bucket_info, obj, s, psm, y);
+      return get_olh_target_state(dpp, *rctx, bucket_info, obj, s, psm, y);
     }
     return 0;
   }
@@ -5828,7 +5827,7 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp,
     ldpp_dout(dpp, 20) << __func__ << ": setting s->olh_tag to " << string(s->olh_tag.c_str(), s->olh_tag.length()) << dendl;
 
     if (need_follow_olh) {
-      return get_olh_target_state(dpp, *octx, bucket_info, obj, s, psm, y);
+      return get_olh_target_state(dpp, *rctx, bucket_info, obj, s, psm, y);
     } else if (obj.key.have_null_instance() && !sm->manifest) {
       // read null version, and the head object only have olh info
       s->exists = false;
@@ -5839,13 +5838,13 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp,
   return 0;
 }
 
-int RGWRados::get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *octx, RGWBucketInfo& bucket_info, const rgw_obj& obj, RGWObjStateManifest** psm,
+int RGWRados::get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx, RGWBucketInfo& bucket_info, const rgw_obj& obj, RGWObjStateManifest** psm,
                             bool follow_olh, optional_yield y, bool assume_noent)
 {
   int ret;
 
   do {
-    ret = get_obj_state_impl(dpp, octx, bucket_info, obj, psm, follow_olh, y, assume_noent);
+    ret = get_obj_state_impl(dpp, rctx, bucket_info, obj, psm, follow_olh, y, assume_noent);
   } while (ret == -EAGAIN);
 
   return ret;
@@ -6396,7 +6395,7 @@ int RGWRados::Object::Read::prepare(optional_yield y, const DoutPrefixProvider *
     return -ENOENT;
   }
 
-  RGWBucketInfo &bucket_info = source->get_bucket_info();
+  RGWBucketInfo& bucket_info = source->get_bucket_info();
 
   if (params.part_num) {
     int parts_count = 0;
