@@ -2331,7 +2331,6 @@ version_t OSDMonitor::get_trim_to() const
 }
 
 /* There are two constraints on trimming:
- *
  * 1. we must not trim past the last_epoch_clean for any pg
  * 2. we must not trim past the last reported epoch for any up
  *    osds.
