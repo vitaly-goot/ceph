@@ -310,7 +310,6 @@ AuthServiceClient::GetSigningKey(const GetSigningKeyRequest req,
   }
   GetSigningKeyResponse resp;
 
-  // populate_trace_context(&context, s->trace);
   ::grpc::Status status = stub_->GetSigningKey(&context, req, &resp);
   if (status.ok()) {
     auto key = resp.signing_key();
