@@ -157,7 +157,6 @@ function(do_build_boost root_dir version)
     string(REPLACE "." "_" boost_version_underscore ${boost_version} )
     string(JOIN ";" boost_url
       https://download.ceph.com/qa/boost_${boost_version_underscore}.tar.bz2
-      https://boostorg.jfrog.io/artifactory/main/release/${boost_version}/source/boost_${boost_version_underscore}.tar.bz2
     )
     set(source_dir
       URL ${boost_url}
