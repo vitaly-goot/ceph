@@ -2,11 +2,14 @@
 // vim: ts=8 sw=2 smarttab
 #pragma once
 
-#include "rgw_op.h"
-#include "rgw_rest_s3.h"
 #include <fmt/printf.h>
 #include <memory>
+#include <sys/types.h>
 #include <unistd.h>
+
+#include "common/dout.h"
+#include "rgw_op.h"
+#include "rgw_rest_s3.h"
 
 namespace rgw {
 
@@ -217,6 +220,10 @@ public:
    */
   bool parse(const DoutPrefixProvider* dpp, const std::string& input,
       RGWSQHandlerType handler_type);
+
+  /// Quickly determine if the input is a valid base64 string.
+  bool valid_base64(const DoutPrefixProvider* dpp, const std::string& input);
+
   RGWOp* op() noexcept { return op_; }
   std::string command() noexcept { return command_; }
   std::vector<std::string> param() noexcept { return param_; }
@@ -268,6 +275,12 @@ public:
    * @return int zero (success).
    */
   int verify_permission(optional_yield y) override { return 0; }
+
+  /**
+   * @brief StoreQuery commands are read-only.
+   *
+   * @return uint32_t the op type.
+   */
   uint32_t op_mask() override { return RGW_OP_TYPE_READ; }
 
   /**
@@ -337,11 +350,11 @@ protected:
  * Example response:
  * 200 OK
  *
- * With body (formatting added)
- *   <?xml version="1.0" encoding="UTF-8"?>
- *   <StoreQueryPingResult>
- *     <request_id>foo</request_id>
- *   </StoreQueryPingResult>
+ * With body (formatting may vary):
+ *
+ *   "StoreQueryPingResult": {
+ *     "request_id": "foo"
+ *   }
  * ```
  *
  * The request_id is blindly mirrored back to the caller.
@@ -410,22 +423,21 @@ public:
  * ...
  *
  * Example response:
- * 200 OK
+ *   200 OK
  *
- * With body (formatting added)
- *   <?xml version="1.0" encoding="UTF-8"?>
- *   <StoreQueryObjectStatusResult>
- *     <Object>
- *       <bucket>test</bucket>
- *       <key>foo</key>
- *       <deleted>false</deleted>
- *       <multipart_upload_in_progress>false</multipart_upload_in_progress>
- *       <version_id></version_id>
- *       <size>123</size>
- *     </Object>
- *   </StoreQueryObjectStatusResult>
+ * Response body:
+ *
+ *   "StoreQueryObjectStatusResult: {
+ *     "Object": {
+ *         "bucket": "test",
+ *         "key": "foo",
+ *         "deleted": false,
+ *         "multipart_upload_in_progress": false,
+ *         "version_id": "",
+ *         "size": 123
+ *     }
+ *   }
  * ```
- *
  */
 class RGWStoreQueryOp_ObjectStatus : public RGWStoreQueryOp_Base {
 private:
@@ -475,5 +487,400 @@ public:
   void send_response_json() override;
   const char* name() const override { return "storequery_objectstatus"; }
 };
+
+class RGWStoreQueryListItem {
+private:
+  std::string key_;
+  std::optional<bool> is_deleted_;
+  std::optional<uint64_t> size_;
+
+public:
+  RGWStoreQueryListItem(const std::string& key)
+      : key_(key)
+  {
+  }
+  const std::string& key() const noexcept { return key_; }
+
+  void set_deleted(bool deleted) noexcept { is_deleted_ = deleted; }
+  void unset_deleted() noexcept { is_deleted_.reset(); }
+  std::optional<bool> is_deleted() const noexcept { return is_deleted_; }
+
+  void set_size(uint64_t size) noexcept { size_ = size; }
+  void unset_size() noexcept { size_.reset(); }
+  std::optional<uint64_t> size() const noexcept { return size_; }
+
+  void dump(Formatter* f) const
+  {
+    f->open_object_section("Object");
+    f->dump_string("key", key_);
+    // Only dump optional attributes if they've been given values.
+    if (is_deleted_.has_value() && *is_deleted_) {
+      // We only dump the attribute if it's set and true.
+      f->dump_bool("deleted", *is_deleted_);
+    }
+    if (size_.has_value()) {
+      // Size of zero is a value value.
+      f->dump_unsigned("size", *size_);
+    }
+    f->close_section();
+  }
+}; // RGWStoreQueryListItem
+
+/**
+ * @brief StoreQuery ObjectList command implementation.
+ *
+ * Return a list of objects in the bucket, limited to a maximum number of
+ * records. Support pagination to allow the list to exceed the maximum number
+ * of records.
+ *
+ * Unlike ObjectStatus, this will not include multipart uploads. It is
+ * difficult to see how a single, paginated list across multiple RGWs could
+ * meaninfully encompass both types, so we're not going to try. It makes sense
+ * for ObjectStatus to combine the classes because the scope is limited. Here,
+ * we're querying an entire bucket which might have billions of objects.
+ *
+ * Here is an example JSON response, with the query size limited rather
+ * artifically to two objects:
+ *
+ * ```
+ *   {
+ *     "Objects": [
+ *       {
+ *         "key": "MDAwMDAwMTEK",
+ *         "size": 16
+ *       },
+ *       {
+ *         "key": "MDAwMDAwMjIK",
+ *         "deleted": true
+ *       }
+ *     ],
+ *     "Stats": {
+ *       "entries_max": 2,
+ *       "entries_actual": 2,
+ *       "sal_seen": 2,
+ *       "sal_exists": 1,
+ *       "sal_current": 2,
+ *       "sal_deleted": 1
+ *     },
+ *     "NextToken": "MDAwMDAwMjI="
+ *   }
+ * ```
+ *
+ * The object key names are base64-encoded as they can contain codepoints that
+ * might interfere with JSON encoding. Size is in bytes.
+ *
+ * To retrieve the next page of results, the client issues an \a objectlist
+ * query specifying the continuation token specified in the \a NextToken field
+ * of the JSON response.
+ */
+class RGWStoreQueryOp_ObjectList : public RGWStoreQueryOp_Base {
+
+protected:
+  struct Stats {
+    /// The maximum number of entries requested by the user.
+    uint64_t entries_max = 0;
+    /// The number of entries actually returned to the user.
+    uint64_t entries_actual = 0;
+    /// The number of list() queries of size \a entries_max to the SAL.
+    uint64_t sal_queries = 0;
+    /// The number of objects returned by querying the SAL.
+    uint64_t sal_seen = 0;
+    /// Out of \a sal_seen, the number of objects with the `exists` flag set.
+    uint64_t sal_exists = 0;
+    /// Out of \a sal_seen, the number of objects with the `current` flag set.
+    uint64_t sal_current = 0;
+    /// Out of \a sal_seen, the number of objects with the `current` flag
+    /// cleared.
+    uint64_t sal_not_current = 0;
+    /// Out of \a sal_seen, the number of objects with the `current` /and/
+    /// `deleted` flag set.
+    uint64_t sal_deleted = 0;
+
+    /// Format stats to the given formatter object.
+    void dump(ceph::Formatter* f) const
+    {
+      f->dump_unsigned("entries_max", entries_max);
+      f->dump_unsigned("entries_actual", entries_actual);
+      f->dump_unsigned("sal_queries", sal_queries);
+      f->dump_unsigned("sal_seen", sal_seen);
+      f->dump_unsigned("sal_exists", sal_exists);
+      f->dump_unsigned("sal_current", sal_current);
+      f->dump_unsigned("sal_not_current", sal_not_current);
+      f->dump_unsigned("sal_deleted", sal_deleted);
+    }
+  }; // struct RGWStoreQueryOp_ObjectList::Stats
+
+  /**
+   * @brief A single item in the list of objects returned by the query.
+   */
+  class Item {
+  private:
+    std::string key_;
+    std::optional<bool> is_deleted_;
+    std::optional<uint64_t> size_;
+
+  public:
+    Item(const std::string& key)
+        : key_(key)
+    {
+    }
+    const std::string& key() const noexcept { return key_; }
+
+    void set_deleted(bool deleted) noexcept { is_deleted_ = deleted; }
+    void unset_deleted() noexcept { is_deleted_.reset(); }
+    std::optional<bool> is_deleted() const noexcept { return is_deleted_; }
+
+    void set_size(uint64_t size) noexcept { size_ = size; }
+    void unset_size() noexcept { size_.reset(); }
+    std::optional<uint64_t> size() const noexcept { return size_; }
+
+    void dump(Formatter* f) const;
+  }; // RGWStoreQueryListItem
+
+private:
+  using item_type = Item;
+
+  uint64_t max_entries_;
+  std::optional<std::string> marker_;
+  std::optional<std::string> return_marker_;
+  std::vector<item_type> items_;
+
+  Stats stats_;
+
+public:
+  RGWStoreQueryOp_ObjectList(uint64_t max_entries, std::optional<std::string> marker)
+      : max_entries_(max_entries)
+      , marker_(marker)
+  {
+  }
+
+  RGWStoreQueryOp_ObjectList() = delete;
+  RGWStoreQueryOp_ObjectList(const RGWStoreQueryOp_ObjectList&) = delete;
+  RGWStoreQueryOp_ObjectList& operator=(const RGWStoreQueryOp_ObjectList&) = delete;
+  RGWStoreQueryOp_ObjectList(RGWStoreQueryOp_ObjectList&&) = delete;
+  RGWStoreQueryOp_ObjectList& operator=(RGWStoreQueryOp_ObjectList&&) = delete;
+
+  static constexpr uint64_t LIST_QUERY_SIZE_HARD_LIMIT = 10000;
+
+  /**
+   * @brief execute() for RGWStoreQueryOp_ObjectList (StoreQuery objectlist).
+   *
+   * Simply calls execute_query() to perform the query.
+   *
+   * @param y optional yield.
+   */
+  void execute(optional_yield y) override;
+
+  void send_response_json() override;
+  const char* name() const override { return "storequery_objectlist"; }
+
+  /**
+   * @brief Fetch a subset of the list of object from the SAL.
+   *
+   * NOTE: The optional_yield is used here, so be careful if you're adding
+   * tracing. The list queries can take a long time and you could end up
+   * detaching traces from their parents.
+   *
+   * This method will populate \p items_ with a subset of the objects in the
+   * bucket. The query is not configurable; we want to do as little work as
+   * possible, and provide as few ways to break things as we can.
+   *
+   * If the query fails, \p op_ret will be set to the error code and \p items_
+   * must not be used. If the query succeeds, \p op_ret will be >= 0, and \a
+   * send_response_json() can return results to the user.
+   *
+   * It is highly likely that the query will not be able to return all objects
+   * in a single request. As a result, the JSON will include a NextToken field
+   * that will allow the user to request the next page of results. This is
+   * very similar to pagination in AWS. Pass the returned continuation token
+   * to the next query to get the next page of results.
+   *
+   * The page size is capped at LIST_QUERY_SIZE_HARD_LIMIT. This is a
+   * precaution to stop over-zealous microservices breaking the OSDs. We do
+   * not at the time of writing know the impact of gigantic list queries, so
+   * the value is capped at the largest value used by vanilla RGW as part of
+   * the SWIFT API. S3 usually limits responses to 1000 objects.
+   *
+   * Using very small page sizes is not helpful. The SAL queries will perform
+   * a readahead of (by default) 1000 objects anyway, so setting a page size
+   * less than this actively wastes time and does unnecessary work.
+   *
+   * The pagination can return duplicate items across requests in versioned
+   * buckets. The client should deal with this gracefully.
+   *
+   * @param y optional yield.
+   * @return true Success. \p items_ is populated and can be used.
+   * @return false Failure. \p op_ret is set, and \p items_ should not be
+   * used.
+   */
+  bool execute_query(optional_yield y);
+
+  /**
+   * @brief Set the return marker (continuation token) for the next query.
+   *
+   * By default, the return marker is \p std::nullopt, indicating no value.
+   *
+   * @param marker The return marker (contination token) to set.
+   */
+  void set_return_marker(const std::string& marker) { return_marker_ = marker; }
+  /// Reset the return marker to its default no value state.
+  void unset_return_marker() { return_marker_.reset(); }
+  /// Fetch the return marker (continuation token) for the next query, or
+  /// std::nullopt if none is set.
+  std::optional<std::string> return_marker() const { return return_marker_; }
+
+  /// Fetch the maximum number of entries to return in this query.
+  uint64_t max_entries() const { return max_entries_; }
+  /// Fetch the continuation marker used when issuing this query. Contrast
+  /// with return_marker() which is the optional marker for the next query.
+  std::optional<std::string> marker() const { return marker_; }
+
+}; // RGWStoreQueryOp_ObjectList
+
+/**
+ * @brief StoreQuery MPUploadList command implementation.
+ *
+ * Return a list of in-flight multipart uploads for the bucket, limited to a
+ * maximum number of records. Support pagination to allow the list to exceed
+ * the maximum number of records.
+ *
+ * This is a counterpart to the objectlist command.
+ *
+ * Here is an example JSON response with the query size limited rather
+ * artificially to two objects:
+ *
+ * ```
+ *  {
+ *    "Objects": [
+ *      {
+ *        "key": "bXAwMDAwMDAwMQ==",
+ *        "upload_id": "Mn5hXzhtV2UtZGRaU1VPNF83WkJla0M2ZnNCV2VOOUpl"
+ *      },
+ *      {
+ *        "key": "bXAwMDAwMDAwMg==",
+ *        "upload_id": "Mn5GcXo2enFpT0t2bUlleVljY3llSFJ1b09ZeHZSWkhI"
+ *      }
+ *    ],
+ *    "NextToken": "bXAwMDAwMDAwMi4yfkZxejZ6cWlPS3ZtSWV5WWNjeWVIUnVvT1l4dlJaSEgubWV0YQ=="
+ *  }
+ * ```
+ *
+ * The object key names and the upload IDs are base64-encoded, since both can
+ * contain codepoints that might not survive JSON encoding.
+ *
+ * To retrieve the next page of results, the client issues an \a mpuploadlist
+ * query specifying the continuation token specified in the \a NextToken field
+ * of the JSON response.
+ */
+class RGWStoreQueryOp_MPUploadList : public RGWStoreQueryOp_Base {
+
+protected:
+  /**
+   * @brief A single item in the list of in-progress multipart uploads.
+   */
+  class Item {
+  private:
+    std::string key_;
+    std::string upload_id_;
+
+  public:
+    Item(const std::string& key, const std::string& upload_id)
+        : key_(key)
+        , upload_id_(upload_id)
+    {
+    }
+    const std::string& key() const noexcept { return key_; }
+    const std::string& upload_id() const noexcept { return upload_id_; }
+
+    void dump(Formatter* f) const;
+  }; // Item
+
+private:
+  using item_type = Item;
+
+  uint64_t max_entries_;
+  std::optional<std::string> marker_;
+  std::optional<std::string> return_marker_;
+  std::vector<item_type> items_;
+
+public:
+  RGWStoreQueryOp_MPUploadList(uint64_t max_entries, std::optional<std::string> marker)
+      : max_entries_(max_entries)
+      , marker_(std::move(marker))
+  {
+  }
+
+  RGWStoreQueryOp_MPUploadList() = delete;
+  RGWStoreQueryOp_MPUploadList(const RGWStoreQueryOp_MPUploadList&) = delete;
+  RGWStoreQueryOp_MPUploadList& operator=(const RGWStoreQueryOp_MPUploadList&) = delete;
+  RGWStoreQueryOp_MPUploadList(RGWStoreQueryOp_MPUploadList&&) = delete;
+  RGWStoreQueryOp_MPUploadList& operator=(RGWStoreQueryOp_MPUploadList&&) = delete;
+
+  static constexpr uint64_t LIST_MULTIPARTS_QUERY_SIZE_HARD_LIMIT = 10000;
+
+  void execute(optional_yield y) override;
+
+  void send_response_json() override;
+
+  const char* name() const override { return "storequery_mpuploadlist"; }
+
+  /**
+   * @brief Fetch a subset of the list of in-progress multipart uploads from
+   * the SAL.
+   *
+   * NOTE: The optional_yield is used here, so be careful if you're adding
+   * tracing. It turns out that the multipart_list call doesn't actually take
+   * the yield (I think it should) but don't assume this will always be the
+   * case.
+   *
+   * This method will populate \p items_ with a subset of the in-progress
+   * multipart uploads. The query is not configurable; we want to do as little
+   * work as possible, and provide as few ways to break things as we can.
+   *
+   * If the query fails, \p op_ret will be set to the error code and \p items_
+   * must not be used. If the query succeeds, \p op_ret will be >= 0, and \a
+   * send_response_json() can return results to the user.
+   *
+   * It will often be the case that the query will not be able to return all
+   * in-progress multipart uploads in one go. In that case, the JSON will
+   * include  a NextToken field that will allow the user to request the next
+   * page of results. This is very similar to pagination in AWS. Pass the
+   * returned contuation token to the next query to get the next page of
+   * results.
+   *
+   * The page size is capped at LIST_MULTIPARTS_QUERY_SIZE_HARD_LIMIT. This is
+   * a precaution to stop over-zealous microservices breaking the OSDs. We do
+   * not at the time of writing know the impact of gigantic list queries, so
+   * the value is capped at the largest value passed to
+   * rgw::sal::Bucket::list() (the underlying call used by
+   * rgw::sal::Bucket::list_multipart_uploads()) in RGW. This is the value
+   * used by the SWIFT API. S3 usually limits responses to 1000 objects.
+   *
+   * Using very small page sizes is not helpful. The SAL queries will perform
+   * a readahead of (by default) 1000 objects anyway, so setting a page size
+   * less than this actively wastes time and does unnecessary work.
+   *
+   * @param y optional yield.
+   * @return true Success. \p items_ is populated and can be used.
+   * @return false Failure. \p op_ret is set, and \p items_ should not be
+   * used.
+   */
+  bool execute_query(optional_yield y);
+
+  /**
+   * @brief Set the return marker (continuation token) for the next query.
+   *
+   * By default, the return marker is \p std::nullopt, indicating no value.
+   *
+   * @param marker The return marker (contination token) to set.
+   */
+  void set_return_marker(const std::string& marker) { return_marker_ = marker; }
+  /// Reset the return marker to its default no value state.
+  void unset_return_marker() { return_marker_.reset(); }
+  /// Fetch the return marker (continuation token) for the next query, or
+  /// std::nullopt if none is set.
+  std::optional<std::string> return_marker() const { return return_marker_; }
+
+}; // RGWStoreQueryOp_MPUploadList
 
 } // namespace rgw

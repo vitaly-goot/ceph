@@ -549,12 +549,13 @@ if(WITH_RADOSGW)
 
     list(APPEND CMAKE_PREFIX_PATH ${RGW_ABSL_ROOT_DIR}/lib/cmake/absl)
 
-    foreach(pkg in utf8_range protobuf grpc)
+    foreach(pkg utf8_range protobuf grpc)
       list(APPEND CMAKE_PREFIX_PATH ${RGW_GRPC_ROOT_DIR}/lib/cmake/${pkg})
     endforeach()
 
     find_package(absl REQUIRED)
     find_package(utf8_range REQUIRED)
+    set(protobuf_MODULE_COMPATIBLE TRUE)
     find_package(protobuf REQUIRED)
     find_package(gRPC REQUIRED)
 

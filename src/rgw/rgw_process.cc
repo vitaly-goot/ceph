@@ -367,6 +367,10 @@ int process_request(const RGWProcessEnv& penv,
 
   ldpp_dout(s, 2) << "initializing for trans_id = " << s->trans_id << dendl;
 
+  // Akamai: These variables are declared in a C-style block here because
+  // there are some goto statements later, and C++ doesn't allow jumping over
+  // variable declarations.
+
   RGWOp* op = nullptr;
   int init_error = 0;
   bool should_log = false;
@@ -377,6 +381,7 @@ int process_request(const RGWProcessEnv& penv,
                                                frontend_prefix,
                                                client_io, &mgr, &init_error);
   rgw::dmclock::SchedulerCompleter c;
+  std::string trace_name;
 
   if (init_error != 0) {
     abort_early(s, nullptr, init_error, nullptr, yield);
@@ -392,6 +397,23 @@ int process_request(const RGWProcessEnv& penv,
     abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler, yield);
     goto done;
   }
+
+  // Start tracing earlier than stock RGW. We want to trace the entire
+  // request, not just post-authentication.
+  trace_name = std::string(op->name()) + " " + s->trans_id;
+  s->trace_enabled = tracing::rgw::tracer.is_enabled();
+  if (!s->otel_traceparent.empty()) {
+    s->trace = tracing::rgw::tracer.start_trace_with_req_state_parent(
+        trace_name, s->trace_enabled, s->otel_traceparent, s->otel_tracestate);
+  } else {
+    s->trace = tracing::rgw::tracer.start_trace(trace_name, s->trace_enabled);
+  }
+  s->trace->SetAttribute(tracing::rgw::OP, op->name());
+  s->trace->SetAttribute(tracing::rgw::TYPE, tracing::rgw::REQUEST);
+  if (s->cct->_conf->rgw_jaeger_agent_extra_attributes) {
+    set_extra_trace_attributes(s, s->trace);
+  }
+
   {
     s->trace_enabled = tracing::rgw::tracer.is_enabled();
     std::string script;
@@ -421,12 +443,17 @@ int process_request(const RGWProcessEnv& penv,
   s->op_type = op->get_type();
 
   try {
-    ldpp_dout(op, 2) << "verifying requester" << dendl;
-    ret = op->verify_requester(*penv.auth_registry, yield);
-    if (ret < 0) {
-      dout(10) << "failed to authorize request" << dendl;
-      abort_early(s, op, ret, handler, yield);
-      goto done;
+    {
+      ldpp_dout(op, 2) << "verifying requester" << dendl;
+      auto span = tracing::rgw::tracer.add_span("verify_requester", s->trace);
+      std::swap(span, s->trace);
+      ret = op->verify_requester(*penv.auth_registry, yield);
+      std::swap(span, s->trace);
+      if (ret < 0) {
+        dout(10) << "failed to authorize request" << dendl;
+        abort_early(s, op, ret, handler, yield);
+        goto done;
+      }
     }
 
     /* FIXME: remove this after switching all handlers to the new authentication
@@ -447,20 +474,6 @@ int process_request(const RGWProcessEnv& penv,
       dout(10) << "user is suspended, uid=" << s->user->get_id() << dendl;
       abort_early(s, op, -ERR_USER_SUSPENDED, handler, yield);
       goto done;
-    }
-
-
-    const auto trace_name = std::string(op->name()) + " " + s->trans_id;
-    if (!s->otel_traceparent.empty()) {
-      s->trace = tracing::rgw::tracer.start_trace_with_req_state_parent(trace_name,
-          s->trace_enabled, s->otel_traceparent, s->otel_tracestate);
-    } else {
-      s->trace = tracing::rgw::tracer.start_trace(trace_name, s->trace_enabled);
-    }
-    s->trace->SetAttribute(tracing::rgw::OP, op->name());
-    s->trace->SetAttribute(tracing::rgw::TYPE, tracing::rgw::REQUEST);
-    if (s->cct->_conf->rgw_jaeger_agent_extra_attributes) {
-      set_extra_trace_attributes(s, s->trace);
     }
 
     ret = rgw_process_authenticated(handler, op, req, s, yield, driver);

@@ -6379,6 +6379,18 @@ options:
   - rgw
   - osd
   with_legacy: true
+- name: jaeger_tracing_verbose_attributes
+  type: bool
+  level: advanced
+  desc: Enable verbose attributes in Jaeger traces that may help attackers
+  long_desc: If true, the Jaeger tracer will include more verbose attributes in
+    traces, which will help debugging but could conceivably make attacks
+    easier as well.
+  default: false
+  services:
+  - rgw
+  - osd
+  with_legacy: true
 - name: jaeger_agent_host
   type: str
   level: advanced
@@ -6395,6 +6407,97 @@ options:
   services:
   - rgw
   - osd
+- name: otlp_tracing_enable
+  type: bool
+  level: advanced
+  desc: Ceph should use OpenTelemetry tracing system
+  long_desc: Send OpenTelemetry traces to a collector using gRPC. If true,
+    this will disable Jaeger traces.
+  see_also:
+  - jaeger_tracing_enable
+  - otlp_endpoint_url
+  default: false
+  services:
+  - rgw
+  - osd
+  with_legacy: true
+- name: otlp_tracing_log_level_debug
+  type: bool
+  level: advanced
+  desc: Enable debug logging for the OpenTelemetry library
+  long_desc: If true, opentelemetry-cpp will log all debug messages including
+    level Debug. If false, the tracer will log only at levels error, warning
+    and info messages.
+  see_also:
+  - otlp_tracing_enable
+  default: false
+  services:
+  - rgw
+  - osd
+  with_legacy: true
+- name: otlp_endpoint_url
+  type: str
+  level: advanced
+  desc: Endpoint of the OpenTelemetry collector
+  long_desc: The endpoint of the OpenTelemetry collector to which traces should
+    be sent. This is an http(s) URL, not a gRPC endpoint spec. That's what
+    the OpenTelemetry library wants. https is not currently supported.
+  see_also:
+  - otlp_tracing_enable
+  default: http://127.0.0.1:4317
+  services:
+  - rgw
+  - osd
+  with_legacy: true
+- name: otlp_endpoint_ca_cert_file
+  type: str
+  level: advanced
+  desc: Path to a PEM file containing CA cert information for OpenTelemetry.
+  long_desc: The path to a PEM file containing the CA cert information for the
+    OpenTelemetry collector. This is used to verify the collector's
+    certificate. If empty, it's likely that an HTTPS URI in otlp_endpoint_url
+    will fail to connect.
+  see_also:
+  - otlp_tracing_enable
+  - otlp_endpoint_url
+  default:
+  services:
+  - rgw
+  - osd
+  with_legacy: true
+- name: otlp_sampler_parent_based
+  type: bool
+  level: advanced
+  desc: OpenTelemetry tracer sampler mode
+  long_desc: If true, the OpenTelemetry tracer will use the parent span's sampling
+    decision. If false, the tracer will use the default (always on) sampler.
+  see_also:
+  - otlp_tracing_enable
+  - otlp_sampler_delegate_defaults_to_on
+  default: true
+  services:
+  - rgw
+  - osd
+  with_legacy: true
+- name: otlp_sampler_delegate_defaults_to_on
+  type: bool
+  level: advanced
+  desc: OpenTelemetry tracing behaviour in the absence of parent span
+    instructions.
+  long_desc: Usually we want to respect the tracing behaviour of the
+    propagated trace span. That is, if the parent span (originated by Envoy)
+    is set to sample, we should sample. This keeps the load on the tracing
+    infrastructure to a sensible level. In the absence of sampling data in the
+    parent span, this setting will determine whether we sample or not. If
+    true, we will sample by default. If false, we will not sample by default.
+  see_also:
+  - otlp_tracing_enable
+  - otlp_sampler_parent_based
+  default: true
+  services:
+  - rgw
+  - osd
+  with_legacy: true
 - name: mgr_ttl_cache_expire_seconds
   type: uint
   level: dev

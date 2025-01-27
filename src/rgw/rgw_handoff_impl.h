@@ -24,7 +24,6 @@
 #include <string>
 #include <unordered_map>
 
-#include "google/rpc/status.pb.h"
 #include <fmt/format.h>
 #include <grpc/grpc.h>
 #include <grpcpp/channel.h>
@@ -35,6 +34,7 @@
 #include "common/async/yield_context.h"
 #include "common/config_obs.h"
 #include "common/dout.h"
+#include "common/tracer.h"
 #include "rgw/rgw_common.h"
 
 #include "authenticator/v1/authenticator.grpc.pb.h"
@@ -276,10 +276,14 @@ public:
    * @param req the filled-in authentication request protobuf
    * (rgw::auth::v1::AuthRequest).
    * @param authz_state The authorization state, if available. On success,
-   * this _will_ be modified, even though it's a const pointer (see method docs).
+   * this _will_ be modified, even though it's a const pointer (see method
+   * docs).
+   * @param span An optional trace span.
    * @return HandoffAuthResult A completed auth result.
    */
-  HandoffAuthResult Auth(const AuthenticateRESTRequest& req, const HandoffAuthzState* authz_state = nullptr);
+  HandoffAuthResult Auth(const AuthenticateRESTRequest &req,
+                         const HandoffAuthzState *authz_state = nullptr,
+                         std::optional<jspan> span = std::nullopt);
 
   /**
    * @brief Map an Authenticator gRPC error code onto an error code that RGW
@@ -320,9 +324,11 @@ public:
    *
    * @param req A properly filled authenticator.v1.GetSigningKeyRequest
    * protobuf message.
+   * @param span An optional trace span.
    * @return A GetSigningKeyResult object.
    */
-  GetSigningKeyResult GetSigningKey(const GetSigningKeyRequest req);
+  GetSigningKeyResult GetSigningKey(const GetSigningKeyRequest req,
+                                    std::optional<jspan> span = std::nullopt);
 };
 
 /****************************************************************************/
@@ -844,9 +850,12 @@ public:
    * time as this is almost always the correct thing to do.
    *
    * @param req The AuthorizeRequest message.
+   * @param span An optional trace span.
    * @return AuthorizeResponse the AuthorizeResponse message from the server.
    */
-  AuthorizerClient::AuthorizeResult AuthorizeV2(AuthorizeV2Request& req);
+  AuthorizerClient::AuthorizeResult
+  AuthorizeV2(AuthorizeV2Request &req,
+              std::optional<jspan> span = std::nullopt);
 
 }; // class AuthorizerClient
 
