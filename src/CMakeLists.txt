@@ -437,7 +437,7 @@ if(WITH_JAEGER)
   build_opentelemetry()
   add_library(jaeger_base INTERFACE)
   target_link_libraries(jaeger_base INTERFACE opentelemetry::libopentelemetry
-    thrift::libthrift)
+    thrift::libthrift gRPC::grpc++)
   add_dependencies(common-objs jaeger_base)
   target_link_libraries(common-objs jaeger_base)
   target_compile_definitions(common-objs INTERFACE HAVE_ABSEIL)
