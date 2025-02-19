@@ -534,7 +534,15 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     s->bucket_attrs = s->bucket->get_attrs();
 
     if (s->handoff_authz->enabled()) {
-      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy() and s->bucket_owner set" << dendl;
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy()" << dendl;
+      // HANDOFF: We can skip the policy read, but we *must* set the
+      // s->bucket_owner as it's used by usage logging.
+      //
+      // Conveniently, with Handoff Authn the request user is always set (as
+      // directed by the Authenticator) to the bucket owner and we don't need
+      // the policy to know the bucket owner.
+      s->bucket_owner = s->user->get_id();
+
     } else {
       ret = read_bucket_policy(dpp, driver, s, s->bucket->get_info(),
           s->bucket->get_attrs(),
