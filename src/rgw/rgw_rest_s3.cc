@@ -4193,15 +4193,15 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
       s->formatter->close_section();
     }
     if (!common_prefixes.empty()) {
-      s->formatter->open_array_section("CommonPrefixes");
       for (const auto& kv : common_prefixes) {
+        s->formatter->open_array_section("CommonPrefixes");
         if (encode_url) {
           s->formatter->dump_string("Prefix", url_encode(kv.first, false));
         } else {
           s->formatter->dump_string("Prefix", kv.first);
         }
+        s->formatter->close_section();
       }
-      s->formatter->close_section();
     }
   }
   s->formatter->close_section();
