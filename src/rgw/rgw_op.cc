@@ -534,7 +534,42 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     s->bucket_attrs = s->bucket->get_attrs();
 
     if (s->handoff_authz->enabled()) {
-      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy() and s->bucket_owner set" << dendl;
+      // HANDOFF: We can skip the policy read, but we *must* set the
+      // s->bucket_owner as it's used by usage logging.
+      //
+      // This call follows the chain of events that occurs when there's no
+      // policy available:
+      //
+      //   read_bucket_policy() -> rgw_op_get_bucket_policy_from_attr() ->
+      //     RGWAccessControlPolicy::create_default()
+      //
+      // The end result is that we fetch the owner from the bucket object.
+      //
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy(), fetch owner from bucket info" << dendl;
+
+      // Duplicate the check in read_bucket_policy(). I can't find any code
+      // that actually sets this flag (nothing calls
+      // driver->set_bucket_enabled(), which is the only thing that sets it in
+      // the rados driver).
+      RGWBucketInfo bucket_info = s->bucket->get_info();
+      if (!s->system_request && bucket_info.flags & BUCKET_SUSPENDED) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " is suspended" << dendl;
+        return -ERR_USER_SUSPENDED;
+      }
+      // Duplicate the user load in rgw_op_get_bucket_policy_from_attr() and
+      // make sure the owner user is loaded.
+      rgw_user owner = bucket_info.owner;
+      std::unique_ptr<rgw::sal::User> user = driver->get_user(owner);
+      int r = user->load_user(dpp, y);
+      if (r < 0) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " owner failed to load" << dendl;
+        return r;
+      }
+      s->bucket_owner = owner;
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): set bucket_owner: " << owner.to_str() << dendl;
+
     } else {
       ret = read_bucket_policy(dpp, driver, s, s->bucket->get_info(),
           s->bucket->get_attrs(),
