@@ -151,6 +151,8 @@ set(librgw_common_srcs
   rgw_bucket_encryption.cc
   rgw_secret_encryption.cc
   rgw_tracer.cc
+  rgw_ubns.cc
+  rgw_ubns_impl.cc
   rgw_lua_background.cc
   driver/rados/cls_fifo_legacy.cc
   driver/rados/rgw_bucket.cc
@@ -346,6 +348,7 @@ if(WITH_RADOSGW_GRPC)
   set(grpc_source
     authenticator/v1/authenticator
     authorizer/v1/authorizer
+    ubdb/v1/ubdb
 
     # These are 'standard' protobufs for the 'Richer error model'
     # (https://grpc.io/docs/guides/error/). They're not installed anywhere by

@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package ubdb.v1;
+
+option go_package = "bits.linode.com/StorageTeam/ubns/gen/proto/ubdb/v1";
+
+// UBDBService provides the endpoints to manage BucketEntry records
+// within UBNS.
+service UBDBService {
+  // AddBucketEntry creates a new BucketEntry in UBDB.
+  rpc AddBucketEntry(AddBucketEntryRequest) returns (AddBucketEntryResponse);
+
+  // DeleteBucketEntry deletes a BucketEntry in UBDB.
+  rpc DeleteBucketEntry(DeleteBucketEntryRequest) returns (DeleteBucketEntryResponse);
+
+  // UpdateBucketEntry updates the state of a BucketEntry in UBDB.
+  rpc UpdateBucketEntry(UpdateBucketEntryRequest) returns (UpdateBucketEntryResponse);
+
+  // Force trigger a reconciliation of UBDB with the Ceph clusters.
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+}
+
+// Request message for adding a new bucket entry.
+message AddBucketEntryRequest {
+  // The name of the bucket. Unique identifier for the bucket
+  // within a Ceph cluster.
+  // It is used together with the owner field to uniquely identify
+  // a bucket across all Ceph clusters of a region.
+  //
+  // @gotags: xml:"Bucket" json:"Bucket"
+  string bucket = 1;
+  // The owner of the bucket.
+  //
+  // It can be any value that uniquely identifies the owner of
+  // the bucket (externally to Ceph cluster and within a region)
+  // since it isn't used for any UBNS operations aside from simple
+  // string comparisons.
+  // Used in conjunction with the bucket name to uniquely identify
+  // a bucket within a region.
+  //
+  // @gotags: xml:"Owner" json:"Owner"
+  string owner = 2;
+  // The name of the Ceph cluster hosting the bucket.
+  //
+  // It can be any value that uniquely identifies the cluster
+  // since it isn't used for any UBNS operations aside from
+  // simple string comparisons.
+  //
+  // @gotags: xml:"Cluster" json:"Cluster"
+  string cluster = 3;
+}
+
+// Response message for adding a new bucket entry.
+message AddBucketEntryResponse {}
+
+// All Bucket states.
+// @gotags: xml:"BucketState" json:"BucketState"
+enum BucketState {
+  BUCKET_STATE_UNSPECIFIED = 0;
+  BUCKET_STATE_CREATED = 1;
+  BUCKET_STATE_DELETING = 2;
+}
+
+// Request message for updating a bucket entry.
+message UpdateBucketEntryRequest {
+  // The name of the bucket. Unique identifier for the bucket
+  // within a Ceph cluster.
+  // It is used together with the owner field to uniquely identify
+  // a bucket across all Ceph clusters.
+  //
+  // @gotags: xml:"Bucket" json:"Bucket"
+  string bucket = 1;
+  // The name of the Ceph cluster hosting the bucket.
+  //
+  // It can be any value that uniquely identifies the cluster
+  // since it isn't used for any UBNS operations aside from
+  // simple string comparisons.
+  //
+  // @gotags: xml:"Cluster" json:"Cluster"
+  string cluster = 2;
+  // New desired state of the bucket.
+  //
+  // @gotags: xml:"State" json:"State"
+  BucketState state = 3;
+  // The owner of the bucket.
+  //
+  // It can be any value that uniquely identifies the owner of
+  // the bucket (externally to Ceph cluster and within a region)
+  // since it isn't used for any UBNS operations aside from simple
+  // string comparisons.
+  // Used in conjunction with the bucket name to uniquely identify
+  // a bucket within a region.
+  //
+  // @gotags: xml:"Owner" json:"Owner"
+  string owner = 4;
+}
+
+// Response message for updating a bucket entry.
+message UpdateBucketEntryResponse {}
+
+// Request message for deleting a bucket entry.
+message DeleteBucketEntryRequest {
+  //The name of the bucket.
+  //
+  // @gotags: xml:"Bucket" json:"Bucket"
+  string bucket = 1;
+  // The name of the Ceph cluster hosting the bucket.
+  //
+  // It can be any value that uniquely identifies the cluster
+  // since it isn't used for any UBNS operations aside from
+  // simple string comparisons.
+  //
+  // @gotags: xml:"Cluster" json:"Cluster"
+  string cluster = 2;
+  // The owner of the bucket.
+  //
+  // It can be any value that uniquely identifies the owner of
+  // the bucket (externally to Ceph cluster and within a region)
+  // since it isn't used for any UBNS operations aside from simple
+  // string comparisons.
+  // Used in conjunction with the bucket name to uniquely identify
+  // a bucket within a region.
+  //
+  // @gotags: xml:"Owner" json:"Owner"
+  string owner = 3;
+}
+
+// Response message for deleting a bucket entry.
+message DeleteBucketEntryResponse {}
+
+// Request message for reconciling UBDB.
+message ReconcileRequest {}
+
+// Response message from reconciling UBDB.
+message ReconcileResponse {}

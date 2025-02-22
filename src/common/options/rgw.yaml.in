@@ -4050,4 +4050,113 @@ options:
   default: false
   services:
   - rgw
+- name: rgw_ubns_cluster_id
+  type: str
+  level: advanced
+  desc: Cluster ID for the Akamai Unique Bucket Name Service
+  long_desc: The cluster ID for the Akamai Unique Bucket Name Service. This value
+    is used to identify the Ceph cluster to UBNS, and is required for UBNS
+    operation. It is an opaque string that is unique to the cluster. It must
+    be the same on all RGWs in the cluster or the results will be
+    unpredictable.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_enabled
+  type: bool
+  level: advanced
+  desc: Enable the Akamai Unique Bucket Name Service
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_initial_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS.
+  long_desc: The initial reconnect backoff timeout, the amount of time the
+    gRPC channel will wait before attempting to reconnect to the server.
+    The library enforces a minimum value of 100ms for this setting.
+    Be careful when changing this setting.
+  default: 1000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_min_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_MIN_RECONNECT_BACKOFF_MS (minimum reconnect backoff).
+  long_desc: The smallest value for the reconnect backoff timer. Be careful
+    when changing this setting.
+  default: 20000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_max_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_MAX_RECONNECT_BACKOFF_MS (minimum reconnect backoff).
+  long_desc: The largest value for the reconnect backoff timer. Be careful
+    when changing this setting.
+  default: 120000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_enabled
+  type: bool
+  level: advanced
+  desc: Enable mTLS for UBNS gRPC connections.
+  long_desc: If set to true, the RGW will use mTLS to secure the connection to the
+    UBNS service. If true, the RGW will require rgw_ubns_grpc_mtls_ca_cert,
+    rgw_ubns_grpc_mtls_client_cert, and rgw_ubns_grpc_mtls_client_key to be set
+    in order to start.
+  default: true
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_ca_cert_file
+  type: str
+  level: advanced
+  desc: Path to the CA certificate file for UBNS gRPC connections.
+  long_desc: The path to the CA certificate that will be used to verify the
+    server's certificate when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_client_cert_file
+  type: str
+  level: advanced
+  desc: Path to the client certificate file for UBNS gRPC connections.
+  long_desc: The path to the client certificate that will be used to authenticate
+    the RGW when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_client_key_file
+  type: str
+  level: advanced
+  desc: Path to the client key file for UBNS gRPC connections.
+  long_desc: The path to the client key that will be used to authenticate the RGW
+    when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_uri
+  type: str
+  level: advanced
+  desc: URI for the UBNS service via gRPC.
+  long_desc: The gRPC server address to use. This value is passed unchanged to
+    grpc::CreateCustomChannel() so may be in any format supported by the C++
+    gRPC library.
+  default: ipv4:127.0.0.1:9000
+  flags:
+  - runtime
+  services:
+  - rgw
   with_legacy: true

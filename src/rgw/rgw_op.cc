@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 smarttab ft=cpp
 
 #include <errno.h>
+#include <rgw_common.h>
 #include <stdlib.h>
 #include <system_error>
 #include <unistd.h>
@@ -13,14 +14,15 @@
 #include <boost/optional.hpp>
 #include <boost/utility/in_place_factory.hpp>
 
-#include "include/scope_guard.h"
 #include "common/Clock.h"
 #include "common/armor.h"
+#include "common/ceph_json.h"
+#include "common/dout.h"
 #include "common/errno.h"
 #include "common/mime.h"
-#include "common/utf8.h"
-#include "common/ceph_json.h"
 #include "common/static_ptr.h"
+#include "common/utf8.h"
+#include "include/scope_guard.h"
 #include "rgw_tracer.h"
 
 #include "rgw_rados.h"
@@ -54,6 +56,8 @@
 #include "rgw_sal_rados.h"
 #include "rgw_lua_data_filter.h"
 #include "rgw_lua.h"
+#include "rgw_ubns.h"
+#include "rgw_ubns_machine.h"
 
 #include "services/svc_zone.h"
 #include "services/svc_quota.h"
@@ -3510,9 +3514,42 @@ void RGWCreateBucket::execute(optional_yield y)
   buffer::list corsbl;
   string bucket_name = rgw_make_bucket_entry_name(s->bucket_tenant, s->bucket_name);
 
+  // UBNS: Create an empty optional<UBNSCreateMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSCreateMachine> ubns_creater(std::nullopt);
+
+  if (s->ubns_client) {
+    // Create a real ubns_creater. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_creater.emplace(this, s->ubns_client, bucket_name, s->ubns_client->cluster_id(), s->user->get_id().to_str());
+  }
+
   op_ret = get_params(y);
   if (op_ret < 0)
     return;
+
+  if (ubns_creater) {
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::CREATE_START);
+    if (!success) {
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request failed with unknown error" << dendl;
+        op_ret = -EEXIST;
+      }
+      return;
+    }
+    // creater state is CREATE_RPC_SUCCEEDED or CREATE_RPC_SOFT_FAILURE.
+    if (ubns_creater->state() == rgw::UBNSCreateMachine::CreateMachineState::CREATE_RPC_SOFT_FAILURE) {
+      ldpp_dout(this, 1) << "UBNS state CREATE_RPC_SOFT_FAILURE: stop RGWCreateBucket::execute() and return success code" << dendl;
+      op_ret = 0; // Success.
+      return;
+    }
+  }
 
   if (!relaxed_region_enforcement &&
       !location_constraint.empty() &&
@@ -3696,6 +3733,24 @@ void RGWCreateBucket::execute(optional_yield y)
       op_ret = -ERR_BUCKET_EXISTS;
     }
   }
+
+  if (ubns_creater) {
+    // Move the state machine from CREATE_RPC_SUCCEEDED to UPDATE_START.
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::UPDATE_START);
+    if (!success) {
+      // We've created the bucket! We will need to be reconcile this
+      // externally, there's no obvious way to roll this back from
+      // RGWCreateBucket::execute().
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed UpdateBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // creater state is UPDATE_RPC_SUCCEEDED or UPDATE_RPC_FAILED.
+  }
 }
 
 int RGWDeleteBucket::verify_permission(optional_yield y)
@@ -3727,6 +3782,41 @@ void RGWDeleteBucket::execute(optional_yield y)
   if (s->bucket_name.empty()) {
     op_ret = -EINVAL;
     return;
+  }
+
+  // UBNS: Create an empty optional<UBNSDeleteMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSDeleteMachine> ubns_deleter(std::nullopt);
+
+  if (s->ubns_client) {
+    // Fetch the user ID from the bucket. UBNS requires us to pass a matching
+    // owner, and there's no guarantee that the user requesting bucket
+    // deletion is the owner of the bucket.
+    const std::string& user_id = s->bucket->get_owner()->get_id().id;
+    ldpp_dout(this, 5) << fmt::format(FMT_STRING("UBNS RGWDeleteBucket::execute(): bucket('{}','{}',''): fetched owner '{}'"), s->bucket_name, s->ubns_client->cluster_id(), user_id) << dendl;
+
+    // Create a real ubns_deleter. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_deleter.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), user_id);
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::UPDATE_START);
+    if (!success) {
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request with unknown error" << dendl;
+        // This is an internal error, it has nothing to do with the bucket.
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+      return;
+    }
+    // deleter state is UPDATE_RPC_SUCCEEDED.
   }
 
   if (!s->bucket_exists) {
@@ -3785,6 +3875,24 @@ void RGWDeleteBucket::execute(optional_yield y)
       // lost a race, either with mdlog sync or another delete bucket operation.
       // in either case, we've already called ctl.bucket->unlink_bucket()
       op_ret = 0;
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::DELETE_START);
+    if (!success) {
+      // There's an error, but we've already deleted the bucket! We need to
+      // reconcile this externally, there's no obvious way to roll this back
+      // from RGWDeleteBucket::execute() - what do we do, recreate the bucket?
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request failed with unknown error" << dendl;
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // deleter state is DELETE_RPC_SUCCEEDED or DELETE_RPC_FAILED.
   }
 
   return;
