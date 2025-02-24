@@ -3391,6 +3391,21 @@ options:
   see_also:
   - rgw_max_objs_per_shard
   - rgw_max_dynamic_shards
+- name: rgw_reshard_direct_max 
+  type: bool
+  level: basic
+  desc: Scale up to rgw_max_dynamic_shards once shard density exceeds rgw_max_objs_per_shard for the first time.
+  long_desc: Alternative to dynamic resharding, if enabled RGW will switch from dynamic resgarding to a two-step approach. 
+    Initially, the number of shards is set to the minimum, then automatically scales up to `rgw_max_dynamic_shards` 
+    once the shard density surpasses `rgw_max_objs_per_shard` for the first time.
+    The rgw_dynamic_resharding option must be also enabled for this mode to take effect.
+  default: true
+  services:
+  - rgw
+  see_also:
+  - rgw_dynamic_resharding
+  - rgw_max_objs_per_shard
+  - rgw_max_dynamic_shards
 - name: rgw_max_objs_per_shard
   type: uint
   level: basic
