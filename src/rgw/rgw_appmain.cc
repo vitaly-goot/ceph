@@ -432,7 +432,7 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
     }
     dout(1) << "Akamai UBNS enabled" << dendl;
     ubns_client = std::make_shared<rgw::UBNSClient>();
-    ubns_client->init(cct.get(), "");
+    ubns_client->init(dpp->get_cct(), "");
   } else {
     dout(1) << "Akamai UBNS present but disabled" << dendl;
   }
