@@ -4050,6 +4050,7 @@ options:
   default: false
   services:
   - rgw
+  with_legacy: true
 - name: rgw_ubns_cluster_id
   type: str
   level: advanced
