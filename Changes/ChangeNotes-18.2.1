@@ -114,3 +114,58 @@ When run in dry mode, it will report all incomplete MPUs that exceed a configura
 
 [File Changed]
 src/tools/akamai/python/mpu_cleanup.py
+
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/OBJGEN1-1047
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+New access log appender reporting alog messages into '/var/log/ceph/access.log'.
+New dpp logging subsystem 'alog' to facilitate access log reporting.
+New reporting around LC processor to highlighting {bucket_name, lc_operation[lc_expire_current,lc_expire_noncurrent,lc_abort_mpu,lc_expire_dm], op_return_code] 
+Access log file format must be sutable for Loki (log collection) subsytem. Loki is optimized for handling logs, and by using key-value pairs. 
+
+Common Guidelines for Loki-Compatible Logs:
+- Format the logs in a structured key-value pairs, which makes them easier to parse and query in Loki.
+- The key-value pairs are space-separated.
+- Use key-value pairs to allow easy querying with Loki's query language (LogQL).
+- Timestamp in a standard format (ISO 8601 or RFC 3339) as Loki handles time-based queries.
+
+
+[Logging]
+New log file 
+/var/log/ceph/ceph-client.rgw.${instance}.access.log
+Grafana experimental:
+https://grafana.linode.com/d/ednak6pnwuu4ge/vgoot-ceph-quincy-rgw-overview-copy?orgId=1&refresh=10s&editPanel=35
+
+[Output]
+LC processor Key-Value Pairs Example:
+  time=2024-10-01T07:52:31Z timestamp=1727769151.265 bucket=test5 op=lc_expire_current ret=0
+
+[Config]
+  name: enable_accesslog
+  type: bool
+  level: basic
+  desc: enable access log
+  default: false
+
+[Rollout]
+The feature is disabled by default. To enable set 'enable_accesslog' variable to true.
+  ceph config set client.rgw enable_accesslog true
+LC reporting to the access log can also be disabled by setting the severity for the 'alog' subsystem to a value below 4.
+  ceph config set client.rgw debug_alog 3
+
+[File Changed]
+  new file:   src/common/AccessLog.cc
+  new file:   src/common/AccessLog.h
+  modified:   src/common/CMakeLists.txt
+  modified:   src/common/ceph_context.cc
+  modified:   src/common/ceph_context.h
+  modified:   src/common/options/global.yaml.in
+  modified:   src/common/subsys.h
+  modified:   src/log/Log.cc
+  modified:   src/log/Log.h
+  modified:   src/rgw/rgw_lc.cc
+
