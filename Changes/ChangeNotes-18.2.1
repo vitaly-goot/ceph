@@ -254,3 +254,22 @@ For Gen1 clusters, SREs will need to manually enable the feature as required.
   src/rgw/rgw_loadgen.h
   src/rgw/rgw_rest.cc
 
+=============================================================================
+JIRA https://track.akamai.com/jira/browse/CEPH-156
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+  OSD debug tool 
+  Details in src/tools/akamai/osd_debug/README.md
+
+
+[File Changed]
+    new file: src/tools/akamai/osd_debug/srv/unwind_attach.sh
+    new file: src/tools/akamai/osd_debug/srv/gdb_attach.sh
+    new file: src/tools/akamai/osd_debug/srv/elevate_osd_log.sh
+    new file: src/tools/akamai/osd_debug/srv/process_ss_output.py
+    new file: src/tools/akamai/osd_debug/srv/osd-debugger.sh
+    new file: src/tools/akamai/osd_debug/README.md
+    new file: src/tools/akamai/osd_debug/etc/logrotate.d/ceph-common-debug
