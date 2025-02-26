@@ -920,6 +920,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       int ret = mpu->abort(this, cct);
       fmt::memory_buffer buf;
       fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", target->get_name(), "lc_abort_mpu", ret);
+      buf.push_back('\0');
       auto alog_dpp = &cct->lookup_or_create_singleton_object<NoDoutPrefix>(CephContext::alog_dpp_singleton, false, g_ceph_context, ceph_subsys_alog);
       ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
       if (ret == 0) {
@@ -1175,6 +1176,7 @@ public:
 			     rgw::notify::ObjectExpirationDeleteMarker);
       fmt::memory_buffer buf;
       fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d} comment={})", oc.bucket->get_name(), "lc_expire_current", r, "dm");
+      buf.push_back('\0');
       ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
       if (r < 0) {
 	ldpp_dout(oc.dpp, 0) << "ERROR: current is-dm remove_expired_obj "
@@ -1192,6 +1194,7 @@ public:
 			     rgw::notify::ObjectExpirationCurrent);
       fmt::memory_buffer buf;
       fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", oc.bucket->get_name(), "lc_expire_current", r);
+      buf.push_back('\0');
       ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
       if (r < 0) {
 	ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj "
@@ -1243,6 +1246,7 @@ public:
 			       rgw::notify::ObjectExpirationNoncurrent);
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", oc.bucket->get_name(), "lc_expire_noncurrent", r);
+    buf.push_back('\0');
     auto alog_dpp = &oc.cct->lookup_or_create_singleton_object<NoDoutPrefix>(CephContext::alog_dpp_singleton, false, g_ceph_context, ceph_subsys_alog);
     ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
     if (r < 0) {
@@ -1292,6 +1296,7 @@ public:
 			       rgw::notify::ObjectExpirationDeleteMarker);
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", oc.bucket->get_name(), "lc_expire_dm", r);
+    buf.push_back('\0');
     auto alog_dpp = &oc.cct->lookup_or_create_singleton_object<NoDoutPrefix>(CephContext::alog_dpp_singleton, false, g_ceph_context, ceph_subsys_alog);
     ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
     if (r < 0) {
