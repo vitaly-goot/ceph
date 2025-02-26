@@ -169,3 +169,88 @@ LC reporting to the access log can also be disabled by setting the severity for 
   modified:   src/log/Log.h
   modified:   src/rgw/rgw_lc.cc
 
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/CEPH-174
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+  Abort PCONN on 4xx error when expect-100-continue included in HTTP header
+
+[Output]
+log output are added to note PCONN termination and delay 
+  ldout(cct, 5) << "PCONN abort on error delayed: " << delay_ms << dendl;
+  ldout(cct, 1) << "PCONN abort on error enforced" << dendl;
+
+[Config]
+name: rgw_request_close_conn_on_error_override
+  type: bool
+  level: dev
+  default: false
+  desc: Force the connection to close by overriding the keep-alive option when an error occurs (e.g., HTTP response code is in the 4xx range).
+  long_desc: JIRA https://track.akamai.com/jira/browse/CEPH-174
+    When this value is set to false, keep-alive for such requests functions as intended.
+    When this value is set to true, it will abort requests that include the Expect-100-Continue header, operate in keep-alive mode and end up with an error.
+    This is essentially an Akamai workaround for the OSPROXY solution, which forwards the payload along with the Expect-100-Continue header
+    because it cannot decouple the signature logic from the HTTP connection control logic.
+    This behavior confuses RGW, as it does not expect both the Expect-100-Continue header and the payload to be present simultaneously in the request.
+    While this setup does not pose an issue when such requests succeed, as RGW will process the payload normally, it causes problems in error scenarios.
+    In the event of an error, RGW does not discard the residual payload that OSPROXY sends prematurely, leading to the failure of the next request
+    on the same PCONN because the residual payload is not cleaned up.
+    Note that the vast majority of clients are designed to wait for an acknowledgment before sending the payload.
+    The negative impacts become evident when OSPROXY is part of the chain. If OSPROXY is removed from the architecture, this patch can be safely rolled back.
+  services:
+  - rgw
+name: rgw_request_close_conn_on_error_delay
+  type: int
+  level: dev
+  default: 0
+  desc:  Adds a delay to penalize clients before aborting requests that encounter an error.
+  long_desc: JIRA https://track.akamai.com/jira/browse/CEPH-174
+     This setting only takes effect when rgw_request_close_conn_on_error_override is set to true and applies to requests that include the Expect-100-Continue header,
+     operate in keep-alive mode, and result in an error.
+     A value of 0 means no additional delay is added.
+     A positive value introduces a delay (in milliseconds) before the PCONN is aborted (bounded up to 10 sec). 
+     The delay is intended to slow down clients that trigger 4xx responses, mitigating potential abuse where a malicious client disrupts normal operations.
+     By delaying connection closure, the server reduces the overhead associated with establishing new connections, thereby conserving resources and maintaining stability.
+  services:
+  - rgw
+  see_also:
+  - rgw_request_close_conn_on_error_override
+
+[Notes]
+Aborting persistent connections introduces overhead associated with establishing new connections. To address this, configurable delay option is added to penalize clients 
+generating 4xx traffic before aborting such requests. Adding delay on the RGW side obviously isn't ideal, since it ties up PCONN resources.
+
+To evaluate the potential impact, of PCONN termination we can add Grafana dashboard to track the rate of 4xx versus 2xx response codes in production. 
+This data can be extracted from the OSPROXY access logs available in Grafana. Under normal circumstances, traffic should predominantly result in 2xx responses. 
+We should define a threshold and set up an alert based on the 2xx to 4xx response ratio. For example, a ratio of 1:1000 may be acceptable, 
+but anything lower could indicate potential issues, such as an ongoing attack or a severe client misconfiguration.
+
+The primary purpose of the proxy, which is to protect the backend, is not functioning as intended in the current OSPROXY setup, 
+as it forwards the payload without waiting for an ACK from the server. This exposes the system to potential attacks. 
+The proposed solution should be treated as a temporary workaround while transitioning to Envoy.
+
+[Rollout]
+Feature is disabled by default,
+to abort connection on error set rgw_request_close_conn_on_error_override to true
+to enable 1 second timeout before abort set rgw_request_close_conn_on_error_delay to 1000 (max is bounded to 10 sec) 
+
+With this approach:
+The feature will be automatically disabled in Gen2 clusters.
+For Gen1 clusters, SREs will need to manually enable the feature as required.
+
+[File Changed]
+  src/common/options/rgw.yaml.in
+  src/rgw/rgw_asio_client.cc
+  src/rgw/rgw_asio_client.h
+  src/rgw/rgw_asio_frontend.cc
+  src/rgw/rgw_asio_frontend_timer.h
+  src/rgw/rgw_client_io.h
+  src/rgw/rgw_client_io_filters.h
+  src/rgw/rgw_common.h
+  src/rgw/rgw_loadgen.cc
+  src/rgw/rgw_loadgen.h
+  src/rgw/rgw_rest.cc
+
