@@ -100,3 +100,17 @@ Starting LC Processor verification for incomplete multipart uploads.
 
 [File Changed]
 src/tools/akamai/python/lc_scan.py
+
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/OBJGEN1-1235
+
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+Script to  detect and delete incomplete MPUs.
+When run in dry mode, it will report all incomplete MPUs that exceed a configurable cutoff time (default is 24 hours) for a specified bucket. When dry mode is disabled, the script will enforce the deletion of these incomplete MPUs. You can also control concurrency by adjusting the thread pool of workers.
+
+[File Changed]
+src/tools/akamai/python/mpu_cleanup.py
