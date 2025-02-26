@@ -52,3 +52,51 @@ QUERY: sum by (rgw_host) (label_replace(rate(ceph_simple_throttler_throttle[60s]
 [File Changed]
 src/rgw/rgw_dmclock_async_scheduler.h
 src/rgw/rgw_dmclock_scheduler_ctx.cc
+
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/OBJGEN1-1235
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+This script scans bucket lifecycle policies and provides insights into the count and size metrics of expired versus non-expired objects for current, non-current, and incomplete multipart uploads.
+
+It downloads and parses the S3 bucket lifecycle policy (as defined here https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html), then iterates over the bucket to verify
+if an object is expired. The script reports counters that outline the number of objects and their size. It also calculates and reports the ratio of expired to non-expired objects.
+During iteration, the script produces a report line labeled 'HEARTBEAT' with intermediate results, followed by the last processed token. The counters are reported as:
+  Expired: [{expired_obj}, {expired_byte}] Total: [{total_obj}, {total_byte}] Rate: [{rate_obj}%, {rate_byte}%]
+
+The script supports aborting and resuming processing from a specific token at any time, resuming the calculation with restored counters for current and non-current objects. For example:
+  python3 lc_scan.py --bucket=test4 --token vgoot%2F7%2F172.232.160.215%2F76 --current_cnt 1,100,5,500 --noncurrent_cnt 0,0,10,1000
+
+Here, the counters are provided as a tuple of four integers separated by commas, denoting (expired_obj, expired_byte, total_obj, total_byte) for corresponded counter.
+
+At the end, the script iterates over the list of incomplete uploads and produces a counter showing expired versus non-expired uploads according to the Lifecycle policy rule, if one is present.
+You can skip the verification of current and non-current objects by using the --mpu_only command option flag.
+
+[Notes]
+- Tags policies are not supported, mainly to improve speed of scanning as we don't use it at Akamai. Contact developers if you would like to add support for it.
+- Ceph-17 does not support the NewerNoncurrentVersions attribute in S3 lifecycle policies. If you attempt to set a rule with this attribute, Ceph-17 will silently exclude it from the policy rules, resulting in a final rule that does not include the NewerNoncurrentVersions attribute.
+- Ceph-17 does not support complex rules with object size filters defined in the And section. For example, attempting to set the following rule will result in the ObjectSizeGreaterThan and ObjectSizeLessThan attributes being dropped:
+       'And': {
+            'Prefix': 'logs/',
+            'Tags': [{'Key': 'Environment', 'Value': 'Production'}],
+            'ObjectSizeGreaterThan': 1000,
+            'ObjectSizeLessThan': 100000
+        }
+
+
+[Output]
+Combined rules execution plan: Current:True,Noncurrent:True,MPU:True
+Starting LC Processor verification for current objects.
+Starting LC Processor verification for noncurrent objects.
+1721764377 HEARTBEAT Current:{Expired:[0,0]},{Total:[100,1000]},{Rate:[0.0%,0.0%]} Noncurrent:{Expired:[0,0]},{Total:[29,290]},{Rate:[0.0%,0.0%]}
+vgoot%2F3%2F172.232.160.215%2F75
+1721764397 HEARTBEAT Current:{Expired:[0,0]},{Total:[200,2000]},{Rate:[0.0%,0.0%]} Noncurrent:{Expired:[0,0]},{Total:[29,290]},{Rate:[0.0%,0.0%]}
+vgoot%2F7%2F172.232.160.215%2F76
+Starting LC Processor verification for incomplete multipart uploads.
+1721764411 DONE Current:{Expired:[0,0]},{Total:[254,2540]},{Rate:[0.0%,0.0%]} Noncurrent:{Expired:[0,0]},{Total:[29,290]},{Rate:[0.0%,0.0%]} MPU:{Expired:[0,0]},{Total:[1,524288000]},{Rate:[0.0%,0.0%]}
+
+[File Changed]
+src/tools/akamai/python/lc_scan.py
