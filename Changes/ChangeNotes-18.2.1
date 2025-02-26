@@ -25,3 +25,30 @@ RGWSetBucketVersioning::execute() do validation only when HTTP_X_RGW_VALIDATE_ON
 [File Changed]
 src/rgw/rgw_op.cc
 
+
+
+=============================================================================
+JIRA OBJGEN1-950 Ceph: report RGW concurrent connection or other data to SRE
+
+Developer: @vgoot
+Code Review: @sung @bzymka
+
+[Description]
+Start reporting metrics from simple_throttler into Prometheus to gain per-RGW observability of the current number of connections waiting in the queue, and rejected connections resulting in 503 errors.
+
+[Grafana]
+TITLE: QLen by RGW
+METRIC: ceph_simple_throttler_outstanding
+TYPE: gauge
+DESC: current number of accepted connections waiting in Q by RGW
+QUERY: sum by (rgw_host) (label_replace(ceph_simple_throttler_outstanding * on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata, "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"))
+
+TITLE: Dropped connections by RGW
+METRIC: ceph_simple_throttler_throttle
+TYPE: counter
+DESC: connections rejected with 503 by RGW
+QUERY: sum by (rgw_host) (label_replace(rate(ceph_simple_throttler_throttle[60s]) * on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata, "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"))
+
+[File Changed]
+src/rgw/rgw_dmclock_async_scheduler.h
+src/rgw/rgw_dmclock_scheduler_ctx.cc
