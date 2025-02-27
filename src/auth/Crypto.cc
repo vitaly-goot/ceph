@@ -313,22 +313,8 @@ public:
 
   int encrypt(CephContext *cct, const ceph::bufferlist& in,
 	      ceph::bufferlist& out,
-              std::string* error) const override {
-    // reinitialize IV each time. It might be unnecessary depending on
-    // actual implementation but at the interface layer we are obliged
-    // to deliver IV as non-const.
-    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
-    char iv[AES_BLOCK_LEN];
-    memcpy(iv, CEPH_AES_IV, AES_BLOCK_LEN);
-    ceph::bufferptr iv_buf(iv, AES_BLOCK_LEN);
-
-    return encrypt(in, out, iv_buf, error);
-  }
-
-  int encrypt(const ceph::bufferlist& in,
-              ceph::bufferlist& out,
-              ceph::bufferptr& iv,
-              std::string* error) const override {
+              std::string* /* unused */) const override {
+    ldout(cct, 20) << "CryptoAESKeyHandler::encrypt()" << dendl;
     // we need to take into account the PKCS#7 padding. There *always* will
     // be at least one byte of padding. This stays even to input aligned to
     // AES_BLOCK_LEN. Otherwise we would face ambiguities during decryption.
@@ -350,18 +336,19 @@ public:
     incopy.append(std::move(pad_buf));
     const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
 
-    if (iv.length() != AES_BLOCK_LEN) {
-      if (error) *error = "Invalid IV";
-      return -EINVAL;
-    }
+    // reinitialize IV each time. It might be unnecessary depending on
+    // actual implementation but at the interface layer we are obliged
+    // to deliver IV as non-const.
+    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
+    unsigned char iv[AES_BLOCK_LEN];
+    memcpy(iv, CEPH_AES_IV, AES_BLOCK_LEN);
 
     // we aren't using EVP because of performance concerns. Profiling
     // shows the cost is quite high. Endianness might be an issue.
     // However, as they would affect Cephx, any fallout should pop up
     // rather early, hopefully.
     AES_cbc_encrypt(in_buf, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
-                    out_tmp.length(), &enc_key, 
-                    reinterpret_cast<unsigned char*>(iv.c_str()), AES_ENCRYPT);
+		    out_tmp.length(), &enc_key, iv, AES_ENCRYPT);
 
     out.append(out_tmp);
     return 0;
@@ -369,20 +356,8 @@ public:
 
   int decrypt(CephContext *cct, const ceph::bufferlist& in,
 	      ceph::bufferlist& out,
-	      std::string* error) const override {
-    // make a local, modifiable copy of IV.
-    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
-    char iv[AES_BLOCK_LEN];
-    memcpy(iv, CEPH_AES_IV, AES_BLOCK_LEN);
-    ceph::bufferptr iv_buf(iv, AES_BLOCK_LEN);
-
-    return decrypt(in, out, iv_buf, error);
-  }
-
-  int decrypt(const ceph::bufferlist& in,
-              ceph::bufferlist& out,
-              ceph::bufferptr& iv,
-              std::string* error) const override {
+	      std::string* /* unused */) const override {
+    ldout(cct, 20) << "CryptoAESKeyHandler::decrypt()" << dendl;
     // PKCS#7 padding enlarges even empty plain-text to take 16 bytes.
     if (in.length() < AES_BLOCK_LEN || in.length() % AES_BLOCK_LEN) {
       return -1;
@@ -392,15 +367,14 @@ public:
     ceph::bufferlist incopy(in);
     const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
 
-    if (iv.length() != AES_BLOCK_LEN) {
-      if (error) *error = "Invalid IV";
-      return -EINVAL;
-    }
+    // make a local, modifiable copy of IV.
+    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
+    unsigned char iv[AES_BLOCK_LEN];
+    memcpy(iv, CEPH_AES_IV, AES_BLOCK_LEN);
 
     ceph::bufferptr out_tmp{in.length()};
     AES_cbc_encrypt(in_buf, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
-                    in.length(), &dec_key, 
-                    reinterpret_cast<unsigned char *>(iv.c_str()), AES_DECRYPT);
+		    in.length(), &dec_key, iv, AES_DECRYPT);
 
     // BE CAREFUL: we cannot expose any single bit of information about
     // the cause of failure. Otherwise we'll face padding oracle attack.
@@ -773,6 +747,7 @@ public:
   int encrypt(CephContext *cct, const ceph::bufferlist& in,
 	      ceph::bufferlist& out,
               std::string* /* unused */) const override {
+    ldout(cct, 20) << "CryptoAES256KRB5KeyHandler::encrypt()" << dendl;
     // encrypted (confounder | data) | hash
     ceph::bufferptr out_tmp{static_cast<unsigned>(
       AES256KRB5_BLOCK_LEN + in.length() + AES256KRB5_HASH_LEN)};
@@ -822,6 +797,7 @@ public:
 	      ceph::bufferlist& out,
 	      std::string* /* unused */) const override {
 
+    ldout(cct, 20) << "CryptoAES256KRB5KeyHandler::decrypt()" << dendl;
     if (in.length() < AES256KRB5_BLOCK_LEN + AES256KRB5_HASH_LEN) { /* minimum size: confounder + hmac */
       return -EINVAL;
     }
@@ -889,7 +865,6 @@ public:
 
     return 0;
   }
-
 };
 
 
@@ -956,6 +931,7 @@ void CryptoKey::decode(bufferlist::const_iterator& bl)
   if (_set_secret(type, tmp) < 0)
     throw ceph::buffer::malformed_input("malformed secret");
 }
+
 
 int CryptoKey::set_secret(int type, const bufferptr& s, utime_t c)
 {
