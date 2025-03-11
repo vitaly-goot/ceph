@@ -2782,7 +2782,7 @@ Then run the following:
             )
             daemons.append(sd)
 
-        @ forall_hosts
+        @forall_hosts
         def create_func_map(*args: Any) -> str:
             daemon_spec = self.cephadm_services[daemon_type].prepare_create(*args)
             with self.async_timeout_handler(daemon_spec.host, f'cephadm deploy ({daemon_spec.daemon_type} daemon)'):
