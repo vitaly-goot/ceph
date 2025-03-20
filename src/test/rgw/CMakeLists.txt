@@ -330,3 +330,10 @@ target_include_directories(unittest_rgw_otel_trace
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/store/rados")
 target_link_libraries(unittest_rgw_otel_trace ${rgw_libs})
+
+add_executable(unittest_rgw_ubns test_rgw_ubns.cc test_rgw_grpc_util.h)
+add_ceph_unittest(unittest_rgw_ubns)
+target_link_libraries(unittest_rgw_ubns
+  ${UNITTEST_LIBS}
+  ${rgw_libs}
+)

@@ -38,6 +38,7 @@
 #include "rgw_tag.h"
 #include "rgw_op_type.h"
 #include "rgw_sync_policy.h"
+#include "rgw_ubns.h"
 #include "cls/version/cls_version_types.h"
 #include "cls/user/cls_user_types.h"
 #include "cls/rgw/cls_rgw_types.h"
@@ -311,6 +312,11 @@ static inline const char* to_mime_type(const RGWFormat f)
 #define ERR_BUSY_RESHARDING      2300
 #define ERR_NO_SUCH_ENTITY       2301
 #define ERR_LIMIT_EXCEEDED       2302
+
+// UBNS-specific errors
+#define ERR_UBNS_INVALID_OR_MISSING_PARAMETER 12001
+#define ERR_UBNS_BUCKET_ALREADY_OWNED_BY_YOU 12002
+#define ERR_UBNS_BAD_REQUEST 12003
 
 // STS Errors
 #define ERR_PACKED_POLICY_TOO_LARGE 2400
@@ -1101,6 +1107,7 @@ struct req_state : DoutPrefixProvider {
   RGWRateLimitInfo bucket_ratelimit;
   std::string ratelimit_bucket_marker;
   std::string ratelimit_user_name;
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
   bool content_started{false};
   RGWFormat format{RGWFormat::PLAIN};
   ceph::Formatter *formatter{nullptr};

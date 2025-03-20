@@ -417,12 +417,33 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
   ratelimiter.reset(new ActiveRateLimiter{dpp->get_cct()});
   ratelimiter->start();
 
+  /* Initialise Akamai UBNS. We have to explicitly pass this pointer around a
+   * fair bit in v17, via process_request() and into req_state, the 's'
+   * pointer that all operations receive. We end up placing it in the
+   * ProcessEnv, because in v18 it's a tiny bit better due to
+   * process_request() already taking a ProcessEnv* rather than an explicit
+   * list of pointers to various items.
+   */
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
+  if (g_conf()->rgw_ubns_enabled) {
+    if (!rgw::ubns_validate_startup_configuration(g_conf()) != 0) {
+      derr << "FATAL: UBNS configuration is invalid" << dendl;
+      return EINVAL;
+    }
+    dout(1) << "Akamai UBNS enabled" << dendl;
+    ubns_client = std::make_shared<rgw::UBNSClient>();
+    ubns_client->init(dpp->get_cct(), "");
+  } else {
+    dout(1) << "Akamai UBNS present but disabled" << dendl;
+  }
+
   // initialize RGWProcessEnv
   env.rest = &rest;
   env.olog = olog;
   env.auth_registry = rgw::auth::StrategyRegistry::create(
       dpp->get_cct(), *implicit_tenant_context, env.driver);
   env.ratelimiting = ratelimiter.get();
+  env.ubns_client = ubns_client;
   // Store the handoff helper created by ExternalAuthStrategy. This may be
   // null, that's ok.
   env.handoff_helper = rgw::auth::s3::g_handoff_helper;

@@ -350,6 +350,9 @@ int process_request(const RGWProcessEnv& penv,
   std::unique_ptr<rgw::sal::User> u = driver->get_user(rgw_user());
   s->set_user(u);
 
+  // Save the (possibly null) UBNS client pointer so we can issue gRPC requests.
+  s->ubns_client = penv.ubns_client;
+
   if (ret < 0) {
     s->cio = client_io;
     abort_early(s, nullptr, ret, nullptr, yield);
