@@ -6860,6 +6860,9 @@ void RGWInitMultipart::execute(optional_yield y)
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
   upload = s->bucket->get_multipart_upload(s->object->get_name(),
 				       upload_id);
+  upload->obj_legal_hold = obj_legal_hold;
+  upload->obj_retention = obj_retention;
+
   op_ret = upload->init(this, s->yield, s->owner, s->dest_placement, attrs);
 
   if (op_ret == 0) {
