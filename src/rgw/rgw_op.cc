@@ -9238,6 +9238,7 @@ void RGWPutObjRetention::execute(optional_yield y)
     op_ret = -EINVAL;
     return;
   }
+
   bufferlist bl;
   obj_retention.encode(bl);
 
