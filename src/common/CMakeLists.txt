@@ -26,6 +26,7 @@ set(common_srcs
   FixedCDC.cc
   Formatter.cc
   Graylog.cc
+  AccessLog.cc
   HTMLFormatter.cc
   HeartbeatMap.cc
   LogClient.cc

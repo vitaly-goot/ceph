@@ -27,6 +27,7 @@ namespace logging {
 
 class Graylog;
 class JournaldLogger;
+class AccessLog;
 class SubsystemMap;
 
 class Log : private Thread
@@ -66,6 +67,9 @@ public:
   void stop_journald_logger();
 
   std::shared_ptr<Graylog> graylog() { return m_graylog; }
+
+  void start_accesslog(const std::string& host);
+  void stop_accesslog();
 
   void submit_entry(Entry&& e);
 
@@ -119,12 +123,14 @@ private:
   int m_stderr_log = -1, m_stderr_crash = -1;
   int m_graylog_log = -3, m_graylog_crash = -3;
   int m_journald_log = -3, m_journald_crash = -3;
+  int m_accesslog_log = -3;
 
   std::string m_log_stderr_prefix;
   bool do_stderr_poll = false;
 
   std::shared_ptr<Graylog> m_graylog;
   std::unique_ptr<JournaldLogger> m_journald;
+  std::unique_ptr<AccessLog> m_accesslog;
 
   std::vector<char> m_log_buf;
 

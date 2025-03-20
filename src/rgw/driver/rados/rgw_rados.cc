@@ -1866,7 +1866,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
         /* we're skipping past namespaced objects */
 	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping past namespaced objects, including \"" << entry.key <<
+	  ": skipping past namespaced objects, including \"" << entry.key << "\" obj.name \"" << obj.name << "\" params.delim \"" << params.delim  <<
 	  "\"" << dendl;
         continue;
       }
@@ -1882,22 +1882,6 @@ int RGWRados::Bucket::List::list_objects_ordered(
       if (count < max) {
 	params.marker = index_key;
 	next_marker = index_key;
-      }
-
-      if (params.access_list_filter &&
-	  ! params.access_list_filter->filter(obj.name, index_key.name)) {
-	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping past namespaced objects, including \"" << entry.key <<
-	  "\"" << dendl;
-        continue;
-      }
-
-      if (params.prefix.size() &&
-	  0 != obj.name.compare(0, params.prefix.size(), params.prefix)) {
-	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping object \"" << entry.key <<
-	  "\" that doesn't match prefix \"" << params.prefix << "\"" << dendl;
-        continue;
       }
 
       if (!params.delim.empty()) {
@@ -1930,11 +1914,6 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	      (*common_prefixes)[obj.name] = true;
 	      count++;
 	    }
-
-	    ldpp_dout(dpp, 20) << __func__ <<
-	      ": finished entry with common prefix \"" << entry.key <<
-	      "\" so continuing loop (cls filtered)" << dendl;
-	    continue;
 	  } else {
 	    // NOTE: this condition is for older versions of the OSD
 	    // that do not filter on the CLS side, so the following code
@@ -1961,7 +1940,39 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
 	      count++;
 	    }
+	  } // if we're running an older OSD version
+	} // if a delimiter was found after prefix
+      } // if a delimiter was passed in
 
+      if (params.access_list_filter &&
+	  ! params.access_list_filter->filter(obj.name, index_key.name)) {
+	ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	  ": skipping past access_list_filter objects, including \"" << entry.key 
+	  << "\" obj.name \"" << obj.name << "\" index_key.name \"" << index_key.name 
+	  << "\" params.delim \"" << params.delim << "\" params.prefix \"" << params.prefix <<
+	  "\"" << dendl;
+        continue;
+      }
+
+      if (params.prefix.size() &&
+	  0 != obj.name.compare(0, params.prefix.size(), params.prefix)) {
+	ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	  ": skipping object \"" << entry.key <<
+	  "\" that doesn't match prefix \"" << params.prefix << "\"" << dendl;
+        continue;
+      }
+
+      if (!params.delim.empty()) {
+	const int delim_pos = obj.name.find(params.delim, params.prefix.size());
+	if (delim_pos >= 0) {
+	  // run either the code where delimiter filtering is done a)
+	  // in the OSD/CLS or b) here.
+	  if (cls_filtered) {
+	    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	      ": finished entry with common prefix \"" << entry.key <<
+	      "\" so continuing loop (cls filtered)" << dendl;
+	    continue;
+	  } else {
 	    ldpp_dout(dpp, 20) << __func__ <<
 	      ": finished entry with common prefix \"" << entry.key <<
 	      "\" so continuing loop (not cls filtered)" << dendl;

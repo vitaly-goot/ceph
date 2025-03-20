@@ -595,6 +595,11 @@ options:
   default: false
   see_also:
   - log_to_journald
+- name: enable_accesslog
+  type: bool
+  level: basic
+  desc: enable access log 
+  default: false
 - name: log_coarse_timestamps
   type: bool
   level: advanced

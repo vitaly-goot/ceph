@@ -1203,6 +1203,7 @@ struct req_state : DoutPrefixProvider {
   bool local_source{false}; /* source is local */
 
   int prot_flags{0};
+  bool close_conn{false};
 
   /* Content-Disposition override for TempURL of Swift API. */
   struct {
