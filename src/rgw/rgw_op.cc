@@ -449,6 +449,14 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
       ret = -ENOENT;
     }
   }
+  if (ret == -ENOENT && !upload_id.empty()) {
+    /* multipart upload */
+    ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message =
+        "The specified multipart upload does not exist. The upload ID might "
+        "be invalid, "
+        "or the multipart upload might have been aborted or completed";
+  }
 
   return ret;
 }
@@ -4350,6 +4358,10 @@ void RGWPutObj::execute(optional_yield y)
       } else {// -ENOENT: raced with upload complete/cancel, no need to spam log
         ldpp_dout(this, 20) << "failed to get multipart info (returned " << op_ret << ": " << cpp_strerror(-op_ret) << "): probably raced with upload complete / cancel" << dendl;
       }
+      if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+        s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                         "or the multipart upload might have been aborted or completed";
+      }
       return;
     }
     /* upload will go out of scope, so copy the dest placement for later use */
@@ -7009,8 +7021,9 @@ void RGWCompleteMultipart::execute(optional_yield y)
       op_ret = 0;
       return;
     }
-    op_ret = -ERR_INTERNAL_ERROR;
-    s->err.message = "This multipart completion is already in progress";
+    op_ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
     return;
   }
 
@@ -7259,6 +7272,10 @@ void RGWAbortMultipart::execute(optional_yield y)
   multipart_trace = tracing::rgw::tracer.add_span(name(), trace_ctx);
 
   op_ret = upload->abort(this, s->cct);
+  if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
+  }
 }
 
 int RGWListMultipart::verify_permission(optional_yield y)
