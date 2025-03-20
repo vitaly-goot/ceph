@@ -4027,6 +4027,18 @@ int RGWInitMultipart_ObjStore_S3::get_params(optional_yield y)
     return -ERR_INVALID_REQUEST;
   }
 
+  auto tag_str = s->info.env->get("HTTP_X_AMZ_TAGGING");
+  if (tag_str) {
+    ret = obj_tags.set_from_string(tag_str);
+    if (ret < 0) {
+      ldpp_dout(this, 0) << "setting obj tags failed with " << ret << dendl;
+      if (ret == -ERR_INVALID_TAG) {
+        ret = -EINVAL; // s3 returns only -EINVAL for PUT requests
+      }
+      return ret;
+    }
+  }
+  
   return 0;
 }
 
@@ -4225,15 +4237,15 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
       s->formatter->close_section();
     }
     if (!common_prefixes.empty()) {
-      s->formatter->open_array_section("CommonPrefixes");
       for (const auto& kv : common_prefixes) {
+        s->formatter->open_array_section("CommonPrefixes");
         if (encode_url) {
           s->formatter->dump_string("Prefix", url_encode(kv.first, false));
         } else {
           s->formatter->dump_string("Prefix", kv.first);
         }
+        s->formatter->close_section();
       }
-      s->formatter->close_section();
     }
   }
   s->formatter->close_section();

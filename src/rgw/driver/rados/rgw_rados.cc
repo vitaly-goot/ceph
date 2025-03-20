@@ -10007,6 +10007,10 @@ int RGWRados::check_bucket_shards(const RGWBucketInfo& bucket_info,
     return 0;
   }
 
+  if (cct->_conf.get_val<bool>("rgw_reshard_direct_max")) {
+    suggested_num_shards = max_dynamic_shards;
+  }
+
   const uint32_t final_num_shards =
     RGWBucketReshard::get_preferred_shards(suggested_num_shards,
 					   max_dynamic_shards);

@@ -449,6 +449,14 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
       ret = -ENOENT;
     }
   }
+  if (ret == -ENOENT && !upload_id.empty()) {
+    /* multipart upload */
+    ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message =
+        "The specified multipart upload does not exist. The upload ID might "
+        "be invalid, "
+        "or the multipart upload might have been aborted or completed";
+  }
 
   return ret;
 }
@@ -534,7 +542,42 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     s->bucket_attrs = s->bucket->get_attrs();
 
     if (s->handoff_authz->enabled()) {
-      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy() and s->bucket_owner set" << dendl;
+      // HANDOFF: We can skip the policy read, but we *must* set the
+      // s->bucket_owner as it's used by usage logging.
+      //
+      // This call follows the chain of events that occurs when there's no
+      // policy available:
+      //
+      //   read_bucket_policy() -> rgw_op_get_bucket_policy_from_attr() ->
+      //     RGWAccessControlPolicy::create_default()
+      //
+      // The end result is that we fetch the owner from the bucket object.
+      //
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy(), fetch owner from bucket info" << dendl;
+
+      // Duplicate the check in read_bucket_policy(). I can't find any code
+      // that actually sets this flag (nothing calls
+      // driver->set_bucket_enabled(), which is the only thing that sets it in
+      // the rados driver).
+      RGWBucketInfo bucket_info = s->bucket->get_info();
+      if (!s->system_request && bucket_info.flags & BUCKET_SUSPENDED) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " is suspended" << dendl;
+        return -ERR_USER_SUSPENDED;
+      }
+      // Duplicate the user load in rgw_op_get_bucket_policy_from_attr() and
+      // make sure the owner user is loaded.
+      rgw_user owner = bucket_info.owner;
+      std::unique_ptr<rgw::sal::User> user = driver->get_user(owner);
+      int r = user->load_user(dpp, y);
+      if (r < 0) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " owner failed to load" << dendl;
+        return r;
+      }
+      s->bucket_owner = owner;
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): set bucket_owner: " << owner.to_str() << dendl;
+
     } else {
       ret = read_bucket_policy(dpp, driver, s, s->bucket->get_info(),
           s->bucket->get_attrs(),
@@ -4315,6 +4358,10 @@ void RGWPutObj::execute(optional_yield y)
       } else {// -ENOENT: raced with upload complete/cancel, no need to spam log
         ldpp_dout(this, 20) << "failed to get multipart info (returned " << op_ret << ": " << cpp_strerror(-op_ret) << "): probably raced with upload complete / cancel" << dendl;
       }
+      if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+        s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                         "or the multipart upload might have been aborted or completed";
+      }
       return;
     }
     /* upload will go out of scope, so copy the dest placement for later use */
@@ -6807,6 +6854,9 @@ void RGWInitMultipart::execute(optional_yield y)
     return;
   }
 
+  encode_obj_tags_attr(&obj_tags, attrs);
+  rgw_cond_decode_objtags(s, attrs);
+
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
   upload = s->bucket->get_multipart_upload(s->object->get_name(),
 				       upload_id);
@@ -6977,8 +7027,9 @@ void RGWCompleteMultipart::execute(optional_yield y)
       op_ret = 0;
       return;
     }
-    op_ret = -ERR_INTERNAL_ERROR;
-    s->err.message = "This multipart completion is already in progress";
+    op_ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
     return;
   }
 
@@ -7227,6 +7278,10 @@ void RGWAbortMultipart::execute(optional_yield y)
   multipart_trace = tracing::rgw::tracer.add_span(name(), trace_ctx);
 
   op_ret = upload->abort(this, s->cct);
+  if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
+  }
 }
 
 int RGWListMultipart::verify_permission(optional_yield y)
@@ -9186,6 +9241,7 @@ void RGWPutObjRetention::execute(optional_yield y)
     op_ret = -EINVAL;
     return;
   }
+
   bufferlist bl;
   obj_retention.encode(bl);
 

@@ -648,6 +648,12 @@ static void build_redirect_url(req_state *s, const string& redirect_base, string
 void abort_early(req_state *s, RGWOp* op, int err_no,
 		 RGWHandler* handler, optional_yield y)
 {
+  if (op) {
+    if (s->trace) {
+      s->trace->SetAttribute(tracing::akamai::EARLY_ABORT, true);
+    }
+  }
+
   string error_content("");
   if (!s->formatter) {
     s->formatter = new JSONFormatter;

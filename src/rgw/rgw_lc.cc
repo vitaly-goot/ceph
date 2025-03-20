@@ -944,9 +944,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
 
   for (auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
        ++prefix_iter) {
-
-    utime_t start = ceph_clock_now();
-    if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+    if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 		     << worker->ix
 		     << dendl;
@@ -978,8 +976,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       } /* for objs */
 
       if ((offset % 100) == 0) {
-        utime_t start = ceph_clock_now();
-	if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+	if (worker_should_stop(stop_at, once)) {
 	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 			     << worker->ix
 			     << dendl;
@@ -1687,9 +1684,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
   rgw_obj_key next_marker;
   for(auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
       ++prefix_iter) {
-
-    utime_t start = ceph_clock_now();
-    if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+    if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 		     << worker->ix
 		     << dendl;
@@ -1736,8 +1731,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
       worker->workpool->enqueue(WorkItem{t1});
       if ((offset % 100) == 0) {
-        utime_t start = ceph_clock_now();
-	if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+	if (worker_should_stop(stop_at, once)) {
 	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 			     << worker->ix
 			     << dendl;
