@@ -1267,6 +1267,10 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
     }
     result_codes.push_back(retcode);
   }
+  // ok() means all the answers were ALLOW.
+  if (result.ok()) {
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("{}: authz success"), __func__) << dendl;
+  }
   return result_codes;
 }
 
