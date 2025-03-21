@@ -973,7 +973,7 @@ HandoffAuthResult HandoffHelperImpl::_grpc_auth(
                                s->handoff_authz->canonical_user_id(), s->handoff_authz->user_arn(),
                                aua, s->handoff_authz->account_arn(), role_arn);
     }
-    ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("success (access_key_id='{}', uid='{}'){}"),
+    ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("success (access_key_id='{}', uid='{}'){}"),
         access_key_id, result.userid(), authz_info)
                       << dendl;
   } else {
@@ -1121,12 +1121,13 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
    *
    * Note that this will std::move req! It gets moved to the result object.
    */
+  ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("{}: Sending initial gRPC authz request"), __func__) << dendl;
   auto result = client.AuthorizeV2(req, optional_trace(s));
 
   if (result.is_extra_data_required()) {
 
-    // Dump the result at debug level.
-    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("{}: Authorize result: "), __func__) << result << dendl;
+    // Log the extra-data-required result at a level that will always be shown.
+    ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("{}: Extra data required"), __func__) << dendl;
 
     ExtraDataSpecification spec;
     bool seen = false;
@@ -1169,11 +1170,14 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
     // ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("{}: Reloading IAM environment"), __func__) << dendl;
     // PopulateAuthorizeRequestIAMEnvironment(dpp, s, req);
 
-    // Resubmit the request with the extra data.
-    ldpp_dout(dpp, 5)
+    // Resubmit the request with the extra data. Log at a high but not
+    // always-on level.
+    ldpp_dout(dpp, 2)
         << fmt::format(FMT_STRING("{}: Resubmitting request with extra data: {}"), __func__, proto_to_JSON(req)) << dendl;
-    /* Again, this will std::move the request! */
     auto req = opt_req.value();
+    ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("{}: Sending extra data gRPC authz request"), __func__) << dendl;
+
+    /* Again, this will std::move the request! */
     result = client.AuthorizeV2(req, optional_trace(s));
   }
 
@@ -1211,11 +1215,25 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
     return std::vector(op_count, -ERR_INTERNAL_ERROR);
   }
 
+  // Log the fact that at least one of the questions has a non-ALLOW answer,
+  // at a level that will be always shown.
+  if (!result.ok()) {
+    ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("{}: WARNING: At least one question returned a non-ALLOW answer"), __func__) << dendl;
+  }
+
   // If we got here, the RPC succeeded and the response appears well-formed.
   // Return the results. These are the codes used in RGWOp classes - zero is
   // success, <0 is an error code from rgw_common.h.
   std::vector<int> result_codes;
+
+  // It's ugly to manually maintain an index, but there's no easy equivalent
+  // of Python's enumerate() for a range-for loop in C++.
+  size_t index = 0;
+  int result_size = result.response().answers_size();
+
   for (const auto& answer : result.response().answers()) {
+    index++;
+
     using namespace ::authorizer::v1;
     int retcode;
     switch (answer.code()) {
@@ -1224,15 +1242,27 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
       break;
     case AUTHORIZATION_RESULT_CODE_DENY:
       retcode = -EACCES;
+      ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned AUTHORIZATION_RESULT_CODE_DENY, retcode={}"),
+          __func__, index, result_size, retcode)
+                        << dendl;
       break;
     case AUTHORIZATION_RESULT_CODE_INTERNAL_ERROR:
       retcode = -ERR_INTERNAL_ERROR;
+      ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned AUTHORIZATION_RESULT_CODE_INTERNAL_ERROR, retcode={}"),
+          __func__, index, result_size, retcode)
+                        << dendl;
       break;
     case AUTHORIZATION_RESULT_CODE_RATE_LIMIT_EXCEEDED:
       retcode = -ERR_RATE_LIMITED;
+      ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned AUTHORIZATION_RESULT_CODE_RATE_LIMIT_EXCEEDED, retcode={}"),
+          __func__, index, result_size, retcode)
+                        << dendl;
       break;
     default:
       retcode = -ERR_INTERNAL_ERROR;
+      ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned unknown error code {}, retcode={}"),
+          __func__, index, result_size, answer.code(), retcode)
+                        << dendl;
       break;
     }
     result_codes.push_back(retcode);
