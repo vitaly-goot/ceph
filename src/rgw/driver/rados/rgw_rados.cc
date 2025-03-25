@@ -1812,7 +1812,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
                                            shard_id,
 					   cur_marker,
 					   cur_prefix,
-					   params.delim,
+					   (params.ns == RGW_OBJ_NS_MULTIPART) ? "" : params.delim,
 					   read_ahead + 1 - count,
 					   params.list_versions,
 					   attempt,
@@ -1884,8 +1884,18 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	next_marker = index_key;
       }
 
+      std::string obj_name = obj.name;
       if (!params.delim.empty()) {
-	const int delim_pos = obj.name.find(params.delim, params.prefix.size());
+        if (params.ns == RGW_OBJ_NS_MULTIPART) {
+          RGWMPObj mp;
+          if(!mp.from_meta(obj.name)) {
+            ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+	    " could not parse mp object name: " << obj.name << dendl;
+            continue;
+	  }
+          obj_name = mp.get_key();
+        }
+	const int delim_pos = obj_name.find(params.delim, params.prefix.size());
 	if (delim_pos >= 0) {
 	  // run either the code where delimiter filtering is done a)
 	  // in the OSD/CLS or b) here.
@@ -1895,10 +1905,10 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	    // find one delimiter at the end if it finds any after the
 	    // prefix
 	    if (delim_pos !=
-		int(obj.name.length() - params.delim.length())) {
+		int(obj_name.length() - params.delim.length())) {
 	      ldpp_dout(dpp, 0) << "WARNING: " << __func__ <<
 		" found delimiter in place other than the end of "
-		"the prefix; obj.name=" << obj.name <<
+		"the prefix; obj_name=" << obj_name <<
 		", prefix=" << params.prefix << dendl;
 	    }
 	    if (common_prefixes) {
@@ -1911,7 +1921,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 		goto done;
 	      }
 
-	      (*common_prefixes)[obj.name] = true;
+	      (*common_prefixes)[obj_name] = true;
 	      count++;
 	    }
 	  } else {
@@ -1923,7 +1933,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
 	    /* extract key -with trailing delimiter- for CommonPrefix */
 	    string prefix_key =
-	      obj.name.substr(0, delim_pos + params.delim.length());
+	      obj_name.substr(0, delim_pos + params.delim.length());
 
 	    if (common_prefixes &&
 		common_prefixes->find(prefix_key) == common_prefixes->end()) {
@@ -1963,7 +1973,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
       }
 
       if (!params.delim.empty()) {
-	const int delim_pos = obj.name.find(params.delim, params.prefix.size());
+	const int delim_pos = obj_name.find(params.delim, params.prefix.size());
 	if (delim_pos >= 0) {
 	  // run either the code where delimiter filtering is done a)
 	  // in the OSD/CLS or b) here.
