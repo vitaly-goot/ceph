@@ -379,7 +379,7 @@ public:
   LCObjsLister(rgw::sal::Driver* _driver, rgw::sal::Bucket* _bucket) :
       driver(_driver), bucket(_bucket) {
     list_params.list_versions = bucket->versioned();
-    list_params.allow_unordered = true;
+    list_params.allow_unordered = !(store->ctx()->_conf.get_val<bool>("rgw_lc_allow_ordered_list"));
     delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
     shard_id = -1;
     init_num_shards = 0;
@@ -398,7 +398,7 @@ public:
   int fetch(const DoutPrefixProvider *dpp) {
     CephContext* cct = dpp->get_cct();
     std::string bn = bucket->get_name();
-    uint32_t cnt = 1000;
+    uint32_t cnt = int32_t(store->ctx()->_conf.get_val<uint64_t>("rgw_lc_list_cnt"));
     uint32_t num_shards = bucket->get_info().layout.current_index.layout.normal.num_shards;
     ldpp_dout(dpp, 10) << "bucket: " << bn << " init_num_shards " << init_num_shards
                        << " num_shards: " << num_shards << dendl;
@@ -414,6 +414,7 @@ public:
       list_params.shard_id = shard_id;
       list_params.prefix = shard_prefix[shard_id];
       list_params.marker = shard_marker[shard_id];
+      list_params.allow_unordered = true;
       cnt = uint32_t(cct->_conf.get_val<uint64_t>("rgw_lc_multi_shard_list_cnt"));
     }
     int ret = bucket->list(dpp, list_params, cnt, list_results, null_yield);
@@ -446,6 +447,7 @@ public:
 	  list_params.shard_id = shard_id;
 	  list_params.prefix = shard_prefix[shard_id];
           list_params.marker = shard_prefix[shard_id];
+          list_params.allow_unordered = true;
 	  ret = bucket->list(dpp, list_params, cnt, list_results, null_yield);
 	  if (ret < 0) {
             ldpp_dout(dpp, 1) << "ERROR: bucket->list returned ret=" << ret
@@ -906,8 +908,8 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
   params.list_versions = false;
   /* lifecycle processing does not depend on total order, so can
    * take advantage of unordered listing optimizations--such as
-   * operating on one shard at a time */
-  params.allow_unordered = true;
+   * operating on one shard at a time. default true */
+  params.allow_unordered = !(cct->_conf.get_val<bool>("rgw_lc_allow_ordered_list"));
   params.ns = RGW_OBJ_NS_MULTIPART;
   params.access_list_filter = &mp_filter;
 
