@@ -717,6 +717,11 @@ public:
      * (taking into account the answers in the response) and moving the
      * request and response into this object.
      *
+     * It's very important to get the value for \p success correct. It governs
+     * whether or not ok() returns true, and that should only be the case if
+     * the RPC was successful and _all_ answers were ALLOW. If any answer is
+     * not ALLOW, success should be false.
+     *
      * @param success Whether or not the response indicates that all questions
      * received an ALLOW response.
      * @param request The AuthorizeV2Request message. This will be moved; the
@@ -786,20 +791,22 @@ public:
 
     /**
      * @brief Return true iff the call has been made and the call succeeded
-     * with a success (ALLOW) result.
+     * with a every question returning a success (ALLOW) result.
      *
-     * @return true The call has been made and the call returned ALLOW status.
-     * @return false The call has not been made, or the call failed, or the
-     * call did not return ALLOW status.
+     * @return true The call has been made and the all questions returned
+     * ALLOW status.
+     * @return false The call has not been made, or the call failed, or the at
+     * least one question did not return ALLOW status.
      */
     bool ok() const noexcept { return success_; }
     /**
      * @brief Return true if the call has not yet been made, or if the call
-     * did not succeed with a success (ALLOW) result.
+     * did not succeed with every question returning a success (ALLOW) result.
      *
-     * @return true The call has not been made, or the call failed, or the
-     * call did not return ALLOW status.
-     * @return false The call has been made and the call returned ALLOW status.
+     * @return true The call has not been made, or the call failed, or the at
+     * least one question did not return ALLOW status.
+     * @return false The call has been made and the all questions returned
+     * ALLOW status.
      */
     bool err() const noexcept { return !ok(); }
 
