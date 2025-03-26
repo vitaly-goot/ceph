@@ -85,7 +85,7 @@ bool AuthMonitor::check_rotate()
 {
   KeyServerData::Incremental rot_inc;
   rot_inc.op = KeyServerData::AUTH_INC_SET_ROTATING;
-  if (mon.key_server.prepare_rotating_update(rot_inc.rotating_bl)) {
+  if (mon.key_server.prepare_rotating_update(rot_inc.rotating_bl, false)) {
     dout(10) << __func__ << " updating rotating" << dendl;
     push_cephx_inc(rot_inc);
     return true;
@@ -870,6 +870,7 @@ bool AuthMonitor::preprocess_command(MonOpRequestRef op)
   string prefix;
   cmd_getval(cmdmap, "prefix", prefix);
   if (prefix == "auth add" ||
+      prefix == "auth wipe-rotating-service-keys" ||
       prefix == "auth del" ||
       prefix == "auth rm" ||
       prefix == "auth get-or-create" ||
@@ -1951,6 +1952,19 @@ bool AuthMonitor::prepare_command(MonOpRequestRef op)
 
     wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,
 					      get_last_committed() + 1));
+    return true;
+  } else if (prefix == "auth wipe-rotating-service-keys") {
+    /* N.B.: doing this requires all service daemons to restart to get new service keys. */
+    /* is this true?? */
+    KeyServerData::Incremental rot_inc;
+    rot_inc.op = KeyServerData::AUTH_INC_SET_ROTATING;
+    bool modified = mon.key_server.prepare_rotating_update(rot_inc.rotating_bl, true);
+    ceph_assert(modified);
+    rs = "wiped rotating service keys!";
+    dout(5) << __func__ << " wiped rotating service keys!" << dendl;
+    push_cephx_inc(rot_inc);
+    wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs, rdata,
+                                              get_last_committed() + 1));
     return true;
   }
 done:

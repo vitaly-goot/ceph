@@ -164,6 +164,9 @@ COMMAND("auth add "
 	"add auth info for <entity> from input file, or random key if no "
         "input is given, and/or any caps specified in the command",
 	"auth", "rwx")
+COMMAND("auth wipe-rotating-service-keys",
+	"wipe rotating keys",
+	"auth", "rwx")
 COMMAND("auth get-or-create-key "
 	"name=entity,type=CephString "
 	"name=caps,type=CephString,n=N,req=false"
