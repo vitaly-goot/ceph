@@ -379,7 +379,7 @@ public:
   LCObjsLister(rgw::sal::Driver* _driver, rgw::sal::Bucket* _bucket) :
       driver(_driver), bucket(_bucket) {
     list_params.list_versions = bucket->versioned();
-    list_params.allow_unordered = !(store->ctx()->_conf.get_val<bool>("rgw_lc_allow_ordered_list"));
+    list_params.allow_unordered = !(driver->ctx()->_conf.get_val<bool>("rgw_lc_allow_ordered_list"));
     delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
     shard_id = -1;
     init_num_shards = 0;
@@ -398,7 +398,7 @@ public:
   int fetch(const DoutPrefixProvider *dpp) {
     CephContext* cct = dpp->get_cct();
     std::string bn = bucket->get_name();
-    uint32_t cnt = int32_t(store->ctx()->_conf.get_val<uint64_t>("rgw_lc_list_cnt"));
+    uint32_t cnt = int32_t(cct->_conf.get_val<uint64_t>("rgw_lc_list_cnt"));
     uint32_t num_shards = bucket->get_info().layout.current_index.layout.normal.num_shards;
     ldpp_dout(dpp, 10) << "bucket: " << bn << " init_num_shards " << init_num_shards
                        << " num_shards: " << num_shards << dendl;
