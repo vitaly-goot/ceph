@@ -989,7 +989,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       for (auto obj_iter = results.objs.begin(); obj_iter != results.objs.end(); ++obj_iter, ++offset) {
 	std::tuple<lc_op, rgw_bucket_dir_entry> t1 =
 	  {prefix_iter->second, *obj_iter};
-        worker->workpool->enqueue(WorkItem{t1});
+	worker->workpool->enqueue(WorkItem{t1});
 	if (going_down()) {
 	  return 0;
 	}
