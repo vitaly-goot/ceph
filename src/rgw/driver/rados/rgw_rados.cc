@@ -4434,6 +4434,19 @@ int RGWRados::copy_obj(RGWObjectCtx& obj_ctx,
   attrs.erase(RGW_ATTR_ID_TAG);
   attrs.erase(RGW_ATTR_PG_VER);
   attrs.erase(RGW_ATTR_SOURCE_ZONE);
+  // When the target bucket isn't versioned or has versioning suspended,
+  // DO NOT copy OLH attributes.
+  if (!dest_bucket_info.versioned() ||
+      dest_bucket_info.flags & BUCKET_VERSIONS_SUSPENDED) {
+    auto iter = attrs.lower_bound(RGW_ATTR_OLH_PREFIX);
+    while (iter != attrs.end()) {
+      if (!boost::algorithm::starts_with(iter->first, RGW_ATTR_OLH_PREFIX)) {
+        break;
+      }
+      iter = attrs.erase(iter);
+    }
+  }
+
   map<string, bufferlist>::iterator cmp = src_attrs.find(RGW_ATTR_COMPRESSION);
   if (cmp != src_attrs.end())
     attrs[RGW_ATTR_COMPRESSION] = cmp->second;
