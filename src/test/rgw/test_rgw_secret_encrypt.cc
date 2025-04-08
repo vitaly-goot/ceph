@@ -8,7 +8,7 @@
 #include <tuple>
 #include "common/ceph_argparse.h"
 #include "rgw/rgw_common.h"
-#include "rgw/rgw_rados.h"
+#include "rgw/driver/rados/rgw_rados.h"
 #include "rgw/rgw_secret_encryption.h"
 #include <gtest/gtest.h>
 #include "include/ceph_assert.h"
