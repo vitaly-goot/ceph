@@ -434,7 +434,10 @@ public:
       if(list_results.is_truncated) {
         //shard may not be completely empty but all remaining entries are available in list_results
         //another list operation is not required
-        is_shard_empty[shard_id] = true;
+        ldpp_dout(dpp, 10) << "is_truncated: list_op shard_id " << shard_id
+                           << " returned ret= " << ret
+                           << " is_truncated=" << list_results.is_truncated << dendl;
+        is_shard_empty.erase(shard_id);
       }
       if(obj_iter == list_results.objs.end()) {
         ldpp_dout(dpp, 10) << "EMPTY: list_op shard_id " << shard_id  << " returned ret=" << ret
@@ -442,11 +445,6 @@ public:
         is_shard_empty[shard_id] = true;
 	//find a shard which has objects
 	for(;;) {
-	  if(is_shard_empty.size() >= num_shards) {
-	    ldpp_dout(dpp, 10) << "EMPTY: list_op all shards empty returned ret=" << ret
-		   << dendl;
-	    return 0;
-	  }
 	  shard_id = (shard_id == num_shards + 1)? 0 : (shard_id + 1) % num_shards;
 	  list_params.shard_id = shard_id;
 	  list_params.prefix = shard_prefix[shard_id];
@@ -461,7 +459,10 @@ public:
 	  if(list_results.is_truncated) {
 	    //shard may not be completely empty but all remaining entries are available in list_results
 	    //another list operation is not required
-	    is_shard_empty[shard_id] = true;
+            ldpp_dout(dpp, 10) << "is_truncated: list_op shard_id " << shard_id
+                               << " returned ret= " << ret
+                               << " is_truncated=" << list_results.is_truncated << dendl;
+            is_shard_empty.erase(shard_id);
 	  }
 	  obj_iter = list_results.objs.begin();
 	  if(obj_iter != list_results.objs.end())
@@ -469,6 +470,13 @@ public:
 	  ldpp_dout(dpp, 10) << "EMPTY: list_op shard_id " << shard_id  << " returned ret=" << ret
 		   << dendl;
 	  is_shard_empty[shard_id] = true;
+          if(is_shard_empty.size() >= num_shards) {
+            ldpp_dout(dpp, 10) << "EMPTY: list_op all shards empty returned ret=" << ret
+                               << " is_shard_empty.size= " << is_shard_empty.size()
+                               << " num_shards= " << num_shards
+                               << dendl;
+            return 0;
+          }
 	}
       }
     }
