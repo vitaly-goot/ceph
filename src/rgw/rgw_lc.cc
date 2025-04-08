@@ -385,6 +385,10 @@ public:
     init_num_shards = 0;
   }
 
+  int get_shard_id() {
+    return shard_id;
+  }
+
   void set_prefix(const string& p) {
     prefix = p;
     shard_prefix[shard_id] = prefix;
@@ -873,6 +877,15 @@ public:
   void enqueue(WorkItem item) {
     const auto tix = ix;
     ix = (ix+1) % wqs.size();
+    (wqs[tix]).enqueue(std::move(item));
+  }
+
+  void enqueue(WorkItem item,int shard_id) {
+    if(shard_id == -1) {
+      return enqueue(item);
+    }
+    auto tix = ix;
+    tix = shard_id % wqs.size();
     (wqs[tix]).enqueue(std::move(item));
   }
 
@@ -1757,7 +1770,9 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     for (auto offset = 0; ol.get_obj(this, &o /* , fetch_barrier */); ++offset, ol.next()) {
       orule.update();
       std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
-      worker->workpool->enqueue(WorkItem{t1});
+      bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
+      int shard_id = multi_shard_list ? ol.get_shard_id() : -1;
+      worker->workpool->enqueue(WorkItem{t1}, shard_id);
       if ((offset % 100) == 0) {
 	if (worker_should_stop(stop_at, once)) {
 	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
