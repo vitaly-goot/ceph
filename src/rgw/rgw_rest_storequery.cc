@@ -35,7 +35,7 @@ void RGWStoreQueryOp_Base::send_response_pre()
   }
   auto ret = RGWHandler_REST::reallocate_formatter(s, RGWFormat::JSON);
   if (ret != 0) {
-    ldpp_dout(this, 20) << "failed to set formatter to JSON" << dendl;
+    ldpp_dout(this, 0) << "failed to set formatter to JSON" << dendl;
     set_req_state_err(s, -EINVAL);
   }
   dump_errno(s);
@@ -133,7 +133,7 @@ bool RGWStoreQueryOp_ObjectStatus::execute_simple_query(optional_yield y)
 
     if (ret < 0) {
       op_ret = ret;
-      ldpp_dout(this, 2) << "sal bucket->list query failed ret=" << ret
+      ldpp_dout(this, 0) << "sal bucket->list query failed ret=" << ret
                          << dendl;
       break;
     }
@@ -227,7 +227,7 @@ bool RGWStoreQueryOp_ObjectStatus::execute_mpupload_query(optional_yield y)
         delimiter, mp_query_max, uploads,
         nullptr, &is_truncated);
     if (ret < 0) {
-      ldpp_dout(this, 2) << "list_multiparts() failed with code " << ret
+      ldpp_dout(this, 0) << "list_multiparts() failed with code " << ret
                          << dendl;
       op_ret = ret;
       break;
@@ -287,7 +287,7 @@ void RGWStoreQueryOp_ObjectStatus::execute(optional_yield y)
   }
 
   // Not found anywhere.
-  ldpp_dout(this, 2) << "key not found" << dendl;
+  ldpp_dout(this, 0) << "key not found" << dendl;
   op_ret = -ENOENT;
   return;
 }
@@ -384,7 +384,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 
     if (ret < 0) {
       op_ret = ret;
-      ldpp_dout(this, 2) << "SAL bucket->list() query failed ret=" << ret
+      ldpp_dout(this, 0) << "SAL bucket->list() query failed ret=" << ret
                          << dendl;
       break;
     }
@@ -438,7 +438,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
         // actually the end of the list - the next query will just have zero
         // items.
         next_marker = results.objs[n].key.name;
-        ldpp_dout(this, 20) << fmt::format(FMT_STRING("max_entries reached, next={}"), next_marker) << dendl;
+        ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next={}"), next_marker) << dendl;
         break;
       }
 
@@ -482,7 +482,7 @@ void RGWStoreQueryOp_ObjectList::execute(optional_yield y)
 {
   if (!execute_query(y)) {
     // rely on execute_query() setting op_ret appropriately.
-    ldpp_dout(this, 1) << "execute_query() failed" << dendl;
+    ldpp_dout(this, 0) << "execute_query() failed" << dendl;
   }
 }
 
@@ -575,9 +575,6 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
     uploads.clear();
 
     ldpp_dout(this, 20) << fmt::format(
-        FMT_STRING("issue list_multiparts() query marker='{}'"), marker)
-                        << dendl;
-    ldpp_dout(this, 20) << fmt::format(
         FMT_STRING("issue list_multiparts() query query_max={} marker={}"), query_max, marker)
                         << dendl;
 
@@ -590,7 +587,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
     auto ret = s->bucket->list_multiparts(this, "", marker, "", query_max, uploads, nullptr, &is_truncated);
 
     if (ret < 0) {
-      ldpp_dout(this, 2) << "list_multiparts() failed with code " << ret
+      ldpp_dout(this, 0) << "list_multiparts() failed with code " << ret
                          << dendl;
       op_ret = ret;
       break;
@@ -619,7 +616,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
         // actually the end of the list - the next query will just have zero
         // items.
         next_marker = marker;
-        ldpp_dout(this, 20) << fmt::format(FMT_STRING("max_entries reached, next={}"), next_marker) << dendl;
+        ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next={}"), next_marker) << dendl;
         break;
       }
     }
@@ -660,7 +657,7 @@ void RGWStoreQueryOp_MPUploadList::execute(optional_yield y)
 {
   if (!execute_query(y)) {
     // rely on execute_query() setting op_ret appropriately.
-    ldpp_dout(this, 1) << "execute_query() failed" << dendl;
+    ldpp_dout(this, 0) << "execute_query() failed" << dendl;
   }
 }
 
@@ -755,7 +752,7 @@ bool RGWSQHeaderParser::valid_base64(const DoutPrefixProvider* dpp, const std::s
   // This is quite fussy, but we should always output valid base64 with proper
   // padding, so it's not unreasonable to expect the same back.
   if (input.size() % 4 != 0) {
-    ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("input length {} is not a multiple of 4"), input.size()) << dendl;
+    ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("input length {} is not a multiple of 4"), input.size()) << dendl;
     return false;
   }
   // Using std::all() would prevent us giving specific diagnostics.
