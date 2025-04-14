@@ -196,6 +196,7 @@ public:
 		  ceph::bufferlist *out);
 
   static constexpr std::size_t largest_singleton = 8 * 72;
+  static constexpr const char* alog_dpp_singleton = "alog_dpp_singleton";
 
   template<typename T, typename... Args>
   T& lookup_or_create_singleton_object(std::string_view name,

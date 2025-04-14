@@ -55,6 +55,12 @@ class basic_timeout_timer {
     }
   }
 
+  void async_wait(uint32_t delay_ms, yield_context yield) {
+    timer.expires_from_now(std::chrono::milliseconds(delay_ms));
+    boost::system::error_code ec;
+    timer.async_wait(yield[ec]);
+  }
+
  private:
   using Timer = boost::asio::basic_waitable_timer<clock_type,
         boost::asio::wait_traits<clock_type>, executor_type>;

@@ -1812,7 +1812,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
                                            shard_id,
 					   cur_marker,
 					   cur_prefix,
-					   params.delim,
+					   (params.ns == RGW_OBJ_NS_MULTIPART) ? "" : params.delim,
 					   read_ahead + 1 - count,
 					   params.list_versions,
 					   attempt,
@@ -1866,7 +1866,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
         /* we're skipping past namespaced objects */
 	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping past namespaced objects, including \"" << entry.key <<
+	  ": skipping past namespaced objects, including \"" << entry.key << "\" obj.name \"" << obj.name << "\" params.delim \"" << params.delim  <<
 	  "\"" << dendl;
         continue;
       }
@@ -1884,24 +1884,18 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	next_marker = index_key;
       }
 
-      if (params.access_list_filter &&
-	  ! params.access_list_filter->filter(obj.name, index_key.name)) {
-	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping past namespaced objects, including \"" << entry.key <<
-	  "\"" << dendl;
-        continue;
-      }
-
-      if (params.prefix.size() &&
-	  0 != obj.name.compare(0, params.prefix.size(), params.prefix)) {
-	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping object \"" << entry.key <<
-	  "\" that doesn't match prefix \"" << params.prefix << "\"" << dendl;
-        continue;
-      }
-
+      std::string obj_name = obj.name;
       if (!params.delim.empty()) {
-	const int delim_pos = obj.name.find(params.delim, params.prefix.size());
+        if (params.ns == RGW_OBJ_NS_MULTIPART) {
+          RGWMPObj mp;
+          if(!mp.from_meta(obj.name)) {
+            ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+	    " could not parse mp object name: " << obj.name << dendl;
+            continue;
+	  }
+          obj_name = mp.get_key();
+        }
+	const int delim_pos = obj_name.find(params.delim, params.prefix.size());
 	if (delim_pos >= 0) {
 	  // run either the code where delimiter filtering is done a)
 	  // in the OSD/CLS or b) here.
@@ -1911,10 +1905,10 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	    // find one delimiter at the end if it finds any after the
 	    // prefix
 	    if (delim_pos !=
-		int(obj.name.length() - params.delim.length())) {
+		int(obj_name.length() - params.delim.length())) {
 	      ldpp_dout(dpp, 0) << "WARNING: " << __func__ <<
 		" found delimiter in place other than the end of "
-		"the prefix; obj.name=" << obj.name <<
+		"the prefix; obj_name=" << obj_name <<
 		", prefix=" << params.prefix << dendl;
 	    }
 	    if (common_prefixes) {
@@ -1927,14 +1921,9 @@ int RGWRados::Bucket::List::list_objects_ordered(
 		goto done;
 	      }
 
-	      (*common_prefixes)[obj.name] = true;
+	      (*common_prefixes)[obj_name] = true;
 	      count++;
 	    }
-
-	    ldpp_dout(dpp, 20) << __func__ <<
-	      ": finished entry with common prefix \"" << entry.key <<
-	      "\" so continuing loop (cls filtered)" << dendl;
-	    continue;
 	  } else {
 	    // NOTE: this condition is for older versions of the OSD
 	    // that do not filter on the CLS side, so the following code
@@ -1944,7 +1933,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
 	    /* extract key -with trailing delimiter- for CommonPrefix */
 	    string prefix_key =
-	      obj.name.substr(0, delim_pos + params.delim.length());
+	      obj_name.substr(0, delim_pos + params.delim.length());
 
 	    if (common_prefixes &&
 		common_prefixes->find(prefix_key) == common_prefixes->end()) {
@@ -1961,7 +1950,39 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
 	      count++;
 	    }
+	  } // if we're running an older OSD version
+	} // if a delimiter was found after prefix
+      } // if a delimiter was passed in
 
+      if (params.access_list_filter &&
+	  ! params.access_list_filter->filter(obj.name, index_key.name)) {
+	ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	  ": skipping past access_list_filter objects, including \"" << entry.key 
+	  << "\" obj.name \"" << obj.name << "\" index_key.name \"" << index_key.name 
+	  << "\" params.delim \"" << params.delim << "\" params.prefix \"" << params.prefix <<
+	  "\"" << dendl;
+        continue;
+      }
+
+      if (params.prefix.size() &&
+	  0 != obj.name.compare(0, params.prefix.size(), params.prefix)) {
+	ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	  ": skipping object \"" << entry.key <<
+	  "\" that doesn't match prefix \"" << params.prefix << "\"" << dendl;
+        continue;
+      }
+
+      if (!params.delim.empty()) {
+	const int delim_pos = obj_name.find(params.delim, params.prefix.size());
+	if (delim_pos >= 0) {
+	  // run either the code where delimiter filtering is done a)
+	  // in the OSD/CLS or b) here.
+	  if (cls_filtered) {
+	    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	      ": finished entry with common prefix \"" << entry.key <<
+	      "\" so continuing loop (cls filtered)" << dendl;
+	    continue;
+	  } else {
 	    ldpp_dout(dpp, 20) << __func__ <<
 	      ": finished entry with common prefix \"" << entry.key <<
 	      "\" so continuing loop (not cls filtered)" << dendl;
@@ -4413,6 +4434,19 @@ int RGWRados::copy_obj(RGWObjectCtx& obj_ctx,
   attrs.erase(RGW_ATTR_ID_TAG);
   attrs.erase(RGW_ATTR_PG_VER);
   attrs.erase(RGW_ATTR_SOURCE_ZONE);
+  // When the target bucket isn't versioned or has versioning suspended,
+  // DO NOT copy OLH attributes.
+  if (!dest_bucket_info.versioned() ||
+      dest_bucket_info.flags & BUCKET_VERSIONS_SUSPENDED) {
+    auto iter = attrs.lower_bound(RGW_ATTR_OLH_PREFIX);
+    while (iter != attrs.end()) {
+      if (!boost::algorithm::starts_with(iter->first, RGW_ATTR_OLH_PREFIX)) {
+        break;
+      }
+      iter = attrs.erase(iter);
+    }
+  }
+
   map<string, bufferlist>::iterator cmp = src_attrs.find(RGW_ATTR_COMPRESSION);
   if (cmp != src_attrs.end())
     attrs[RGW_ATTR_COMPRESSION] = cmp->second;
@@ -10005,6 +10039,10 @@ int RGWRados::check_bucket_shards(const RGWBucketInfo& bucket_info,
 				     &suggested_num_shards);
   if (! need_resharding) {
     return 0;
+  }
+
+  if (cct->_conf.get_val<bool>("rgw_reshard_direct_max")) {
+    suggested_num_shards = max_dynamic_shards;
   }
 
   const uint32_t final_num_shards =

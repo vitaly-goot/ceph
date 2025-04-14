@@ -436,6 +436,31 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_lc_allow_ordered_list
+  type: bool
+  level: dev
+  desc: The lc processing to do ordered listing for the bucket.
+        This is not valid with rgw_lc_multi_shard_list set to true.
+  long_desc: Enabling this for RGW LifeCycle, will cause the lc process to do ordered
+    listing from the bucket. This will be set to false if rgw_lc_multi_shard_list to true.
+    This might increase CPU and memory usage on RGW. This along with increasing
+    rgw_lc_max_wp_worker will increase the lc throughput per bucket. This requires RGW
+    restart to be effective.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_list_cnt
+  type: uint
+  level: dev
+  desc: The count of number of objects in per listing of lc processing from each bucket.
+  long_desc: This is used when rgw_lc_multi_shard_list is false. In each listing request
+    of the bucket, the count number of objects will be requested.
+    This along with increasing rgw_lc_max_wp_worker will increase the lc throughput per bucket.
+  default: 1000
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_lc_multi_shard_list
   type: bool
   level: dev
@@ -483,6 +508,42 @@ options:
     in the request.
   services:
   - rgw
+  with_legacy: true
+- name: rgw_request_close_conn_on_error_override
+  type: bool
+  level: dev
+  default: false
+  desc: Force the connection to close by overriding the keep-alive option when an error occurs (e.g., HTTP response code is in the 4xx range).
+  long_desc: JIRA https://track.akamai.com/jira/browse/CEPH-174
+    When this value is set to false, keep-alive for such requests functions as intended. 
+    When this value is set to true, it will abort requests that include the Expect-100-Continue header, operate in keep-alive mode and end up with an error.
+    This is essentially an Akamai workaround for the OSPROXY solution, which forwards the payload along with the Expect-100-Continue header 
+    because it cannot decouple the signature logic from the HTTP connection control logic.
+    This behavior confuses RGW, as it does not expect both the Expect-100-Continue header and the payload to be present simultaneously in the request.
+    While this setup does not pose an issue when such requests succeed, as RGW will process the payload normally, it causes problems in error scenarios.
+    In the event of an error, RGW does not discard the residual payload that OSPROXY sends prematurely, leading to the failure of the next request
+    on the same PCONN because the residual payload is not cleaned up.
+    Note that the vast majority of clients are designed to wait for an acknowledgment before sending the payload.
+    The negative impacts become evident when OSPROXY is part of the chain. If OSPROXY is removed from the architecture, this patch can be safely rolled back.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_request_close_conn_on_error_delay
+  type: int
+  level: dev
+  default: 0
+  desc:  Adds a delay to penalize clients before aborting requests that encounter an error.
+  long_desc: JIRA https://track.akamai.com/jira/browse/CEPH-174
+     This setting only takes effect when rgw_request_close_conn_on_error_override is set to true and applies to requests that include the Expect-100-Continue header, 
+     operate in keep-alive mode, and result in an error.
+     A value of 0 means no additional delay is added.
+     A positive value introduces a delay (in milliseconds) before the PCONN is aborted.
+     The delay is intended to slow down clients that trigger 4xx responses, mitigating potential abuse where a malicious client disrupts normal operations. 
+     By delaying connection closure, the server reduces the overhead associated with establishing new connections, thereby conserving resources and maintaining stability.
+  services:
+  - rgw
+  see_also:
+  - rgw_request_close_conn_on_error_override
   with_legacy: true
 - name: rgw_ignore_get_invalid_range
   type: bool
@@ -3391,6 +3452,21 @@ options:
   see_also:
   - rgw_max_objs_per_shard
   - rgw_max_dynamic_shards
+- name: rgw_reshard_direct_max 
+  type: bool
+  level: basic
+  desc: Scale up to rgw_max_dynamic_shards once shard density exceeds rgw_max_objs_per_shard for the first time.
+  long_desc: Alternative to dynamic resharding, if enabled RGW will switch from dynamic resgarding to a two-step approach. 
+    Initially, the number of shards is set to the minimum, then automatically scales up to `rgw_max_dynamic_shards` 
+    once the shard density surpasses `rgw_max_objs_per_shard` for the first time.
+    The rgw_dynamic_resharding option must be also enabled for this mode to take effect.
+  default: true
+  services:
+  - rgw
+  see_also:
+  - rgw_dynamic_resharding
+  - rgw_max_objs_per_shard
+  - rgw_max_dynamic_shards
 - name: rgw_max_objs_per_shard
   type: uint
   level: basic
@@ -4048,6 +4124,116 @@ options:
   desc: Revert Akamai CEPH-200 fix behaviour
   long_desc: Revert to pre-CEPH-200 behaviour.
   default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_cluster_id
+  type: str
+  level: advanced
+  desc: Cluster ID for the Akamai Unique Bucket Name Service
+  long_desc: The cluster ID for the Akamai Unique Bucket Name Service. This value
+    is used to identify the Ceph cluster to UBNS, and is required for UBNS
+    operation. It is an opaque string that is unique to the cluster. It must
+    be the same on all RGWs in the cluster or the results will be
+    unpredictable.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_enabled
+  type: bool
+  level: advanced
+  desc: Enable the Akamai Unique Bucket Name Service
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_initial_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS.
+  long_desc: The initial reconnect backoff timeout, the amount of time the
+    gRPC channel will wait before attempting to reconnect to the server.
+    The library enforces a minimum value of 100ms for this setting.
+    Be careful when changing this setting.
+  default: 1000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_min_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_MIN_RECONNECT_BACKOFF_MS (minimum reconnect backoff).
+  long_desc: The smallest value for the reconnect backoff timer. Be careful
+    when changing this setting.
+  default: 20000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_max_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_MAX_RECONNECT_BACKOFF_MS (minimum reconnect backoff).
+  long_desc: The largest value for the reconnect backoff timer. Be careful
+    when changing this setting.
+  default: 120000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_enabled
+  type: bool
+  level: advanced
+  desc: Enable mTLS for UBNS gRPC connections.
+  long_desc: If set to true, the RGW will use mTLS to secure the connection to the
+    UBNS service. If true, the RGW will require rgw_ubns_grpc_mtls_ca_cert,
+    rgw_ubns_grpc_mtls_client_cert, and rgw_ubns_grpc_mtls_client_key to be set
+    in order to start.
+  default: true
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_ca_cert_file
+  type: str
+  level: advanced
+  desc: Path to the CA certificate file for UBNS gRPC connections.
+  long_desc: The path to the CA certificate that will be used to verify the
+    server's certificate when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_client_cert_file
+  type: str
+  level: advanced
+  desc: Path to the client certificate file for UBNS gRPC connections.
+  long_desc: The path to the client certificate that will be used to authenticate
+    the RGW when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_client_key_file
+  type: str
+  level: advanced
+  desc: Path to the client key file for UBNS gRPC connections.
+  long_desc: The path to the client key that will be used to authenticate the RGW
+    when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_uri
+  type: str
+  level: advanced
+  desc: URI for the UBNS service via gRPC.
+  long_desc: The gRPC server address to use. This value is passed unchanged to
+    grpc::CreateCustomChannel() so may be in any format supported by the C++
+    gRPC library.
+  default: ipv4:127.0.0.1:9000
+  flags:
+  - runtime
   services:
   - rgw
   with_legacy: true

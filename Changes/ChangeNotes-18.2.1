@@ -25,3 +25,257 @@ RGWSetBucketVersioning::execute() do validation only when HTTP_X_RGW_VALIDATE_ON
 [File Changed]
 src/rgw/rgw_op.cc
 
+
+=============================================================================
+JIRA OBJGEN1-950 Ceph: report RGW concurrent connection or other data to SRE
+
+Developer: @vgoot
+Code Review: @sung @bzymka
+
+[Description]
+Start reporting metrics from simple_throttler into Prometheus to gain per-RGW observability of the current number of connections waiting in the queue, and rejected connections resulting in 503 errors.
+
+[Grafana]
+TITLE: QLen by RGW
+METRIC: ceph_simple_throttler_outstanding
+TYPE: gauge
+DESC: current number of accepted connections waiting in Q by RGW
+QUERY: sum by (rgw_host) (label_replace(ceph_simple_throttler_outstanding * on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata, "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"))
+
+TITLE: Dropped connections by RGW
+METRIC: ceph_simple_throttler_throttle
+TYPE: counter
+DESC: connections rejected with 503 by RGW
+QUERY: sum by (rgw_host) (label_replace(rate(ceph_simple_throttler_throttle[60s]) * on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata, "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"))
+
+[File Changed]
+src/rgw/rgw_dmclock_async_scheduler.h
+src/rgw/rgw_dmclock_scheduler_ctx.cc
+
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/OBJGEN1-1235
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+This script scans bucket lifecycle policies and provides insights into the count and size metrics of expired versus non-expired objects for current, non-current, and incomplete multipart uploads.
+
+It downloads and parses the S3 bucket lifecycle policy (as defined here https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html), then iterates over the bucket to verify
+if an object is expired. The script reports counters that outline the number of objects and their size. It also calculates and reports the ratio of expired to non-expired objects.
+During iteration, the script produces a report line labeled 'HEARTBEAT' with intermediate results, followed by the last processed token. The counters are reported as:
+  Expired: [{expired_obj}, {expired_byte}] Total: [{total_obj}, {total_byte}] Rate: [{rate_obj}%, {rate_byte}%]
+
+The script supports aborting and resuming processing from a specific token at any time, resuming the calculation with restored counters for current and non-current objects. For example:
+  python3 lc_scan.py --bucket=test4 --token vgoot%2F7%2F172.232.160.215%2F76 --current_cnt 1,100,5,500 --noncurrent_cnt 0,0,10,1000
+
+Here, the counters are provided as a tuple of four integers separated by commas, denoting (expired_obj, expired_byte, total_obj, total_byte) for corresponded counter.
+
+At the end, the script iterates over the list of incomplete uploads and produces a counter showing expired versus non-expired uploads according to the Lifecycle policy rule, if one is present.
+You can skip the verification of current and non-current objects by using the --mpu_only command option flag.
+
+[Notes]
+- Tags policies are not supported, mainly to improve speed of scanning as we don't use it at Akamai. Contact developers if you would like to add support for it.
+- Ceph-17 does not support the NewerNoncurrentVersions attribute in S3 lifecycle policies. If you attempt to set a rule with this attribute, Ceph-17 will silently exclude it from the policy rules, resulting in a final rule that does not include the NewerNoncurrentVersions attribute.
+- Ceph-17 does not support complex rules with object size filters defined in the And section. For example, attempting to set the following rule will result in the ObjectSizeGreaterThan and ObjectSizeLessThan attributes being dropped:
+       'And': {
+            'Prefix': 'logs/',
+            'Tags': [{'Key': 'Environment', 'Value': 'Production'}],
+            'ObjectSizeGreaterThan': 1000,
+            'ObjectSizeLessThan': 100000
+        }
+
+
+[Output]
+Combined rules execution plan: Current:True,Noncurrent:True,MPU:True
+Starting LC Processor verification for current objects.
+Starting LC Processor verification for noncurrent objects.
+1721764377 HEARTBEAT Current:{Expired:[0,0]},{Total:[100,1000]},{Rate:[0.0%,0.0%]} Noncurrent:{Expired:[0,0]},{Total:[29,290]},{Rate:[0.0%,0.0%]}
+vgoot%2F3%2F172.232.160.215%2F75
+1721764397 HEARTBEAT Current:{Expired:[0,0]},{Total:[200,2000]},{Rate:[0.0%,0.0%]} Noncurrent:{Expired:[0,0]},{Total:[29,290]},{Rate:[0.0%,0.0%]}
+vgoot%2F7%2F172.232.160.215%2F76
+Starting LC Processor verification for incomplete multipart uploads.
+1721764411 DONE Current:{Expired:[0,0]},{Total:[254,2540]},{Rate:[0.0%,0.0%]} Noncurrent:{Expired:[0,0]},{Total:[29,290]},{Rate:[0.0%,0.0%]} MPU:{Expired:[0,0]},{Total:[1,524288000]},{Rate:[0.0%,0.0%]}
+
+[File Changed]
+src/tools/akamai/python/lc_scan.py
+
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/OBJGEN1-1235
+
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+Script to  detect and delete incomplete MPUs.
+When run in dry mode, it will report all incomplete MPUs that exceed a configurable cutoff time (default is 24 hours) for a specified bucket. When dry mode is disabled, the script will enforce the deletion of these incomplete MPUs. You can also control concurrency by adjusting the thread pool of workers.
+
+[File Changed]
+src/tools/akamai/python/mpu_cleanup.py
+
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/OBJGEN1-1047
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+New access log appender reporting alog messages into '/var/log/ceph/access.log'.
+New dpp logging subsystem 'alog' to facilitate access log reporting.
+New reporting around LC processor to highlighting {bucket_name, lc_operation[lc_expire_current,lc_expire_noncurrent,lc_abort_mpu,lc_expire_dm], op_return_code] 
+Access log file format must be sutable for Loki (log collection) subsytem. Loki is optimized for handling logs, and by using key-value pairs. 
+
+Common Guidelines for Loki-Compatible Logs:
+- Format the logs in a structured key-value pairs, which makes them easier to parse and query in Loki.
+- The key-value pairs are space-separated.
+- Use key-value pairs to allow easy querying with Loki's query language (LogQL).
+- Timestamp in a standard format (ISO 8601 or RFC 3339) as Loki handles time-based queries.
+
+
+[Logging]
+New log file 
+/var/log/ceph/ceph-client.rgw.${instance}.access.log
+Grafana experimental:
+https://grafana.linode.com/d/ednak6pnwuu4ge/vgoot-ceph-quincy-rgw-overview-copy?orgId=1&refresh=10s&editPanel=35
+
+[Output]
+LC processor Key-Value Pairs Example:
+  time=2024-10-01T07:52:31Z timestamp=1727769151.265 bucket=test5 op=lc_expire_current ret=0
+
+[Config]
+  name: enable_accesslog
+  type: bool
+  level: basic
+  desc: enable access log
+  default: false
+
+[Rollout]
+The feature is disabled by default. To enable set 'enable_accesslog' variable to true.
+  ceph config set client.rgw enable_accesslog true
+LC reporting to the access log can also be disabled by setting the severity for the 'alog' subsystem to a value below 4.
+  ceph config set client.rgw debug_alog 3
+
+[File Changed]
+  new file:   src/common/AccessLog.cc
+  new file:   src/common/AccessLog.h
+  modified:   src/common/CMakeLists.txt
+  modified:   src/common/ceph_context.cc
+  modified:   src/common/ceph_context.h
+  modified:   src/common/options/global.yaml.in
+  modified:   src/common/subsys.h
+  modified:   src/log/Log.cc
+  modified:   src/log/Log.h
+  modified:   src/rgw/rgw_lc.cc
+
+=============================================================================
+JIRA: https://track.akamai.com/jira/browse/CEPH-174
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+  Abort PCONN on 4xx error when expect-100-continue included in HTTP header
+
+[Output]
+log output are added to note PCONN termination and delay 
+  ldout(cct, 5) << "PCONN abort on error delayed: " << delay_ms << dendl;
+  ldout(cct, 1) << "PCONN abort on error enforced" << dendl;
+
+[Config]
+name: rgw_request_close_conn_on_error_override
+  type: bool
+  level: dev
+  default: false
+  desc: Force the connection to close by overriding the keep-alive option when an error occurs (e.g., HTTP response code is in the 4xx range).
+  long_desc: JIRA https://track.akamai.com/jira/browse/CEPH-174
+    When this value is set to false, keep-alive for such requests functions as intended.
+    When this value is set to true, it will abort requests that include the Expect-100-Continue header, operate in keep-alive mode and end up with an error.
+    This is essentially an Akamai workaround for the OSPROXY solution, which forwards the payload along with the Expect-100-Continue header
+    because it cannot decouple the signature logic from the HTTP connection control logic.
+    This behavior confuses RGW, as it does not expect both the Expect-100-Continue header and the payload to be present simultaneously in the request.
+    While this setup does not pose an issue when such requests succeed, as RGW will process the payload normally, it causes problems in error scenarios.
+    In the event of an error, RGW does not discard the residual payload that OSPROXY sends prematurely, leading to the failure of the next request
+    on the same PCONN because the residual payload is not cleaned up.
+    Note that the vast majority of clients are designed to wait for an acknowledgment before sending the payload.
+    The negative impacts become evident when OSPROXY is part of the chain. If OSPROXY is removed from the architecture, this patch can be safely rolled back.
+  services:
+  - rgw
+name: rgw_request_close_conn_on_error_delay
+  type: int
+  level: dev
+  default: 0
+  desc:  Adds a delay to penalize clients before aborting requests that encounter an error.
+  long_desc: JIRA https://track.akamai.com/jira/browse/CEPH-174
+     This setting only takes effect when rgw_request_close_conn_on_error_override is set to true and applies to requests that include the Expect-100-Continue header,
+     operate in keep-alive mode, and result in an error.
+     A value of 0 means no additional delay is added.
+     A positive value introduces a delay (in milliseconds) before the PCONN is aborted (bounded up to 10 sec). 
+     The delay is intended to slow down clients that trigger 4xx responses, mitigating potential abuse where a malicious client disrupts normal operations.
+     By delaying connection closure, the server reduces the overhead associated with establishing new connections, thereby conserving resources and maintaining stability.
+  services:
+  - rgw
+  see_also:
+  - rgw_request_close_conn_on_error_override
+
+[Notes]
+Aborting persistent connections introduces overhead associated with establishing new connections. To address this, configurable delay option is added to penalize clients 
+generating 4xx traffic before aborting such requests. Adding delay on the RGW side obviously isn't ideal, since it ties up PCONN resources.
+
+To evaluate the potential impact, of PCONN termination we can add Grafana dashboard to track the rate of 4xx versus 2xx response codes in production. 
+This data can be extracted from the OSPROXY access logs available in Grafana. Under normal circumstances, traffic should predominantly result in 2xx responses. 
+We should define a threshold and set up an alert based on the 2xx to 4xx response ratio. For example, a ratio of 1:1000 may be acceptable, 
+but anything lower could indicate potential issues, such as an ongoing attack or a severe client misconfiguration.
+
+The primary purpose of the proxy, which is to protect the backend, is not functioning as intended in the current OSPROXY setup, 
+as it forwards the payload without waiting for an ACK from the server. This exposes the system to potential attacks. 
+The proposed solution should be treated as a temporary workaround while transitioning to Envoy.
+
+[Rollout]
+Feature is disabled by default,
+to abort connection on error set rgw_request_close_conn_on_error_override to true
+to enable 1 second timeout before abort set rgw_request_close_conn_on_error_delay to 1000 (max is bounded to 10 sec) 
+
+With this approach:
+The feature will be automatically disabled in Gen2 clusters.
+For Gen1 clusters, SREs will need to manually enable the feature as required.
+
+[File Changed]
+  src/common/options/rgw.yaml.in
+  src/rgw/rgw_asio_client.cc
+  src/rgw/rgw_asio_client.h
+  src/rgw/rgw_asio_frontend.cc
+  src/rgw/rgw_asio_frontend_timer.h
+  src/rgw/rgw_client_io.h
+  src/rgw/rgw_client_io_filters.h
+  src/rgw/rgw_common.h
+  src/rgw/rgw_loadgen.cc
+  src/rgw/rgw_loadgen.h
+  src/rgw/rgw_rest.cc
+
+=============================================================================
+JIRA https://track.akamai.com/jira/browse/CEPH-156
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+  OSD debug tool 
+  Details in src/tools/akamai/osd_debug/README.md
+
+
+[File Changed]
+    new file: src/tools/akamai/osd_debug/srv/unwind_attach.sh
+    new file: src/tools/akamai/osd_debug/srv/gdb_attach.sh
+    new file: src/tools/akamai/osd_debug/srv/elevate_osd_log.sh
+    new file: src/tools/akamai/osd_debug/srv/process_ss_output.py
+    new file: src/tools/akamai/osd_debug/srv/osd-debugger.sh
+    new file: src/tools/akamai/osd_debug/README.md
+    new file: src/tools/akamai/osd_debug/etc/logrotate.d/ceph-common-debug
+=======
+=============================================================================
+JIRA https://track.akamai.com/jira/browse/CEPH-245
+
+[Description]
+Customized dynamic resharding. 
+

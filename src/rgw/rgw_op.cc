@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 smarttab ft=cpp
 
 #include <errno.h>
+#include <rgw_common.h>
 #include <stdlib.h>
 #include <system_error>
 #include <unistd.h>
@@ -13,14 +14,15 @@
 #include <boost/optional.hpp>
 #include <boost/utility/in_place_factory.hpp>
 
-#include "include/scope_guard.h"
 #include "common/Clock.h"
 #include "common/armor.h"
+#include "common/ceph_json.h"
+#include "common/dout.h"
 #include "common/errno.h"
 #include "common/mime.h"
-#include "common/utf8.h"
-#include "common/ceph_json.h"
 #include "common/static_ptr.h"
+#include "common/utf8.h"
+#include "include/scope_guard.h"
 #include "rgw_tracer.h"
 
 #include "rgw_rados.h"
@@ -54,6 +56,8 @@
 #include "rgw_sal_rados.h"
 #include "rgw_lua_data_filter.h"
 #include "rgw_lua.h"
+#include "rgw_ubns.h"
+#include "rgw_ubns_machine.h"
 
 #include "services/svc_zone.h"
 #include "services/svc_quota.h"
@@ -449,6 +453,14 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
       ret = -ENOENT;
     }
   }
+  if (ret == -ENOENT && !upload_id.empty()) {
+    /* multipart upload */
+    ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message =
+        "The specified multipart upload does not exist. The upload ID might "
+        "be invalid, "
+        "or the multipart upload might have been aborted or completed";
+  }
 
   return ret;
 }
@@ -534,7 +546,42 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     s->bucket_attrs = s->bucket->get_attrs();
 
     if (s->handoff_authz->enabled()) {
-      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy() and s->bucket_owner set" << dendl;
+      // HANDOFF: We can skip the policy read, but we *must* set the
+      // s->bucket_owner as it's used by usage logging.
+      //
+      // This call follows the chain of events that occurs when there's no
+      // policy available:
+      //
+      //   read_bucket_policy() -> rgw_op_get_bucket_policy_from_attr() ->
+      //     RGWAccessControlPolicy::create_default()
+      //
+      // The end result is that we fetch the owner from the bucket object.
+      //
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy(), fetch owner from bucket info" << dendl;
+
+      // Duplicate the check in read_bucket_policy(). I can't find any code
+      // that actually sets this flag (nothing calls
+      // driver->set_bucket_enabled(), which is the only thing that sets it in
+      // the rados driver).
+      RGWBucketInfo bucket_info = s->bucket->get_info();
+      if (!s->system_request && bucket_info.flags & BUCKET_SUSPENDED) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " is suspended" << dendl;
+        return -ERR_USER_SUSPENDED;
+      }
+      // Duplicate the user load in rgw_op_get_bucket_policy_from_attr() and
+      // make sure the owner user is loaded.
+      rgw_user owner = bucket_info.owner;
+      std::unique_ptr<rgw::sal::User> user = driver->get_user(owner);
+      int r = user->load_user(dpp, y);
+      if (r < 0) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " owner failed to load" << dendl;
+        return r;
+      }
+      s->bucket_owner = owner;
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): set bucket_owner: " << owner.to_str() << dendl;
+
     } else {
       ret = read_bucket_policy(dpp, driver, s, s->bucket->get_info(),
           s->bucket->get_attrs(),
@@ -3510,9 +3557,42 @@ void RGWCreateBucket::execute(optional_yield y)
   buffer::list corsbl;
   string bucket_name = rgw_make_bucket_entry_name(s->bucket_tenant, s->bucket_name);
 
+  // UBNS: Create an empty optional<UBNSCreateMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSCreateMachine> ubns_creater(std::nullopt);
+
+  if (s->ubns_client) {
+    // Create a real ubns_creater. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_creater.emplace(this, s->ubns_client, bucket_name, s->ubns_client->cluster_id(), s->user->get_id().to_str());
+  }
+
   op_ret = get_params(y);
   if (op_ret < 0)
     return;
+
+  if (ubns_creater) {
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::CREATE_START);
+    if (!success) {
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request failed with unknown error" << dendl;
+        op_ret = -EEXIST;
+      }
+      return;
+    }
+    // creater state is CREATE_RPC_SUCCEEDED or CREATE_RPC_SOFT_FAILURE.
+    if (ubns_creater->state() == rgw::UBNSCreateMachine::CreateMachineState::CREATE_RPC_SOFT_FAILURE) {
+      ldpp_dout(this, 1) << "UBNS state CREATE_RPC_SOFT_FAILURE: stop RGWCreateBucket::execute() and return success code" << dendl;
+      op_ret = 0; // Success.
+      return;
+    }
+  }
 
   if (!relaxed_region_enforcement &&
       !location_constraint.empty() &&
@@ -3696,6 +3776,24 @@ void RGWCreateBucket::execute(optional_yield y)
       op_ret = -ERR_BUCKET_EXISTS;
     }
   }
+
+  if (ubns_creater) {
+    // Move the state machine from CREATE_RPC_SUCCEEDED to UPDATE_START.
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::UPDATE_START);
+    if (!success) {
+      // We've created the bucket! We will need to be reconcile this
+      // externally, there's no obvious way to roll this back from
+      // RGWCreateBucket::execute().
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed UpdateBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // creater state is UPDATE_RPC_SUCCEEDED or UPDATE_RPC_FAILED.
+  }
 }
 
 int RGWDeleteBucket::verify_permission(optional_yield y)
@@ -3727,6 +3825,41 @@ void RGWDeleteBucket::execute(optional_yield y)
   if (s->bucket_name.empty()) {
     op_ret = -EINVAL;
     return;
+  }
+
+  // UBNS: Create an empty optional<UBNSDeleteMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSDeleteMachine> ubns_deleter(std::nullopt);
+
+  if (s->ubns_client) {
+    // Fetch the user ID from the bucket. UBNS requires us to pass a matching
+    // owner, and there's no guarantee that the user requesting bucket
+    // deletion is the owner of the bucket.
+    const std::string& user_id = s->bucket->get_owner()->get_id().id;
+    ldpp_dout(this, 5) << fmt::format(FMT_STRING("UBNS RGWDeleteBucket::execute(): bucket('{}','{}',''): fetched owner '{}'"), s->bucket_name, s->ubns_client->cluster_id(), user_id) << dendl;
+
+    // Create a real ubns_deleter. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_deleter.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), user_id);
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::UPDATE_START);
+    if (!success) {
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request with unknown error" << dendl;
+        // This is an internal error, it has nothing to do with the bucket.
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+      return;
+    }
+    // deleter state is UPDATE_RPC_SUCCEEDED.
   }
 
   if (!s->bucket_exists) {
@@ -3785,6 +3918,24 @@ void RGWDeleteBucket::execute(optional_yield y)
       // lost a race, either with mdlog sync or another delete bucket operation.
       // in either case, we've already called ctl.bucket->unlink_bucket()
       op_ret = 0;
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::DELETE_START);
+    if (!success) {
+      // There's an error, but we've already deleted the bucket! We need to
+      // reconcile this externally, there's no obvious way to roll this back
+      // from RGWDeleteBucket::execute() - what do we do, recreate the bucket?
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request failed with unknown error" << dendl;
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // deleter state is DELETE_RPC_SUCCEEDED or DELETE_RPC_FAILED.
   }
 
   return;
@@ -3851,6 +4002,9 @@ int RGWPutObj::init_processing(optional_yield y) {
       return ret;
     }
     copy_source_bucket_info = bucket->get_info();
+    // Save copy source's bucket attrs in order to retrieve
+    // bucket policy/ACL later for permission verification.
+    copy_source_bucket_attrs = bucket->get_attrs();
 
     /* handle x-amz-copy-source-range */
     if (copy_source_range) {
@@ -3905,7 +4059,6 @@ int RGWPutObj::verify_permission(optional_yield y)
 
     RGWAccessControlPolicy cs_acl(s->cct);
     boost::optional<Policy> policy;
-    map<string, bufferlist> cs_attrs;
     std::unique_ptr<rgw::sal::Bucket> cs_bucket;
     int ret = driver->get_bucket(NULL, copy_source_bucket_info, &cs_bucket);
     if (ret < 0)
@@ -3918,7 +4071,7 @@ int RGWPutObj::verify_permission(optional_yield y)
     cs_object->set_prefetch_data();
 
     /* check source object permissions */
-    if (ret = read_obj_policy(this, driver, s, copy_source_bucket_info, cs_attrs, &cs_acl, nullptr,
+    if (ret = read_obj_policy(this, driver, s, copy_source_bucket_info, copy_source_bucket_attrs, &cs_acl, nullptr,
 			policy, cs_bucket.get(), cs_object.get(), y, true); ret < 0) {
       return ret;
     }
@@ -4314,6 +4467,10 @@ void RGWPutObj::execute(optional_yield y)
         ldpp_dout(this, 0) << "ERROR: get_multipart_info returned " << op_ret << ": " << cpp_strerror(-op_ret) << dendl;
       } else {// -ENOENT: raced with upload complete/cancel, no need to spam log
         ldpp_dout(this, 20) << "failed to get multipart info (returned " << op_ret << ": " << cpp_strerror(-op_ret) << "): probably raced with upload complete / cancel" << dendl;
+      }
+      if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+        s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                         "or the multipart upload might have been aborted or completed";
       }
       return;
     }
@@ -6807,9 +6964,15 @@ void RGWInitMultipart::execute(optional_yield y)
     return;
   }
 
+  encode_obj_tags_attr(&obj_tags, attrs);
+  rgw_cond_decode_objtags(s, attrs);
+
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
   upload = s->bucket->get_multipart_upload(s->object->get_name(),
 				       upload_id);
+  upload->obj_legal_hold = obj_legal_hold;
+  upload->obj_retention = obj_retention;
+
   op_ret = upload->init(this, s->yield, s->owner, s->dest_placement, attrs);
 
   if (op_ret == 0) {
@@ -6974,8 +7137,9 @@ void RGWCompleteMultipart::execute(optional_yield y)
       op_ret = 0;
       return;
     }
-    op_ret = -ERR_INTERNAL_ERROR;
-    s->err.message = "This multipart completion is already in progress";
+    op_ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
     return;
   }
 
@@ -7224,6 +7388,10 @@ void RGWAbortMultipart::execute(optional_yield y)
   multipart_trace = tracing::rgw::tracer.add_span(name(), trace_ctx);
 
   op_ret = upload->abort(this, s->cct);
+  if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
+  }
 }
 
 int RGWListMultipart::verify_permission(optional_yield y)
@@ -9183,6 +9351,7 @@ void RGWPutObjRetention::execute(optional_yield y)
     op_ret = -EINVAL;
     return;
   }
+
   bufferlist bl;
   obj_retention.encode(bl);
 

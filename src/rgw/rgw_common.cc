@@ -135,6 +135,10 @@ rgw_http_errors rgw_http_s3_errors({
     { ERR_ZERO_IN_URL, {400, "InvalidRequest" }},
     { ERR_NO_SUCH_TAG_SET, {404, "NoSuchTagSet"}},
     { ERR_NO_SUCH_BUCKET_ENCRYPTION_CONFIGURATION, {404, "ServerSideEncryptionConfigurationNotFoundError"}},
+
+    { ERR_UBNS_INVALID_OR_MISSING_PARAMETER, {400, "InvalidOrMissingParameter"}},
+    { ERR_UBNS_BUCKET_ALREADY_OWNED_BY_YOU, {409, "BucketAlreadyOwnedByYou"}},
+    { ERR_UBNS_BAD_REQUEST, {400, "BadRequest"}},
 });
 
 rgw_http_errors rgw_http_swift_errors({

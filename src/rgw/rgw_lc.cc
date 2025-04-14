@@ -379,10 +379,14 @@ public:
   LCObjsLister(rgw::sal::Driver* _driver, rgw::sal::Bucket* _bucket) :
       driver(_driver), bucket(_bucket) {
     list_params.list_versions = bucket->versioned();
-    list_params.allow_unordered = true;
+    list_params.allow_unordered = !(driver->ctx()->_conf.get_val<bool>("rgw_lc_allow_ordered_list"));
     delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
     shard_id = -1;
     init_num_shards = 0;
+  }
+
+  int get_shard_id() {
+    return shard_id;
   }
 
   void set_prefix(const string& p) {
@@ -398,7 +402,7 @@ public:
   int fetch(const DoutPrefixProvider *dpp) {
     CephContext* cct = dpp->get_cct();
     std::string bn = bucket->get_name();
-    uint32_t cnt = 1000;
+    uint32_t cnt = int32_t(cct->_conf.get_val<uint64_t>("rgw_lc_list_cnt"));
     uint32_t num_shards = bucket->get_info().layout.current_index.layout.normal.num_shards;
     ldpp_dout(dpp, 10) << "bucket: " << bn << " init_num_shards " << init_num_shards
                        << " num_shards: " << num_shards << dendl;
@@ -414,6 +418,7 @@ public:
       list_params.shard_id = shard_id;
       list_params.prefix = shard_prefix[shard_id];
       list_params.marker = shard_marker[shard_id];
+      list_params.allow_unordered = true;
       cnt = uint32_t(cct->_conf.get_val<uint64_t>("rgw_lc_multi_shard_list_cnt"));
     }
     int ret = bucket->list(dpp, list_params, cnt, list_results, null_yield);
@@ -429,7 +434,10 @@ public:
       if(list_results.is_truncated) {
         //shard may not be completely empty but all remaining entries are available in list_results
         //another list operation is not required
-        is_shard_empty[shard_id] = true;
+        ldpp_dout(dpp, 10) << "is_truncated: list_op shard_id " << shard_id
+                           << " returned ret= " << ret
+                           << " is_truncated=" << list_results.is_truncated << dendl;
+        is_shard_empty.erase(shard_id);
       }
       if(obj_iter == list_results.objs.end()) {
         ldpp_dout(dpp, 10) << "EMPTY: list_op shard_id " << shard_id  << " returned ret=" << ret
@@ -437,15 +445,11 @@ public:
         is_shard_empty[shard_id] = true;
 	//find a shard which has objects
 	for(;;) {
-	  if(is_shard_empty.size() >= num_shards) {
-	    ldpp_dout(dpp, 10) << "EMPTY: list_op all shards empty returned ret=" << ret
-		   << dendl;
-	    return 0;
-	  }
 	  shard_id = (shard_id == num_shards + 1)? 0 : (shard_id + 1) % num_shards;
 	  list_params.shard_id = shard_id;
 	  list_params.prefix = shard_prefix[shard_id];
           list_params.marker = shard_prefix[shard_id];
+          list_params.allow_unordered = true;
 	  ret = bucket->list(dpp, list_params, cnt, list_results, null_yield);
 	  if (ret < 0) {
             ldpp_dout(dpp, 1) << "ERROR: bucket->list returned ret=" << ret
@@ -455,7 +459,10 @@ public:
 	  if(list_results.is_truncated) {
 	    //shard may not be completely empty but all remaining entries are available in list_results
 	    //another list operation is not required
-	    is_shard_empty[shard_id] = true;
+            ldpp_dout(dpp, 10) << "is_truncated: list_op shard_id " << shard_id
+                               << " returned ret= " << ret
+                               << " is_truncated=" << list_results.is_truncated << dendl;
+            is_shard_empty.erase(shard_id);
 	  }
 	  obj_iter = list_results.objs.begin();
 	  if(obj_iter != list_results.objs.end())
@@ -463,6 +470,13 @@ public:
 	  ldpp_dout(dpp, 10) << "EMPTY: list_op shard_id " << shard_id  << " returned ret=" << ret
 		   << dendl;
 	  is_shard_empty[shard_id] = true;
+          if(is_shard_empty.size() >= num_shards) {
+            ldpp_dout(dpp, 10) << "EMPTY: list_op all shards empty returned ret=" << ret
+                               << " is_shard_empty.size= " << is_shard_empty.size()
+                               << " num_shards= " << num_shards
+                               << dendl;
+            return 0;
+          }
 	}
       }
     }
@@ -874,6 +888,15 @@ public:
     (wqs[tix]).enqueue(std::move(item));
   }
 
+  void enqueue(WorkItem item,int shard_id) {
+    if(shard_id == -1) {
+      return enqueue(item);
+    }
+    auto tix = ix;
+    tix = shard_id % wqs.size();
+    (wqs[tix]).enqueue(std::move(item));
+  }
+
   void drain() {
     for (auto& wq : wqs) {
       wq.drain();
@@ -906,8 +929,8 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
   params.list_versions = false;
   /* lifecycle processing does not depend on total order, so can
    * take advantage of unordered listing optimizations--such as
-   * operating on one shard at a time */
-  params.allow_unordered = true;
+   * operating on one shard at a time. default true */
+  params.allow_unordered = !(cct->_conf.get_val<bool>("rgw_lc_allow_ordered_list"));
   params.ns = RGW_OBJ_NS_MULTIPART;
   params.access_list_filter = &mp_filter;
 
@@ -918,6 +941,11 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       rgw_obj_key key(obj.key);
       std::unique_ptr<rgw::sal::MultipartUpload> mpu = target->get_multipart_upload(key.name);
       int ret = mpu->abort(this, cct);
+      fmt::memory_buffer buf;
+      fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", target->get_name(), "lc_abort_mpu", ret);
+      buf.push_back('\0');
+      auto alog_dpp = &cct->lookup_or_create_singleton_object<NoDoutPrefix>(CephContext::alog_dpp_singleton, false, g_ceph_context, ceph_subsys_alog);
+      ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
       if (ret == 0) {
         if (perfcounter) {
           perfcounter->inc(l_rgw_lc_abort_mpu, 1);
@@ -944,9 +972,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
 
   for (auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
        ++prefix_iter) {
-
-    utime_t start = ceph_clock_now();
-    if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+    if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 		     << worker->ix
 		     << dendl;
@@ -978,8 +1004,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       } /* for objs */
 
       if ((offset % 100) == 0) {
-        utime_t start = ceph_clock_now();
-	if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+	if (worker_should_stop(stop_at, once)) {
 	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 			     << worker->ix
 			     << dendl;
@@ -1117,8 +1142,8 @@ public:
     auto& o = oc.o;
     if (!o.is_current()) {
       ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
-			<< ": not current, skipping "
-			<< oc.wq->thr_name() << dendl;
+                        << ": not current, skipping "
+                        << oc.wq->thr_name() << dendl;
       return false;
     }
     if (o.is_delete_marker()) {
@@ -1166,9 +1191,16 @@ public:
   int process(lc_op_ctx& oc) {
     auto& o = oc.o;
     int r;
+
+    auto alog_dpp = &oc.cct->lookup_or_create_singleton_object<NoDoutPrefix>(CephContext::alog_dpp_singleton, false, g_ceph_context, ceph_subsys_alog);
+
     if (o.is_delete_marker()) {
       r = remove_expired_obj(oc.dpp, oc, true,
 			     rgw::notify::ObjectExpirationDeleteMarker);
+      fmt::memory_buffer buf;
+      fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d} comment={})", oc.bucket->get_name(), "lc_expire_current", r, "dm");
+      buf.push_back('\0');
+      ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
       if (r < 0) {
 	ldpp_dout(oc.dpp, 0) << "ERROR: current is-dm remove_expired_obj "
 			 << oc.bucket << ":" << o.key
@@ -1183,6 +1215,10 @@ public:
       /* ! o.is_delete_marker() */
       r = remove_expired_obj(oc.dpp, oc, !oc.bucket->versioned(),
 			     rgw::notify::ObjectExpirationCurrent);
+      fmt::memory_buffer buf;
+      fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", oc.bucket->get_name(), "lc_expire_current", r);
+      buf.push_back('\0');
+      ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
       if (r < 0) {
 	ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj "
 			 << oc.bucket << ":" << o.key
@@ -1231,6 +1267,11 @@ public:
     auto& o = oc.o;
     int r = remove_expired_obj(oc.dpp, oc, true,
 			       rgw::notify::ObjectExpirationNoncurrent);
+    fmt::memory_buffer buf;
+    fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", oc.bucket->get_name(), "lc_expire_noncurrent", r);
+    buf.push_back('\0');
+    auto alog_dpp = &oc.cct->lookup_or_create_singleton_object<NoDoutPrefix>(CephContext::alog_dpp_singleton, false, g_ceph_context, ceph_subsys_alog);
+    ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
     if (r < 0) {
       ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj (non-current expiration) " 
 		       << oc.bucket << ":" << o.key
@@ -1276,6 +1317,11 @@ public:
     auto& o = oc.o;
     int r = remove_expired_obj(oc.dpp, oc, true,
 			       rgw::notify::ObjectExpirationDeleteMarker);
+    fmt::memory_buffer buf;
+    fmt::format_to(std::back_inserter(buf), R"(bucket={} op={} ret={:d})", oc.bucket->get_name(), "lc_expire_dm", r);
+    buf.push_back('\0');
+    auto alog_dpp = &oc.cct->lookup_or_create_singleton_object<NoDoutPrefix>(CephContext::alog_dpp_singleton, false, g_ceph_context, ceph_subsys_alog);
+    ldpp_dout(alog_dpp, 4) << buf.data() << dendl;
     if (r < 0) {
       ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj (delete marker expiration) "
 		       << oc.bucket << ":" << o.key
@@ -1687,9 +1733,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
   rgw_obj_key next_marker;
   for(auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
       ++prefix_iter) {
-
-    utime_t start = ceph_clock_now();
-    if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+    if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 		     << worker->ix
 		     << dendl;
@@ -1734,10 +1778,11 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     for (auto offset = 0; ol.get_obj(this, &o /* , fetch_barrier */); ++offset, ol.next()) {
       orule.update();
       std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
-      worker->workpool->enqueue(WorkItem{t1});
+      bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
+      int shard_id = multi_shard_list ? ol.get_shard_id() : -1;
+      worker->workpool->enqueue(WorkItem{t1}, shard_id);
       if ((offset % 100) == 0) {
-        utime_t start = ceph_clock_now();
-	if (worker_should_stop(stop_at, once) || !worker->should_work(start)) {
+	if (worker_should_stop(stop_at, once)) {
 	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
 			     << worker->ix
 			     << dendl;

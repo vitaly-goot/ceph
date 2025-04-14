@@ -618,7 +618,10 @@ void end_header(req_state* s, RGWOp* op, const char *content_type,
   dump_header_if_nonempty(s, "Server", g_conf()->rgw_service_provider_name);
 
   try {
-    RESTFUL_IO(s)->complete_header();
+    if (s->err.ret < 0) {
+      s->close_conn = true;
+    }
+    RESTFUL_IO(s)->complete_header(s->close_conn);
   } catch (rgw::io::Exception& e) {
     ldpp_dout(s, 0) << "ERROR: RESTFUL_IO(s)->complete_header() returned err="
 		     << e.what() << dendl;
