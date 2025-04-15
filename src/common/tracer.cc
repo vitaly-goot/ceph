@@ -105,7 +105,7 @@ Tracer::Tracer(opentelemetry::nostd::string_view service_name)
 
 void Tracer::init(opentelemetry::nostd::string_view service_name) {
   if (!tracer) {
-    if (g_ceph_context->_conf->otlp_tracing_enable) {
+    if (g_ceph_context && g_ceph_context->_conf->otlp_tracing_enable) {
       return init_otlp(service_name);
     }
     using namespace opentelemetry;
