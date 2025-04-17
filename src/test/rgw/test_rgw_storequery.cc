@@ -1,10 +1,18 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <fmt/format.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
 #include "common/ceph_argparse.h"
+#include "common/dout.h"
 #include "global/global_context.h"
 #include "rgw/rgw_rest_storequery.h"
-#include <gtest/gtest.h>
+
+namespace {
+
+using namespace std::string_literals;
 
 using namespace rgw;
 
@@ -68,7 +76,7 @@ TEST_F(StoreQueryHeaderParserTest, Tokenizer)
   ASSERT_EQ(p.param()[0], "two");
   ASSERT_EQ(p.param()[1], "th\"ree");
 }
-TEST_F(StoreQueryHeaderParserTest, Ping)
+TEST_F(StoreQueryHeaderParserTest, PingSuccess)
 {
   // Successful parse.
   ASSERT_TRUE(p.parse(&dpp, "Ping foo", RGWSQHandlerType::Service));
@@ -76,14 +84,17 @@ TEST_F(StoreQueryHeaderParserTest, Ping)
   ASSERT_EQ(p.param().size(), 1);
   ASSERT_TRUE(p.op() != nullptr);
   ASSERT_STREQ(p.op()->name(), "storequery_ping");
+}
+
+TEST_F(StoreQueryHeaderParserTest, PingFail)
+{
   // Fail parse.
-  p.reset();
   ASSERT_FALSE(p.parse(&dpp, "ping", RGWSQHandlerType::Service));
   p.reset();
   ASSERT_FALSE(p.parse(&dpp, "ping foo bar", RGWSQHandlerType::Service));
 }
 
-TEST_F(StoreQueryHeaderParserTest, ObjectStatus)
+TEST_F(StoreQueryHeaderParserTest, ObjectStatusSuccess)
 {
   // Successful parse.
   ASSERT_TRUE(p.parse(&dpp, "ObjectStatus", RGWSQHandlerType::Obj));
@@ -91,8 +102,11 @@ TEST_F(StoreQueryHeaderParserTest, ObjectStatus)
   ASSERT_TRUE(p.param().empty());
   ASSERT_TRUE(p.op() != nullptr);
   ASSERT_STREQ(p.op()->name(), "storequery_objectstatus");
+}
+
+TEST_F(StoreQueryHeaderParserTest, ObjectStatusFail)
+{
   // Fail parse.
-  p.reset();
   ASSERT_FALSE(p.parse(&dpp, "objectstatus foo", RGWSQHandlerType::Obj));
   // Wrong handler type.
   p.reset();
@@ -101,6 +115,98 @@ TEST_F(StoreQueryHeaderParserTest, ObjectStatus)
   p.reset();
   ASSERT_FALSE(p.parse(&dpp, "objectstatus", RGWSQHandlerType::Bucket));
 }
+
+TEST_F(StoreQueryHeaderParserTest, ObjectListSuccess)
+{
+  ASSERT_TRUE(p.parse(&dpp, "objectlist 666", RGWSQHandlerType::Bucket));
+  ASSERT_EQ(p.command(), "objectlist");
+  ASSERT_EQ(p.param().size(), 1);
+  ASSERT_TRUE(p.op() != nullptr);
+  ASSERT_STREQ(p.op()->name(), "storequery_objectlist");
+
+  // Two-argument form. Second arg must be valid base64.
+  p.reset();
+  ASSERT_TRUE(p.parse(&dpp, "objectlist 666 012345678", RGWSQHandlerType::Bucket));
+  ASSERT_EQ(p.command(), "objectlist");
+  ASSERT_EQ(p.param().size(), 2);
+  ASSERT_TRUE(p.op() != nullptr);
+  ASSERT_STREQ(p.op()->name(), "storequery_objectlist");
+}
+
+TEST_F(StoreQueryHeaderParserTest, ObjectListFail)
+{
+  // Fail parse (no argument).
+  ASSERT_FALSE(p.parse(&dpp, "objectlist", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Fail parse (max two arguments).
+  ASSERT_FALSE(p.parse(&dpp, "objectlist 666 TOKEN_FOO rhubarb", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Fail parse (not int).
+  ASSERT_FALSE(p.parse(&dpp, "objectlist foo", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Wrong handler type.
+  ASSERT_FALSE(p.parse(&dpp, "objectlist 666", RGWSQHandlerType::Service));
+  p.reset();
+  // Wrong handler type.
+  ASSERT_FALSE(p.parse(&dpp, "objectlist 666", RGWSQHandlerType::Obj));
+  p.reset();
+
+  // Fail parse (second argument not valid base64).
+  ASSERT_FALSE(p.parse(&dpp, "objectlist 666 xx!", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Fail parse (second argument not valid base64).
+  ASSERT_FALSE(p.parse(&dpp, "objectlist 666 xx", RGWSQHandlerType::Bucket));
+  p.reset();
+  ASSERT_FALSE(p.parse(&dpp, "objectlist 666 x", RGWSQHandlerType::Bucket));
+  p.reset();
+}
+
+TEST_F(StoreQueryHeaderParserTest, MPUploadListSuccess)
+{
+  ASSERT_TRUE(p.parse(&dpp, "mpuploadlist 666", RGWSQHandlerType::Bucket));
+  ASSERT_EQ(p.command(), "mpuploadlist");
+  ASSERT_EQ(p.param().size(), 1);
+  ASSERT_TRUE(p.op() != nullptr);
+  ASSERT_STREQ(p.op()->name(), "storequery_mpuploadlist");
+
+  // Two-argument form. Second arg must be valid base64.
+  p.reset();
+  ASSERT_TRUE(p.parse(&dpp, "mpuploadlist 666 012345678", RGWSQHandlerType::Bucket));
+  ASSERT_EQ(p.command(), "mpuploadlist");
+  ASSERT_EQ(p.param().size(), 2);
+  ASSERT_TRUE(p.op() != nullptr);
+  ASSERT_STREQ(p.op()->name(), "storequery_mpuploadlist");
+}
+
+TEST_F(StoreQueryHeaderParserTest, MPUploadListFail)
+{
+  // Fail parse (no argument).
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Fail parse (max two arguments).
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist 666 TOKEN_FOO rhubarb", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Fail parse (not int).
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist foo", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Wrong handler type.
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist 666", RGWSQHandlerType::Service));
+  p.reset();
+  // Wrong handler type.
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist 666", RGWSQHandlerType::Obj));
+  p.reset();
+
+  // Fail parse (second argument not valid base64).
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist 666 xx!", RGWSQHandlerType::Bucket));
+  p.reset();
+  // Fail parse (second argument not valid base64).
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist 666 xx", RGWSQHandlerType::Bucket));
+  p.reset();
+  ASSERT_FALSE(p.parse(&dpp, "mpuploadlist 666 x", RGWSQHandlerType::Bucket));
+  p.reset();
+}
+
+} // anonymous namespace
 
 int main(int argc, char** argv)
 {
