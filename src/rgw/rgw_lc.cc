@@ -439,6 +439,17 @@ public:
                            << " is_truncated=" << list_results.is_truncated << dendl;
         is_shard_empty.erase(shard_id);
       }
+      else {
+        if(is_shard_empty.size() < num_shards) {
+          ldpp_dout(dpp, 10) << "list_op shard_id=" << shard_id << " is not truncated "
+                             << " is_shard_empty.size= " << is_shard_empty.size()
+                             << " num_shards= " << num_shards
+                             << dendl;
+          //set is_truncated explicitly, as there are still shards with objects and
+          //need the listing to not end prematurely
+          list_results.is_truncated = true;
+        }
+      }
       if(obj_iter == list_results.objs.end()) {
         ldpp_dout(dpp, 10) << "EMPTY: list_op shard_id " << shard_id  << " returned ret=" << ret
                         << dendl;
@@ -464,6 +475,17 @@ public:
                                << " is_truncated=" << list_results.is_truncated << dendl;
             is_shard_empty.erase(shard_id);
 	  }
+          else {
+            if(is_shard_empty.size() < num_shards) {
+              ldpp_dout(dpp, 10) << "list_op shard_id=" << shard_id << " is not truncated "
+                             << " is_shard_empty.size= " << is_shard_empty.size()
+                             << " num_shards= " << num_shards
+                             << dendl;
+              //set is_truncated explicitly, as there are still shards with objects and
+              //need the listing to not end prematurely
+              list_results.is_truncated = true;
+            }
+          }
 	  obj_iter = list_results.objs.begin();
 	  if(obj_iter != list_results.objs.end())
 	    break;
