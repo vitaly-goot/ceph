@@ -467,10 +467,10 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
       }
     } catch (const buffer::error&) {} // omit x-rgw-replicated-from headers
   }
-  if (multipart_parts_count) {
+  if (multipart_parts_count && *multipart_parts_count > 0) {
     dump_header(s, "x-amz-mp-parts-count", *multipart_parts_count);
   }
-  
+
   if (! op_ret) {
     if (! lo_etag.empty()) {
       /* Handle etag of Swift API's large objects (DLO/SLO). It's entirerly
