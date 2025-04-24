@@ -2025,6 +2025,7 @@ private:
 
   void scrub_purged_snaps();
   void probe_smart(const std::string& devid, std::ostream& ss);
+  void probe_psi(ceph::Formatter *f);
 
 public:
   static int peek_meta(ObjectStore *store,

@@ -397,3 +397,81 @@ Required Configuration Changes for Production and SQA:
 
 [Merged To]
   aka_version_18.2.1
+
+=============================================================================
+JIRA https://track.akamai.com/jira/browse/CEPH-188
+
+Developer: @vgoot
+Code Review: @sung @kkeshava
+
+[Description]
+RBD: overload protection
+Design document: https://docs.google.com/document/d/1rPY99ewvNRIFQCxQ5NRAcRF8W2m4mTUdXKIlUDgE_io/edit?tab=t.0
+Slack: https://linode.slack.com/archives/C07TM0UV06S/p1732881016164039
+
+This implementation extends Ceph's OSD and MGR components with PSI-based CPU pressure monitoring and automated throttling.
+- OSD Extension: Each OSD reports CPU pressure (cpu_psi) and idle CPU metrics (cpu_idle) through its admin socket.
+- MGR PSI Plugin: The manager module collects these metrics from OSDs at a configurable interval (mgr/psi/interval) and evaluates cluster-wide CPU health.
+- Automated Throttling: If the pressure metrics exceed defined thresholds on at least mgr/psi/trigger_count hosts, the cluster enters a throttled state. Throttling is lifted when CPU conditions improve across the same number of hosts.
+- Cool-down Control: When mgr/psi/cooldown_seconds is set, the system enforces a delay before exiting the throttling state to avoid rapid toggling.
+- Historical Logging: The module maintains a rolling history of the last 10 throttle activation and release events.
+- Persistent State and Failover: Throttle state, configuration option and history are persisted, allowing the state to survive manager restarts or automatic failover to a standby MGR node which should resume PSI enforcement automatically after failover.
+- Manual Controls: CLI commands (mgr psi throttle_on, mgr psi throttle_off) allow manual override of the throttling state regardless of system thresholds.
+- Health Reporting: When active, the module adds a PSI_THROTTLE_ACTIVE warning to the Ceph health panel, including host count and timestamp.
+
+
+[Logging]
+MGR Plugin activity is logged into
+  /var/log/ceph/ceph-mgr.<mgr_id>.log  (filter with grep psi)
+
+It is possible to control log verbosity with:
+  ceph config set mgr mgr/psi/log_level <debug|info|warning|error> 
+
+[Commands]
+CEPH commands:
+  ceph -s       To check active MGR and throttling state in HEALTH dashboard 
+  ceph health detail -f json-pretty | less
+                To see more details of throtlling 
+  ceph config get mgr mgr/psi/<option> 
+                To get PSI option (see config section)
+  ceph config set mgr mgr/psi/<option> <Value>
+                To set PSI option (see config section) 
+  ceph daemon <osd_id> psi
+                To get PSI probe from admin socket 
+  ceph config get osd bluestore_throttle_bytes              
+                To check current throttling level
+                
+PSI CLI commands 
+  mgr psi history            Show recent throttle history
+  mgr psi throttle_on        Manually enable throttling
+  mgr psi throttle_off       Manually disable throttling
+  mgr psi snapshot           Retrieve the latest PSI sample
+  mgr psi help               Show this help message
+
+[Config]
+  idle_cell_threshold       (float): Minimum CPU idle percent required to exit throttling (0 disables check) [default=15.0]
+  idle_floor_threshold      (float): Maximum CPU idle percent to allow triggering throttling (0 disables check) [default=7.0]
+  trigger_count             (int): Number of hosts that must meet condition to trigger or stop throttling [default=10]
+  throttle_bytes            (str): Value to set for bluestore_throttle_bytes when enabling throttle [default=10000]
+  interval                  (int): Interval (in seconds) between CPU checks [default=60]
+  start_avg300_threshold    (float): Threshold for avg300 to trigger config change [default=80.0]
+  stop_avg300_threshold     (float): avg300 threshold below which throttle is removed [default=50.0]
+  stop_avg60_threshold      (float): avg60 threshold below which throttle is removed [default=40.0]
+  cooldown_seconds          (int): Cool-down time (in seconds) after throttle removal to avoid flipping [default=600]
+
+{Notes]
+It is possible to enable and disable this extension with 
+  ceph mgr module disable psi
+  ceph mgr module enable psi
+In event of disabling the current throttle state will be preserved (and restored if the module is re-enabled later) unless manually reset. To clear throttle state manually:
+  ceph mgr psi throttle_off
+
+[File Changed]
+    modified:   src/osd/OSD.cc
+    modified:   src/osd/OSD.h
+    modified:   src/pybind/mgr/CMakeLists.txt
+    new file:   src/pybind/mgr/psi/__init__.py
+    new file:   src/pybind/mgr/psi/module.py
+
+[Merged To]
+  aka_version_18.2.1

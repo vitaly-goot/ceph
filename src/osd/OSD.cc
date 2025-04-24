@@ -2944,6 +2944,8 @@ will start to track new ops received afterwards.";
     ostringstream out;
     probe_smart(devid, out);
     outbl.append(out.str());
+  } else if (prefix == "psi") {
+    probe_psi(f);
   } else if (prefix == "list_devices") {
     set<string> devnames;
     store->get_devices(&devnames);
@@ -4131,6 +4133,11 @@ void OSD::final_init()
                                      asok_hook,
                                      "probe OSD devices for SMART data.");
 
+  ceph_assert(r == 0);
+
+  r = admin_socket->register_command("psi",
+                                     asok_hook,
+                                     "PSI probe.");
   ceph_assert(r == 0);
 
   r = admin_socket->register_command("list_devices",
@@ -7224,6 +7231,118 @@ void OSD::probe_smart(const string& only_devid, ostream& ss)
     json_map[devid] = smart_json;
   }
   json_spirit::write(json_map, ss, json_spirit::pretty_print);
+}
+
+/* 
+--- GVL --- Akamai extension into admin socket API | CPU load probes | April 2025
+CPU PSI    -> /proc/pressure/cpu
+    already sampled over 10,60,300 seconds 
+
+%idle CPU  -> /proc/stat
+    read /proc/stat twice and computes the delta between the two readings over ~3 second.
+    sleep longer for a more stable measurement
+
+Usage: 
+    ceph daemon <OSD_ID> psi
+
+Return json object:    
+{
+    "timestamp": "2025-04-24T12:32:33.798602-0400",
+    "cpu_pressure": {
+        "full": {
+            "avg10": "0.00",
+            "avg60": "0.00",
+            "avg300": "0.00",
+            "total": "0"
+        },
+        "some": {
+            "avg10": "0.00",
+            "avg60": "0.00",
+            "avg300": "0.00",
+            "total": "620630337221"
+        }
+    },
+    "cpu_idle": {
+        "percent": 98.056121649161312
+    }
+}
+*/
+void OSD::probe_psi(ceph::Formatter *f)
+{
+    f->open_object_section("probe_psi");
+    f->dump_stream("timestamp") << ceph_clock_now();
+    std::ifstream psi_file("/proc/pressure/cpu");
+    if (!psi_file) {
+        dout(10) << "ERROR: Failed to open /proc/pressure/cpu" << dendl;
+        return;
+    }
+
+    std::map<std::string, std::string> psi_data;
+    std::string line;
+    while (std::getline(psi_file, line)) {
+        auto pos = line.find(' ');
+        if (pos != std::string::npos) {
+            std::string key = line.substr(0, pos);
+            std::string value = line.substr(pos + 1);
+            psi_data[key] = value;
+        }
+    }
+
+    f->open_object_section("cpu_pressure");
+    for (const auto &entry : psi_data) {
+        f->open_object_section(entry.first.c_str());
+        std::istringstream value_stream(entry.second);
+        std::string token;
+        while (value_stream >> token) {
+            auto eq_pos = token.find('=');
+            if (eq_pos != std::string::npos) {
+                std::string subkey = token.substr(0, eq_pos);
+                std::string subval = token.substr(eq_pos + 1);
+                f->dump_string(subkey.c_str(), subval);
+            }
+        }
+        f->close_section();
+    }
+    f->close_section(); // End cpu_pressure section
+
+    auto read_cpu_stats = [](const std::string& path, unsigned long& user, unsigned long& nice, unsigned long& system, unsigned long& idle, unsigned long& iowait, unsigned long& irq, unsigned long& softirq) -> bool {
+        std::ifstream stat_file(path);
+        std::string stat_line;
+        if (stat_file && std::getline(stat_file, stat_line) && stat_line.rfind("cpu ", 0) == 0) {
+            std::istringstream ss(stat_line);
+            std::string cpu;
+            ss >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq;
+            return true;
+        }
+        return false;
+    };
+
+    unsigned long user1, nice1, system1, idle1, iowait1, irq1, softirq1;
+    unsigned long user2, nice2, system2, idle2, iowait2, irq2, softirq2;
+    bool rc1 = read_cpu_stats("/proc/stat", user1, nice1, system1, idle1, iowait1, irq1, softirq1);
+    std::future<void> sleeper = std::async(std::launch::async, [] {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    });
+    sleeper.get();
+    bool rc2 = read_cpu_stats("/proc/stat", user2, nice2, system2, idle2, iowait2, irq2, softirq2);
+    if(!rc1 or !rc2) {
+         dout(10) << "ERROR: Failed to open or read /proc/stat" << dendl;
+         return;
+    }
+    unsigned long idle_delta = idle2 - idle1;
+    unsigned long total1 = user1 + nice1 + system1 + idle1 + iowait1 + irq1 + softirq1;
+    unsigned long total2 = user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2;
+    unsigned long total_delta = total2 - total1;
+
+    double idle_percent = total_delta > 0 ? (double)idle_delta / (double)total_delta * 100.0 : 0.0;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << idle_percent;
+
+    f->open_object_section("cpu_idle");
+    f->dump_string("idle_percent", oss.str());
+    f->close_section(); // End cpu_idle section
+
+    f->close_section(); // End probe_psi section
 }
 
 bool OSD::heartbeat_dispatch(Message *m)
