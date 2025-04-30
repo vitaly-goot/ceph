@@ -7,8 +7,10 @@ requests
 Routes
 -e ../../../python-common
 prettytable
-pytest
+pytest==8.0.2
 pyyaml
 natsort
 setuptools
 jsonpatch
+lxml==4.9.3 # to fix https://github.com/xmlsec/python-xmlsec/issues/320
+xmlsec==1.3.13
