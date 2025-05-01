@@ -3195,6 +3195,11 @@ void RGWStatBucket::pre_exec()
 
 void RGWStatBucket::execute(optional_yield y)
 {
+  op_ret = get_params(y);
+  if (op_ret < 0) {
+    return;
+  }
+
   if (!s->bucket_exists) {
     op_ret = -ERR_NO_SUCH_BUCKET;
     return;
@@ -3204,7 +3209,10 @@ void RGWStatBucket::execute(optional_yield y)
   if (op_ret) {
     return;
   }
-  op_ret = bucket->update_container_stats(s);
+
+  if (report_stats) {
+    op_ret = bucket->update_container_stats(s);
+  }
 }
 
 int RGWListBucket::verify_permission(optional_yield y)
