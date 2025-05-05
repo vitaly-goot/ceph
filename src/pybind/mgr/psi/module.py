@@ -99,7 +99,7 @@ class Module(MgrModule):
         while self.run:
             try:
                 self.collect_cluster_psi()
-                self.adjust_throtteling()
+                self.adjust_throttling()
             except Exception as e:
                 self.log.error(f"Collection loop error: {str(e)}")
             time.sleep(int(self.get_module_option('interval')))
@@ -165,7 +165,7 @@ class Module(MgrModule):
         cooldown_seconds = int(self.get_module_option('cooldown_seconds'))
         return datetime.utcnow() >= self.last_throttle_removal + timedelta(seconds=cooldown_seconds)
 
-    def adjust_throtteling(self):      
+    def adjust_throttling(self):      
         exceeded_hosts = 0
         below_hosts = 0
 

@@ -57,6 +57,7 @@
 #include "common/pick_address.h"
 #include "common/blkdev.h"
 #include "common/numa.h"
+#include "common/split.h"
 
 #include "os/ObjectStore.h"
 #ifdef HAVE_LIBFUSE
@@ -7280,10 +7281,11 @@ void OSD::probe_psi(ceph::Formatter *f)
     std::map<std::string, std::string> psi_data;
     std::string line;
     while (std::getline(psi_file, line)) {
-        auto pos = line.find(' ');
-        if (pos != std::string::npos) {
-            std::string key = line.substr(0, pos);
-            std::string value = line.substr(pos + 1);
+        auto tokens = split(std::string_view(line), std::string_view(" "));
+        auto it = tokens.begin();
+        if (it != tokens.end()) {
+            std::string key = std::string(*it++);
+            std::string value = line.substr(key.size() + 1);
             psi_data[key] = value;
         }
     }
@@ -7320,10 +7322,7 @@ void OSD::probe_psi(ceph::Formatter *f)
     unsigned long user1, nice1, system1, idle1, iowait1, irq1, softirq1;
     unsigned long user2, nice2, system2, idle2, iowait2, irq2, softirq2;
     bool rc1 = read_cpu_stats("/proc/stat", user1, nice1, system1, idle1, iowait1, irq1, softirq1);
-    std::future<void> sleeper = std::async(std::launch::async, [] {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-    });
-    sleeper.get();
+    utime_t(3, 0).sleep();
     bool rc2 = read_cpu_stats("/proc/stat", user2, nice2, system2, idle2, iowait2, irq2, softirq2);
     if(!rc1 or !rc2) {
          dout(10) << "ERROR: Failed to open or read /proc/stat" << dendl;
@@ -7333,6 +7332,10 @@ void OSD::probe_psi(ceph::Formatter *f)
     unsigned long total1 = user1 + nice1 + system1 + idle1 + iowait1 + irq1 + softirq1;
     unsigned long total2 = user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2;
     unsigned long total_delta = total2 - total1;
+    if (total2 < total1) {
+        dout(10) << "WARNING: total2 < total1, skipping CPU idle calculation" << dendl;
+        return;
+    }
 
     double idle_percent = total_delta > 0 ? (double)idle_delta / (double)total_delta * 100.0 : 0.0;
     std::ostringstream oss;
