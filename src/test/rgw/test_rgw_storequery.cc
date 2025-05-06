@@ -126,7 +126,7 @@ TEST_F(StoreQueryHeaderParserTest, ObjectListSuccess)
 
   // Two-argument form. Second arg must be valid base64.
   p.reset();
-  ASSERT_TRUE(p.parse(&dpp, "objectlist 666 012345678", RGWSQHandlerType::Bucket));
+  ASSERT_TRUE(p.parse(&dpp, "objectlist 666 cmh1YmFyYgo=", RGWSQHandlerType::Bucket));
   ASSERT_EQ(p.command(), "objectlist");
   ASSERT_EQ(p.param().size(), 2);
   ASSERT_TRUE(p.op() != nullptr);
@@ -171,7 +171,7 @@ TEST_F(StoreQueryHeaderParserTest, MPUploadListSuccess)
 
   // Two-argument form. Second arg must be valid base64.
   p.reset();
-  ASSERT_TRUE(p.parse(&dpp, "mpuploadlist 666 012345678", RGWSQHandlerType::Bucket));
+  ASSERT_TRUE(p.parse(&dpp, "mpuploadlist 666 cmh1YmFyYgo=", RGWSQHandlerType::Bucket));
   ASSERT_EQ(p.command(), "mpuploadlist");
   ASSERT_EQ(p.param().size(), 2);
   ASSERT_TRUE(p.op() != nullptr);
