@@ -30,6 +30,7 @@ set(mgr_modules
   influx
   insights
   iostat
+  psi
   k8sevents
   localpool
   mds_autoscaler

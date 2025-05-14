@@ -14,6 +14,7 @@ usr/share/ceph/mgr/osd_support
 usr/share/ceph/mgr/pg_autoscaler
 usr/share/ceph/mgr/progress
 usr/share/ceph/mgr/prometheus
+usr/share/ceph/mgr/psi
 usr/share/ceph/mgr/rbd_support
 usr/share/ceph/mgr/restful
 usr/share/ceph/mgr/selftest
