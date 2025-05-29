@@ -16,6 +16,8 @@
 #define CEPH_AUTHTYPES_H
 
 #include "Crypto.h"
+#include "common/CanHasPrint.h"
+#include "common/ceph_json.h"
 #include "common/entity_name.h"
 #include "common/Formatter.h"
 #include "include/buffer.h"
@@ -46,6 +48,13 @@ struct EntityAuth {
   std::map<std::string, ceph::buffer::list> caps;
   CryptoKey pending_key; ///< new but uncommitted key
 
+  void print(std::ostream& out) const {
+    out << "auth(key=" << key;
+    if (!pending_key.empty()) {
+      out << " pending_key=" << pending_key;
+    }
+    out << ")";
+  }
   void encode(ceph::buffer::list& bl) const {
     __u8 struct_v = 3;
     using ceph::encode;
@@ -71,16 +80,6 @@ struct EntityAuth {
   }
 };
 WRITE_CLASS_ENCODER(EntityAuth)
-
-inline std::ostream& operator<<(std::ostream& out, const EntityAuth& a)
-{
-  out << "auth(key=" << a.key;
-  if (!a.pending_key.empty()) {
-    out << " pending_key=" << a.pending_key;
-  }
-  out << ")";
-  return out;
-}
 
 struct AuthCapsInfo {
   bool allow_all;
@@ -227,6 +226,9 @@ struct ExpiringCryptoKey {
   CryptoKey key;
   utime_t expiration;
 
+  void print(std::ostream& out) const {
+    out << key << " expires " << expiration;
+  }
   void encode(ceph::buffer::list& bl) const {
     using ceph::encode;
     __u8 struct_v = 1;
@@ -243,11 +245,6 @@ struct ExpiringCryptoKey {
   }
 };
 WRITE_CLASS_ENCODER(ExpiringCryptoKey)
-
-inline std::ostream& operator<<(std::ostream& out, const ExpiringCryptoKey& c)
-{
-  return out << c.key << " expires " << c.expiration;
-}
 
 struct RotatingSecrets {
   std::map<uint64_t, ExpiringCryptoKey> secrets;
