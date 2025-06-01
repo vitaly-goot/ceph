@@ -303,6 +303,12 @@ struct RotatingSecrets {
   void wipe() {
     secrets.clear();
   }
+  auto begin() const {
+    return secrets.begin();
+  }
+  auto end() const {
+    return secrets.end();
+  }
 
   void dump();
 };

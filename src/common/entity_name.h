@@ -67,6 +67,7 @@ struct EntityName
 
   static std::string get_valid_types_as_str();
   static uint32_t str_to_ceph_entity_type(std::string_view);
+  static std::string_view ceph_entity_type_to_str(uint32_t type);
 
   friend bool operator<(const EntityName& a, const EntityName& b);
   friend std::ostream& operator<<(std::ostream& out, const EntityName& n);

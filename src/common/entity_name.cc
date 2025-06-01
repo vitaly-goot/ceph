@@ -154,6 +154,16 @@ uint32_t EntityName::str_to_ceph_entity_type(std::string_view s)
   return CEPH_ENTITY_TYPE_ANY;
 }
 
+std::string_view EntityName::ceph_entity_type_to_str(uint32_t type)
+{
+  size_t i;
+  for (i = 0; i < STR_TO_ENTITY_TYPE.size(); ++i) {
+    if (type == STR_TO_ENTITY_TYPE[i].type)
+      return STR_TO_ENTITY_TYPE[i].str;
+  }
+  return "???";
+}
+
 bool operator<(const EntityName& a, const EntityName& b)
 {
   return (a.type < b.type) || (a.type == b.type && a.id < b.id);
