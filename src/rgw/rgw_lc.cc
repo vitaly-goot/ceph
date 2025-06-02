@@ -844,15 +844,6 @@ private:
 
   void* entry() override {
     while (!wk->get_lc()->going_down()) {
-      if(!wk->cct->_conf->rgw_lc_enable_aio) {
-        auto item = dequeue();
-        if (item.size() == 0) {
-  	  /* going down */
-	  break;
-        }
-        f(wk, this, *item.begin(), null_yield);
-	return nullptr;
-      }
       boost::asio::io_context context;
       for(auto& item : items) {
         if(item.which() != 0) {
