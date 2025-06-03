@@ -400,7 +400,17 @@ options:
     processing
   fmt_desc: This option specifies the number of threads in each lifecycle
     workers work pool. This option can help accelerate processing each bucket.
-  default: 3
+  default: 4
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_wp_worker_max_aio
+  type: int
+  level: advanced
+  desc: Max number of concurrent lifecycle handlings per workpool thread. Increasing this
+    along with enabling ordered listings will increase lc del oprate.
+    Can be set upto max of 128. Default value of 1 will have comparable performance as with blocking io.
+  default: 1
   services:
   - rgw
   with_legacy: true
