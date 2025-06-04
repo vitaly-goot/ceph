@@ -2414,6 +2414,15 @@ void RGWGetObj::execute(optional_yield y)
   s->obj_size = s->object->get_obj_size();
   attrs = s->object->get_attrs();
   multipart_parts_count = read_op->params.parts_count;
+  if (op_ret == -ENOENT){
+    if(s->handoff_authz->allow_if_not_found()){
+      op_ret = -ENOENT
+      ldpp_dout(this, 4) << "Object missing and user is allowed to get 404 info. Returning: " << op_ret << dendl;
+    } else {
+      op_ret = -EACCES;
+      ldpp_dout(this, 4) << "Object missing and user is not allowed to get this info. Returning: " << op_ret << dendl;
+    }
+  }
   if (op_ret < 0)
     goto done_err;
 
