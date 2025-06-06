@@ -23,6 +23,8 @@
 #include <sstream>
 #include "common/config.h"
 #include "common/cmdparse.h"
+#include "include/str_list.h"
+#include "auth/Crypto.h"
 
 #include "include/ceph_assert.h"
 #include "include/stringify.h"
@@ -1192,6 +1194,42 @@ bool MonmapMonitor::prepare_command(MonOpRequestRef op)
       ceph_assert(okay == true);
     }
     request_proposal(mon.osdmon());
+  } else if (prefix == "mon set") {
+    std::string name;
+    cmd_getval(cmdmap, "name", name);
+    std::string value;
+    cmd_getval(cmdmap, "value", value);
+    if (name == "auth_service_cipher") {
+      int c = CryptoManager::get_key_type(value);
+      if (c < 0) {
+        err = -EINVAL;
+        goto reply_no_propose;
+      }
+      pending_map.auth_service_cipher = c;
+    } else if (name == "auth_allowed_ciphers") {
+      std::vector<std::string> v;
+      std::vector<int> ciphers;
+      get_str_vec(value, ", ", v);
+      for (auto& cipher : v) {
+        int c = CryptoManager::get_key_type(cipher);
+        if (c < 0) {
+          err = -EINVAL;
+          goto reply_no_propose;
+        }
+        ciphers.push_back(c);
+      }
+      pending_map.auth_allowed_ciphers = std::move(ciphers);
+    } else if (name == "auth_preferred_cipher") {
+      int c = CryptoManager::get_key_type(value);
+      if (c < 0) {
+        err = -EINVAL;
+        goto reply_no_propose;
+      }
+      pending_map.auth_preferred_cipher = c;
+    } else {
+      ss << "unknown name " << name;
+      err = -EINVAL;
+    }
   } else {
     ss << "unknown command " << prefix;
     err = -EINVAL;
