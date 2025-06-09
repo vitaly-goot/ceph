@@ -50,6 +50,7 @@ class AdminSocket;
 class CryptoHandler;
 class CryptoManager;
 class CryptoRandom;
+class AdminSocketHook;
 class MonMap;
 
 namespace ceph::common {
