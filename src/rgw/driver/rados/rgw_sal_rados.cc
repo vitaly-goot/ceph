@@ -2221,6 +2221,7 @@ int RadosObject::RadosReadOp::prepare(optional_yield y, const DoutPrefixProvider
   parent_op.conds.if_nomatch = params.if_nomatch;
   parent_op.params.lastmod = params.lastmod;
   parent_op.params.target_obj = params.target_obj;
+  parent_op.params.part_num = params.part_num;
   parent_op.params.obj_size = &obj_size;
   parent_op.params.attrs = &source->get_attrs();
 
@@ -2228,9 +2229,10 @@ int RadosObject::RadosReadOp::prepare(optional_yield y, const DoutPrefixProvider
   if (ret < 0)
     return ret;
 
-  source->set_key(parent_op.state.obj.key);
+  source->set_instance(parent_op.state.obj.key.instance);
   source->set_obj_size(obj_size);
-
+  params.parts_count = parent_op.params.parts_count;
+  
   return ret;
 }
 
@@ -2565,6 +2567,15 @@ int RadosMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y, 
     multipart_upload_info upload_info;
     upload_info.dest_placement = dest_placement;
 
+    if (obj_legal_hold) {
+      upload_info.obj_legal_hold_exist = true;
+      upload_info.obj_legal_hold = (*obj_legal_hold);
+    }
+    if (obj_retention) {
+      upload_info.obj_retention_exist = true;
+      upload_info.obj_retention = (*obj_retention);
+    }
+
     bufferlist bl;
     encode(upload_info, bl);
     obj_op.meta.data = &bl;
@@ -2823,6 +2834,22 @@ int RadosMultipartUpload::complete(const DoutPrefixProvider *dpp,
 
   attrs[RGW_ATTR_ETAG] = etag_bl;
 
+  rgw_placement_rule* ru;
+  ru = &placement;
+  rgw::sal::Attrs mpu_attrs; // don't overwrite the target object attrs we are updating
+  ret = RadosMultipartUpload::get_info(dpp, y, &ru, &mpu_attrs);
+
+  if (upload_information.obj_retention_exist) {
+    bufferlist obj_retention_bl;
+    upload_information.obj_retention.encode(obj_retention_bl);
+    attrs[RGW_ATTR_OBJECT_RETENTION] = std::move(obj_retention_bl);
+  }
+  if (upload_information.obj_legal_hold_exist) {
+    bufferlist obj_legal_hold_bl;
+    upload_information.obj_legal_hold.encode(obj_legal_hold_bl);
+    attrs[RGW_ATTR_OBJECT_LEGAL_HOLD] = std::move(obj_legal_hold_bl);
+  }
+
   if (compressed) {
     // write compression attribute to full object
     bufferlist tmp;
@@ -2926,6 +2953,7 @@ int RadosMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield
     return -EIO;
   }
   placement = upload_info.dest_placement;
+  upload_information = upload_info;
   *rule = &placement;
 
   return 0;

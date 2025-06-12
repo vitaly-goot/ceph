@@ -7,17 +7,20 @@
 #include <string.h>
 #include <string_view>
 
-#include "common/ceph_crypto.h"
-#include "common/split.h"
-#include "common/Formatter.h"
-#include "common/utf8.h"
-#include "common/ceph_json.h"
-#include "common/safe_io.h"
-#include "common/errno.h"
 #include "auth/Crypto.h"
+#include "common/Formatter.h"
+#include "common/ceph_crypto.h"
+#include "common/ceph_json.h"
+#include "common/dout.h"
+#include "common/errno.h"
+#include "common/safe_io.h"
+#include "common/split.h"
+#include "common/utf8.h"
+#include "rgw_common.h"
+#include <boost/algorithm/hex.hpp>
 #include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/replace.hpp>
 #include <boost/tokenizer.hpp>
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 #ifdef HAVE_WARN_IMPLICIT_CONST_INT_FLOAT_CONVERSION
@@ -53,6 +56,7 @@
 
 #include <typeinfo> // for 'typeid'
 
+#include "rgw_handoff.h"
 #include "rgw_ldap.h"
 #include "rgw_token.h"
 #include "rgw_rest_role.h"
@@ -63,11 +67,12 @@
 #include "rgw_bucket_sync.h"
 
 #include "include/ceph_assert.h"
-#include "rgw_role.h"
-#include "rgw_rest_sts.h"
 #include "rgw_rest_iam.h"
-#include "rgw_sts.h"
+#include "rgw_rest_storequery.h"
+#include "rgw_rest_sts.h"
+#include "rgw_role.h"
 #include "rgw_sal_rados.h"
+#include "rgw_sts.h"
 
 #include "rgw_s3select.h"
 
@@ -305,6 +310,18 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
 
   dst_zone_trace = s->info.args.get(RGW_SYS_PARAM_PREFIX "if-not-replicated-to");
 
+  // optional part number
+  auto optstr = s->info.args.get_optional("partNumber");
+  if (optstr) {
+    string err;
+    multipart_part_num = strict_strtol(optstr->c_str(), 10, &err);
+    if (!err.empty()) {
+      s->err.message = "Invalid partNumber: " + err;
+      ldpp_dout(s, 10) << "bad part number " << *optstr << ": " << err << dendl;
+      return -ERR_INVALID_PART;
+    }
+  }
+
   return RGWGetObj_ObjStore::get_params(y);
 }
 
@@ -450,6 +467,9 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
         dump_header(s, "x-rgw-replicated-from", zone.to_str());
       }
     } catch (const buffer::error&) {} // omit x-rgw-replicated-from headers
+  }
+  if (multipart_parts_count && *multipart_parts_count > 0) {
+    dump_header(s, "x-amz-mp-parts-count", *multipart_parts_count);
   }
 
   if (! op_ret) {
@@ -644,7 +664,7 @@ int RGWGetObj_ObjStore_S3::get_decrypt_filter(std::unique_ptr<RGWGetObj_Filter> 
       std::move(parts_len));
   return 0;
 }
-int RGWGetObj_ObjStore_S3::verify_requester(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y) 
+int RGWGetObj_ObjStore_S3::verify_requester(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y)
 {
   int ret = -EINVAL;
   ret = RGWOp::verify_requester(auth_registry, y);
@@ -1882,9 +1902,9 @@ void RGWListBucket_ObjStore_S3::send_response()
     s->formatter->dump_string("EncodingType", "url");
     encode_key = true;
   }
-  
+
   RGWListBucket_ObjStore_S3::send_common_response();
-  
+
   if (op_ret >= 0) {
     if (s->format == RGWFormat::JSON) {
       s->formatter->open_array_section("Contents");
@@ -2368,22 +2388,30 @@ static void dump_bucket_metadata(req_state *s, rgw::sal::Bucket* bucket)
 {
   dump_header(s, "X-RGW-Object-Count", static_cast<long long>(bucket->get_count()));
   dump_header(s, "X-RGW-Bytes-Used", static_cast<long long>(bucket->get_size()));
-  // only bucket's owner is allowed to get the quota settings of the account
-  if (bucket->is_owner(s->user.get())) {
-    auto user_info = s->user->get_info();
-    auto bucket_quota = s->bucket->get_info().quota; // bucket quota
-    dump_header(s, "X-RGW-Quota-User-Size", static_cast<long long>(user_info.quota.user_quota.max_size));
-    dump_header(s, "X-RGW-Quota-User-Objects", static_cast<long long>(user_info.quota.user_quota.max_objects));
-    dump_header(s, "X-RGW-Quota-Max-Buckets", static_cast<long long>(user_info.max_buckets));
-    dump_header(s, "X-RGW-Quota-Bucket-Size", static_cast<long long>(bucket_quota.max_size));
-    dump_header(s, "X-RGW-Quota-Bucket-Objects", static_cast<long long>(bucket_quota.max_objects));
-  }
+}
+
+int RGWStatBucket_ObjStore_S3::get_params(optional_yield y)
+{
+  report_stats = s->info.args.exists("read-stats");
+  return 0;
 }
 
 void RGWStatBucket_ObjStore_S3::send_response()
 {
   if (op_ret >= 0) {
-    dump_bucket_metadata(s, bucket.get());
+    if (report_stats) {
+      dump_bucket_metadata(s, bucket.get());
+    }
+    // only bucket's owner is allowed to get the quota settings of the account
+    if (bucket->is_owner(s->user.get())) {
+      auto user_info = s->user->get_info();
+      auto bucket_quota = s->bucket->get_info().quota; // bucket quota
+      dump_header(s, "X-RGW-Quota-User-Size", static_cast<long long>(user_info.quota.user_quota.max_size));
+      dump_header(s, "X-RGW-Quota-User-Objects", static_cast<long long>(user_info.quota.user_quota.max_objects));
+      dump_header(s, "X-RGW-Quota-Max-Buckets", static_cast<long long>(user_info.max_buckets));
+      dump_header(s, "X-RGW-Quota-Bucket-Size", static_cast<long long>(bucket_quota.max_size));
+      dump_header(s, "X-RGW-Quota-Bucket-Objects", static_cast<long long>(bucket_quota.max_objects));
+    }
   }
 
   set_req_state_err(s, op_ret);
@@ -3987,6 +4015,50 @@ int RGWInitMultipart_ObjStore_S3::get_params(optional_yield y)
 
   policy = s3policy;
 
+  // handle object lock
+  auto obj_lock_mode_str = s->info.env->get("HTTP_X_AMZ_OBJECT_LOCK_MODE");
+  auto obj_lock_date_str = s->info.env->get("HTTP_X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE");
+  auto obj_legal_hold_str = s->info.env->get("HTTP_X_AMZ_OBJECT_LOCK_LEGAL_HOLD");
+
+  if (obj_lock_mode_str && obj_lock_date_str) {
+    boost::optional<ceph::real_time> date = ceph::from_iso_8601(obj_lock_date_str);
+    if (boost::none == date || ceph::real_clock::to_time_t(*date) <= ceph_clock_now()) {
+      ldpp_dout(this,0) << "invalid x-amz-object-lock-retain-until-date value" << dendl;
+      return -EINVAL;;
+    }
+    if (strcmp(obj_lock_mode_str, "GOVERNANCE") != 0 && strcmp(obj_lock_mode_str, "COMPLIANCE") != 0) {
+      ldpp_dout(this,0) << "invalid x-amz-object-lock-mode value" << dendl;
+      return -EINVAL;
+    }
+    obj_retention = RGWObjectRetention(obj_lock_mode_str, *date);
+  } else if ((obj_lock_mode_str && !obj_lock_date_str) || (!obj_lock_mode_str && obj_lock_date_str)) {
+    ldpp_dout(this,0) << "need both x-amz-object-lock-mode and x-amz-object-lock-retain-until-date " << dendl;
+    return -EINVAL;
+  }
+  if (obj_legal_hold_str) {
+    if (strcmp(obj_legal_hold_str, "ON") != 0 && strcmp(obj_legal_hold_str, "OFF") != 0) {
+      ldpp_dout(this,0) << "invalid x-amz-object-lock-legal-hold value" << dendl;
+      return -EINVAL;
+    }
+    obj_legal_hold = RGWObjectLegalHold(obj_legal_hold_str);
+  }
+  if (!s->bucket->get_info().obj_lock_enabled() && (obj_retention || obj_legal_hold)) {
+    ldpp_dout(this, 0) << "ERROR: object retention or legal hold can't be set if bucket object lock not configured" << dendl;
+    return -ERR_INVALID_REQUEST;
+  }
+
+  auto tag_str = s->info.env->get("HTTP_X_AMZ_TAGGING");
+  if (tag_str) {
+    ret = obj_tags.set_from_string(tag_str);
+    if (ret < 0) {
+      ldpp_dout(this, 0) << "setting obj tags failed with " << ret << dendl;
+      if (ret == -ERR_INVALID_TAG) {
+        ret = -EINVAL; // s3 returns only -EINVAL for PUT requests
+      }
+      return ret;
+    }
+  }
+  
   return 0;
 }
 
@@ -4185,15 +4257,15 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
       s->formatter->close_section();
     }
     if (!common_prefixes.empty()) {
-      s->formatter->open_array_section("CommonPrefixes");
       for (const auto& kv : common_prefixes) {
+        s->formatter->open_array_section("CommonPrefixes");
         if (encode_url) {
           s->formatter->dump_string("Prefix", url_encode(kv.first, false));
         } else {
           s->formatter->dump_string("Prefix", kv.first);
         }
+        s->formatter->close_section();
       }
-      s->formatter->close_section();
     }
   }
   s->formatter->close_section();
@@ -4840,7 +4912,7 @@ RGWOp *RGWHandler_REST_Obj_S3::op_post()
 
   if (s->info.args.exists("uploads"))
     return new RGWInitMultipart_ObjStore_S3;
-  
+
   if (is_select_op())
     return rgw::s3select::create_s3select_op();
 
@@ -5098,7 +5170,8 @@ int RGW_Auth_S3::authorize(const DoutPrefixProvider *dpp,
   /* neither keystone and rados enabled; warn and exit! */
   if (!driver->ctx()->_conf->rgw_s3_auth_use_rados &&
       !driver->ctx()->_conf->rgw_s3_auth_use_keystone &&
-      !driver->ctx()->_conf->rgw_s3_auth_use_ldap) {
+      !driver->ctx()->_conf->rgw_s3_auth_use_ldap &&
+      !driver->ctx()->_conf->rgw_s3_auth_use_handoff) {
     ldpp_dout(dpp, 0) << "WARNING: no authorization backend enabled! Users will never authenticate." << dendl;
     return -EPERM;
   }
@@ -5258,6 +5331,20 @@ RGWHandler_REST* RGWRESTMgr_S3::get_handler(rgw::sal::Driver* driver,
     return new RGWHandler_REST_Obj_S3Website(auth_registry);
   }
 
+  // Check for StoreQuery requests. If found, return a storequery handler
+  // already configured to the type of request.
+  if (enable_storequery && RGWHandler_REST_StoreQuery_S3::is_storequery_request(s)) {
+    RGWSQHandlerType htype;
+    if (s->init_state.url_bucket.empty()) {
+      htype = RGWSQHandlerType::Service;
+    } else if (!rgw::sal::Object::empty(s->object.get())) {
+      htype = RGWSQHandlerType::Obj;
+    } else {
+      htype = RGWSQHandlerType::Bucket;
+    }
+    return new RGWHandler_REST_StoreQuery_S3(auth_registry, htype);
+  }
+
   if (s->init_state.url_bucket.empty()) {
     // no bucket
     if (s->op == OP_POST) {
@@ -5277,22 +5364,23 @@ RGWHandler_REST* RGWRESTMgr_S3::get_handler(rgw::sal::Driver* driver,
         return new RGWHandler_REST_IAM(auth_registry, data);
       }
       if (enable_pubsub && RGWHandler_REST_PSTopic_AWS::action_exists(s)) {
-        return new RGWHandler_REST_PSTopic_AWS(auth_registry); 
+        return new RGWHandler_REST_PSTopic_AWS(auth_registry);
       }
       return nullptr;
     }
     // non-POST S3 service without a bucket
-    return new RGWHandler_REST_Service_S3(auth_registry);
+    return new RGWHandler_REST_Service_S3(auth_registry, enable_storequery);
   }
   if (!rgw::sal::Object::empty(s->object.get())) {
     // has object
-    return new RGWHandler_REST_Obj_S3(auth_registry);
+    return new RGWHandler_REST_Obj_S3(auth_registry, enable_storequery);
   }
   if (s->info.args.exist_obj_excl_sub_resource()) {
     return nullptr;
   }
   // has bucket
-  return new RGWHandler_REST_Bucket_S3(auth_registry, enable_pubsub);
+  return new RGWHandler_REST_Bucket_S3(auth_registry, enable_pubsub,
+                                       enable_storequery);
 }
 
 bool RGWHandler_REST_S3Website::web_dir() const {
@@ -5572,12 +5660,11 @@ RGWOp* RGWHandler_REST_Service_S3Website::get_obj_op(bool get_data)
 
 namespace rgw::auth::s3 {
 
-static rgw::auth::Completer::cmplptr_t
-null_completer_factory(const boost::optional<std::string>& secret_key)
-{
+static rgw::auth::Completer::cmplptr_t null_completer_factory(
+    const boost::optional<std::string> &secret_key,
+    const std::optional<sha256_digest_t> &cached_signing_key) {
   return nullptr;
 }
-
 
 AWSEngine::VersionAbstractor::auth_data_t
 AWSGeneralAbstractor::get_auth_data(const req_state* const s) const
@@ -5979,7 +6066,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
                                           credential_scope,
                                           client_signature,
 					  flags,
-                                          std::placeholders::_1);
+                                          std::placeholders::_1,
+                                          std::placeholders::_2);
       return {
         access_key_id,
         client_signature,
@@ -6269,7 +6357,8 @@ rgw::auth::s3::LDAPEngine::authenticate(
 
   auto apl = apl_factory->create_apl_remote(cct, s, get_acl_strategy(),
                                             get_creds_info(base64_token));
-  return result_t::grant(std::move(apl), completer_factory(boost::none));
+  return result_t::grant(std::move(apl),
+                         completer_factory(boost::none, std::nullopt));
 } /* rgw::auth::s3::LDAPEngine::authenticate */
 
 void rgw::auth::s3::LDAPEngine::shutdown() {
@@ -6278,6 +6367,149 @@ void rgw::auth::s3::LDAPEngine::shutdown() {
     ldh = nullptr;
   }
 }
+
+/***************************************************************************/
+
+// Begin Handoff Engine.
+
+std::shared_ptr<rgw::HandoffHelper> rgw::auth::s3::g_handoff_helper;
+
+void rgw::auth::s3::HandoffEngine::init(CephContext* const cct, rgw::sal::Driver* store)
+{
+  static std::string plugin_name = "Akamai Handoff Authentication and Authorization";
+  // init() can be called more than once. Only log our present-but-disabled
+  // state exactly once.
+  static std::once_flag logged_presence;
+  if (!cct->_conf->rgw_s3_auth_use_handoff) {
+    std::call_once(logged_presence, [&]() {
+      ldout(cct, 1) << plugin_name << " present but disabled" << dendl;
+    });
+    return;
+  }
+
+  // init() can be called more than once. Only init our HandoffHelper exactly
+  // once, and only set the g_handoff_helper shared_ptr once.
+  static std::once_flag hhinit;
+  std::call_once(hhinit, [&]() {
+    ldout(cct, 1) << plugin_name << " present and enabled" << dendl;
+    handoff_helper_ = std::make_shared<rgw::HandoffHelper>();
+    handoff_helper_->init(cct, store);
+    // Set a globally-accessible shared_ptr to the one true HandoffHelper.
+    g_handoff_helper = handoff_helper_;
+  });
+}
+
+void rgw::auth::s3::HandoffEngine::shutdown()
+{
+  // Clear the global shared_ptr. If everyone else has shed their pointers,
+  // we'll cleanly destruct when the ExternalAuthStrategy is destroyed.
+  // If we're not init()'ed, this is a no-op.
+  g_handoff_helper.reset();
+}
+
+bool rgw::auth::s3::HandoffEngine::valid() {
+  return (handoff_helper_ != nullptr);
+}
+
+rgw::auth::RemoteApplier::acl_strategy_t
+rgw::auth::s3::HandoffEngine::get_acl_strategy() const
+{
+  //This is based on the assumption that the default acl strategy in
+  // get_perms_from_aclspec, will take care. Extra acl spec is not required.
+  return nullptr;
+}
+
+rgw::auth::RemoteApplier::AuthInfo
+rgw::auth::s3::HandoffEngine::get_creds_info(const rgw::RGWToken& token) const noexcept
+{
+  /* The short form of "using" can't be used here -- we're aliasing a class'
+   * member. */
+  using acct_privilege_t = \
+    rgw::auth::RemoteApplier::AuthInfo::acct_privilege_t;
+
+  return rgw::auth::RemoteApplier::AuthInfo {
+    rgw_user(token.id),
+    token.id,
+    RGW_PERM_FULL_CONTROL,
+    acct_privilege_t::IS_PLAIN_ACCT,
+    rgw::auth::RemoteApplier::AuthInfo::NO_ACCESS_KEY,
+    rgw::auth::RemoteApplier::AuthInfo::NO_SUBUSER,
+    TYPE_HANDOFF
+  };
+}
+
+rgw::auth::Engine::result_t
+rgw::auth::s3::HandoffEngine::authenticate(
+  const DoutPrefixProvider* dpp,
+  const std::string_view& access_key_id,
+  const std::string_view& signature,
+  const std::string_view& session_token,
+  const string_to_sign_t& string_to_sign,
+  const signature_factory_t&,
+  const completer_factory_t& completer_factory,
+  const req_state* const s,
+  optional_yield y) const
+{
+  ldpp_dout(dpp, 20) << "HandoffEngine: authenticate()" << dendl;
+
+  //LDAP TODO: Uncomment, when we have a migration plan in place.
+  //Check if a user of type other than 'Handoff' is already present, if yes, then
+  //return error.
+  /*RGWUserInfo user_info;
+  user_info.user_id = base64_token.id;
+  if (rgw_get_user_info_by_uid(store, user_info.user_id, user_info) >= 0) {
+    if (user_info.type != TYPE_HANDOFF) {
+      ldpp_dout(dpp, 10) << "ERROR: User id of type: " << user_info.type << " is already present" << dendl;
+      return nullptr;
+    }
+  }*/
+
+  HandoffAuthResult auth_result = handoff_helper_->auth(dpp,
+      session_token,
+      access_key_id,
+      string_to_sign,
+      signature,
+      s, y);
+  if (auth_result.is_err()) {
+    // HandoffHelper::auth() error codes have been washed through
+    // AuthServiceClient::_translate_authenticator_error_code() to turn them
+    // into RGW-recognisable error codes.
+    // HandoffAuthResult.code() returns an unsigned int, but the calling API
+    // demands a negative return code.
+    return result_t::deny(-auth_result.code());
+  }
+
+  // Pass a placeholder secret in the token. We don't need the actual secret key.
+  auto access_key_token = RGWToken(RGWToken::TOKEN_HANDOFF, auth_result.userid(), "NOTSPECIFIED");
+  // This will create an rgw::auth::RemoteApplier.
+  // The applier may create the user if it doesn't exist locally, however for
+  // Handoff this can be disabled via config if desired.
+  auto apl = apl_factory->create_apl_remote(cct, s, get_acl_strategy(),
+                                            get_creds_info(access_key_token));
+
+  // Check for a signing key. This will be present only for chunked uploads.
+  std::optional<sha256_digest_t> cached_signing_key;
+  if (auth_result.has_signing_key()) {
+    // The signing key is raw bytes, not a string.
+    auto sk = auth_result.signing_key().value();
+    if (sk.size() != 32) {
+      ldpp_dout(dpp, 1)
+          << __func__ << ": signing key SHA256 digest must be exactly 32 bytes"
+          << dendl;
+      return result_t::deny(-ERR_INTERNAL_ERROR);
+    }
+    // Luckily, sha_digest_t<> has a constructor that takes raw bytes.
+    sha256_digest_t digest(sk.data());
+    cached_signing_key = std::make_optional(digest);
+  }
+
+  return result_t::grant(std::move(apl),
+                         completer_factory(boost::none, cached_signing_key));
+} /* rgw::auth::s3::HandoffEngine::authenticate */
+
+// End Handoff Engine.
+
+/***************************************************************************/
 
 /* LocalEngine */
 rgw::auth::Engine::result_t
@@ -6341,7 +6573,8 @@ rgw::auth::s3::LocalEngine::authenticate(
 
   auto apl = apl_factory->create_apl_local(cct, s, user->get_info(),
                                            k.subuser, std::nullopt, access_key_id);
-  return result_t::grant(std::move(apl), completer_factory(k.key));
+  return result_t::grant(std::move(apl),
+                         completer_factory(k.key, std::nullopt));
 }
 
 rgw::auth::RemoteApplier::AuthInfo
@@ -6507,10 +6740,12 @@ rgw::auth::s3::STSEngine::authenticate(
     }
   }
 
-  if (token.acct_type == TYPE_KEYSTONE || token.acct_type == TYPE_LDAP) {
+  if (token.acct_type == TYPE_KEYSTONE || token.acct_type == TYPE_LDAP || token.acct_type == TYPE_HANDOFF) {
     auto apl = remote_apl_factory->create_apl_remote(cct, s, get_acl_strategy(),
                                             get_creds_info(token));
-    return result_t::grant(std::move(apl), completer_factory(token.secret_access_key));
+    return result_t::grant(
+        std::move(apl),
+        completer_factory(token.secret_access_key, std::nullopt));
   } else if (token.acct_type == TYPE_ROLE) {
     t_attrs.user_id = std::move(token.user); // This is mostly needed to assign the owner of a bucket during its creation
     t_attrs.token_policy = std::move(token.policy);
@@ -6519,11 +6754,15 @@ rgw::auth::s3::STSEngine::authenticate(
     t_attrs.token_issued_at = std::move(token.issued_at);
     t_attrs.principal_tags = std::move(token.principal_tags);
     auto apl = role_apl_factory->create_apl_role(cct, s, r, t_attrs);
-    return result_t::grant(std::move(apl), completer_factory(token.secret_access_key));
+    return result_t::grant(
+        std::move(apl),
+        completer_factory(token.secret_access_key, std::nullopt));
   } else { // This is for all local users of type TYPE_RGW or TYPE_NONE
     string subuser;
     auto apl = local_apl_factory->create_apl_local(cct, s, user->get_info(), subuser, token.perm_mask, std::string(_access_key_id));
-    return result_t::grant(std::move(apl), completer_factory(token.secret_access_key));
+    return result_t::grant(
+        std::move(apl),
+        completer_factory(token.secret_access_key, std::nullopt));
   }
 }
 
@@ -6541,4 +6780,54 @@ bool rgw::auth::s3::S3AnonymousEngine::is_applicable(
   }
 
   return route == AwsRoute::QUERY_STRING && version == AwsVersion::UNKNOWN;
+}
+
+rgw::auth::Engine::result_t
+rgw::auth::s3::S3AnonymousEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s, optional_yield y) const
+{
+  if (!is_applicable(s)) {
+    return result_t::deny(-EPERM);
+  } else {
+
+    // A few conditions to prevent unnecessary anonymous auth work:
+    // - If handoff isn't present, skip.
+    // - If handoff is present but anon authz is disabled, skip.
+    // - If handoff+anon authz is enabled, but the request meets the criteria
+    //   for storequery, skip.
+    //
+    // Why the last item? HTTP StoreQuery requests *are* anonymous requests
+    // from RGW's perspective. However, authorization isn't appropriate; the
+    // whole point of StoreQuery is to bypass the auth* systems.
+    //
+    // XXX NOTE: When StoreQuery migrates to gRPC, the last check needs to be
+    // removed. Hopefully the API is_storequery_request() will be removed as
+    // well, so the compiler will make it obvious.
+
+    if (s->handoff_helper &&
+        s->handoff_helper->anonymous_authorization_enabled() &&
+        !RGWHandler_REST_StoreQuery_S3::is_storequery_request(s)) {
+
+      try {
+        auto result = s->handoff_helper->anonymous_authorize(dpp, s, y);
+        if (!result.is_ok()) {
+          // HandoffAuthResult() returns an unsigned int. The calling API
+          // demands a negative result.
+          return result_t::deny(-result.code());
+        }
+      } catch (std::exception &e) {
+        ldpp_dout(dpp, 0)
+            << "ERROR: Handoff anonymous authorization failed with exception: "
+            << e.what() << dendl;
+        return result_t::deny(-EPERM);
+      }
+    }
+
+    RGWUserInfo user_info;
+    rgw_get_anon_user(user_info);
+
+    auto apl = apl_factory->create_apl_local(cct, s, user_info,
+        rgw::auth::LocalApplier::NO_SUBUSER,
+        std::nullopt, rgw::auth::LocalApplier::NO_ACCESS_KEY);
+    return result_t::grant(std::move(apl));
+  }
 }

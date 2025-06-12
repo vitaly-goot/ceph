@@ -7,6 +7,7 @@
 #include "common/safe_io.h"
 #include "common/Graylog.h"
 #include "common/Journald.h"
+#include "common/AccessLog.h"
 #include "common/valgrind.h"
 
 #include "include/ceph_assert.h"
@@ -173,6 +174,7 @@ void Log::reopen_log_file()
     }
   }
   m_flush_mutex_holder = 0;
+  if (m_accesslog) m_accesslog->reopen_log_file();
 }
 
 void Log::chown_log_file(uid_t uid, gid_t gid)
@@ -225,6 +227,34 @@ void Log::stop_graylog()
 {
   std::scoped_lock lock(m_flush_mutex);
   m_graylog.reset();
+}
+
+void Log::start_accesslog(const std::string& host)
+{
+  std::scoped_lock lock(m_flush_mutex);
+  if (!m_accesslog) {
+    m_accesslog = std::make_unique<AccessLog>();
+  }
+  m_accesslog->set_hostname(host);
+  if (m_log_file.size() > 4) {
+    std::string fname = m_log_file;
+    if (m_log_file.compare(m_log_file.size() - 4, 4, ".log") == 0) {
+      fname.replace(fname.size() - 4, 4, ".access.log");
+    }
+    else {
+      fname.append(".access.log");
+    }
+    m_accesslog->set_log_file(fname);
+  } else {
+    m_accesslog->set_log_file("/var/log/ceph/ceph-client.rgw.access.log");
+  }
+  m_accesslog->reopen_log_file();
+}
+
+void Log::stop_accesslog()
+{
+  std::scoped_lock lock(m_flush_mutex);
+  m_accesslog.reset();
 }
 
 void Log::set_journald_level(int log, int crash)
@@ -389,12 +419,13 @@ void Log::_flush(EntryVector& t, bool crash)
     auto thread = e.m_thread;
     auto str = e.strv();
 
-    bool should_log = crash || m_subs->get_log_level(sub) >= prio;
+    bool should_log = (crash || m_subs->get_log_level(sub) >= prio);
     bool do_fd = m_fd >= 0 && should_log;
     bool do_syslog = m_syslog_crash >= prio && should_log;
     bool do_stderr = m_stderr_crash >= prio && should_log;
     bool do_graylog2 = m_graylog_crash >= prio && should_log;
     bool do_journald = m_journald_crash >= prio && should_log;
+    bool do_alog = strcmp("alog", m_subs->get_name(sub)) == 0 && should_log;
 
     if (do_fd || do_syslog || do_stderr) {
       const std::size_t cur = m_log_buf.size();
@@ -443,6 +474,10 @@ void Log::_flush(EntryVector& t, bool crash)
 
     if (do_journald && m_journald) {
       m_journald->log_entry(e);
+    }
+
+    if (do_alog && m_accesslog) {
+      m_accesslog->log_entry(e);
     }
 
     {

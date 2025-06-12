@@ -21,6 +21,7 @@
 #include "rgw_keystone.h"
 #include "rgw_rest_conn.h"
 #include "rgw_ldap.h"
+#include "rgw_handoff.h"
 
 #include "rgw_token.h"
 #include "include/ceph_assert.h"
@@ -246,6 +247,7 @@ public:
   ~RGWStatBucket_ObjStore_S3() override {}
 
   void send_response() override;
+  int get_params(optional_yield y) override;
 };
 
 class RGWCreateBucket_ObjStore_S3 : public RGWCreateBucket_ObjStore {
@@ -667,6 +669,7 @@ public:
 };
 
 class RGWHandler_REST_Service_S3 : public RGWHandler_REST_S3 {
+  bool enable_storequery;
 protected:
   bool is_usage_op() const {
     return s->info.args.exists("usage");
@@ -674,13 +677,16 @@ protected:
   RGWOp *op_get() override;
   RGWOp *op_head() override;
 public:
-   RGWHandler_REST_Service_S3(const rgw::auth::StrategyRegistry& auth_registry) :
-      RGWHandler_REST_S3(auth_registry) {}
+  RGWHandler_REST_Service_S3(const rgw::auth::StrategyRegistry &auth_registry,
+                             bool _enable_storequery)
+      : RGWHandler_REST_S3(auth_registry),
+        enable_storequery(_enable_storequery) {}
   ~RGWHandler_REST_Service_S3() override = default;
 };
 
 class RGWHandler_REST_Bucket_S3 : public RGWHandler_REST_S3 {
   const bool enable_pubsub;
+  const bool enable_storequery;
 protected:
   bool is_acl_op() const {
     return s->info.args.exists("acl");
@@ -733,12 +739,15 @@ protected:
   RGWOp *op_post() override;
   RGWOp *op_options() override;
 public:
-  RGWHandler_REST_Bucket_S3(const rgw::auth::StrategyRegistry& auth_registry, bool _enable_pubsub) :
-      RGWHandler_REST_S3(auth_registry), enable_pubsub(_enable_pubsub) {}
+  RGWHandler_REST_Bucket_S3(const rgw::auth::StrategyRegistry &auth_registry,
+                            bool _enable_pubsub, bool _enable_storequery)
+      : RGWHandler_REST_S3(auth_registry), enable_pubsub(_enable_pubsub),
+        enable_storequery(_enable_storequery) {}
   ~RGWHandler_REST_Bucket_S3() override = default;
 };
 
 class RGWHandler_REST_Obj_S3 : public RGWHandler_REST_S3 {
+  bool enable_storequery;
 protected:
   bool is_acl_op() const {
     return s->info.args.exists("acl");
@@ -769,6 +778,10 @@ protected:
   RGWOp *op_post() override;
   RGWOp *op_options() override;
 public:
+  RGWHandler_REST_Obj_S3(const rgw::auth::StrategyRegistry &auth_registry,
+                         bool _enable_storequery)
+      : RGWHandler_REST_S3(auth_registry),
+        enable_storequery(_enable_storequery) {}
   using RGWHandler_REST_S3::RGWHandler_REST_S3;
   ~RGWHandler_REST_Obj_S3() override = default;
 };
@@ -779,13 +792,15 @@ private:
   const bool enable_sts;
   const bool enable_iam;
   const bool enable_pubsub;
+  const bool enable_storequery;
 public:
-  explicit RGWRESTMgr_S3(bool _enable_s3website=false, bool _enable_sts=false, bool _enable_iam=false, bool _enable_pubsub=false)
-    : enable_s3website(_enable_s3website),
-      enable_sts(_enable_sts),
-      enable_iam(_enable_iam),
-      enable_pubsub(_enable_pubsub) {
-  }
+  explicit RGWRESTMgr_S3(bool _enable_s3website = false,
+                         bool _enable_sts = false, bool _enable_iam = false,
+                         bool _enable_pubsub = false,
+                         bool _enable_storequery = false)
+      : enable_s3website(_enable_s3website), enable_sts(_enable_sts),
+        enable_iam(_enable_iam), enable_pubsub(_enable_pubsub),
+        enable_storequery(_enable_storequery) {}
 
   ~RGWRESTMgr_S3() override = default;
 
@@ -939,9 +954,9 @@ public:
     /* Return an instance of Completer for verifying the payload's fingerprint
      * if necessary. Otherwise caller gets nullptr. Caller may provide secret
      * key */
-    using completer_factory_t = \
-      std::function<rgw::auth::Completer::cmplptr_t(
-        const boost::optional<std::string>& secret_key)>;
+    using completer_factory_t = std::function<rgw::auth::Completer::cmplptr_t(
+        const boost::optional<std::string>& secret_key,
+        const std::optional<sha256_digest_t>& cached_signing_key)>;
 
     struct auth_data_t {
       access_key_id_t access_key_id;
@@ -1124,6 +1139,154 @@ public:
   static void shutdown();
 };
 
+/**
+ * @brief S3 authentication handoff engine.
+ *
+ * Supports the delegation of S3 authentication to an external program.
+ *
+ * Based initially on LDAPEngine.
+ *
+ * Note that unlike the LDAP engine we don't perform base64 decoding of the
+ * access key. As far as handoff is concerned, the access key is an opaque
+ * string parsed out of the Authorization header and sent verbatim to the
+ * external authenticator.
+ *
+ * The HandoffHelper class is somewhat redundant and could be folded into
+ * HandoffEngine. However, it makes it easier to read and easier to unit test
+ * in a separate class as it stands.
+ */
+class HandoffEngine : public AWSEngine {
+  std::shared_ptr<HandoffHelper> handoff_helper_;
+  std::mutex mtx_;
+
+  /**
+   * @brief One-time initialisation of the Handoff engine.
+   *
+   * Simply a passthrough the the HandoffHelper initialisation.
+   *
+   * Though currently unused, keep a copy of the store pointer - it's bound to
+   * be useful at some point.
+   *
+   * @param cct The context.
+   * @param store The store abstraction later.
+   *
+   */
+  void init(CephContext* const cct, rgw::sal::Driver* store);
+
+  using acl_strategy_t = rgw::auth::RemoteApplier::acl_strategy_t;
+  using auth_info_t = rgw::auth::RemoteApplier::AuthInfo;
+  using result_t = rgw::auth::Engine::result_t;
+
+protected:
+  rgw::sal::Driver* store;
+  const rgw::auth::RemoteApplier::Factory* const apl_factory;
+
+  acl_strategy_t get_acl_strategy() const;
+  auth_info_t get_creds_info(const rgw::RGWToken& token) const noexcept;
+
+  /**
+   * @brief Authenticate the request via the external authenticator.
+   *
+   * Pass most parameters straight through and call HandoffHelper::auth().
+   *
+   * On failure, simply return a deny result.
+   *
+   * On success, return a grant result with applier via get_creds_info() and
+   * an empty completer.
+   *
+   * @param dpp Debug prefix provider.
+   * @param access_key_id The access key. An opaque string from the
+   * Authorization header.
+   * @param signature The signature as found in the Authorization header.
+   * @param session_token The session token. An opaque string to this engine.
+   * @param string_to_sign The StringToSign as described in the AWS signature
+   * documentation.
+   * @param completer_factory Completion interface (see docs in rgw_auth.h).
+   * Currently Unused by this engine, as it is unused by LDAP.
+   * @param s The request state.
+   * @param y An optional_yield, we'll use it with our callout HTTP client.
+   * @return result_t The result of the external authentication.
+   *
+   * This is simply a passthrough to rgw::HandoffHelper::auth(), parsing that
+   * method's authentication result into AWSEngine's expected form.
+   */
+  result_t authenticate(const DoutPrefixProvider* dpp,
+                        const std::string_view& access_key_id,
+                        const std::string_view& signature,
+                        const std::string_view& session_token,
+                        const string_to_sign_t& string_to_sign,
+                        const signature_factory_t&,
+                        const completer_factory_t& completer_factory,
+                        const req_state* s,
+			optional_yield y) const override;
+public:
+  /**
+   * @brief Construct a new Handoff Engine object. Calls init().
+   *
+   * @param cct The Ceph context.
+   * @param store The store abstraction layer pointer.
+   * @param ver_abstractor passthrough to AWSEngine.
+   * @param apl_factory passthrough to AWSEngine.
+   */
+  HandoffEngine(CephContext* const cct,
+             rgw::sal::Driver* store,
+             const VersionAbstractor& ver_abstractor,
+             const rgw::auth::RemoteApplier::Factory* const apl_factory)
+    : AWSEngine(cct, ver_abstractor),
+      store(store),
+      apl_factory(apl_factory) {
+    init(cct, store);
+  }
+
+  using AWSEngine::authenticate;
+
+  const char* get_name() const noexcept override {
+    return "rgw::auth::s3::HandoffEngine";
+  }
+
+  /**
+   * @brief Return true if the HandoffEngine has been initialised.
+   *
+   * @return true The engine is ready for use.
+   * @return false The engine is uninitialised and must be configured using
+   * init().
+   */
+  bool valid();
+
+  /**
+   * @brief Free any resources used by the HandoffEngine.
+   */
+  void shutdown();
+
+  /**
+   * @brief Get a shared_ptr to the helper object.
+   *
+   * This is intended to allow other components the ability to access the
+   * shared HandoffHelper object, such as for anonymous authorization. There's
+   * no sense in having multiple sets of gRPC channel state pointing at the
+   * same server.
+   *
+   * @return std::shared_ptr<HandoffHelper> The helper. Will be nullptr if
+   * init() has not yet been called.
+   */
+  std::shared_ptr<HandoffHelper> get_helper()
+  {
+    return handoff_helper_;
+  }
+};
+
+/**
+ * @brief Surface the std::once_flag-protected global HandoffHelper
+ * shared_ptr.
+ *
+ * Ideally we'd expose this as a member on the StrategyRegistry, but
+ * unfortunately the AWSExternalAuthStrategy object is buried layers-deep
+ * under the StrategyRegistry and we can't easily get to it. (See
+ * rgw_appmain.cc::init_frontends2().)
+ * It's easier to just have a single global shared_ptr.
+ */
+extern std::shared_ptr<HandoffHelper> g_handoff_helper;
+
 class LocalEngine : public AWSEngine {
   rgw::sal::Driver* driver;
   const rgw::auth::LocalApplier::Factory* const apl_factory;
@@ -1205,6 +1368,8 @@ class S3AnonymousEngine : public rgw::auth::AnonymousEngine {
 public:
   /* Let's reuse the parent class' constructor. */
   using rgw::auth::AnonymousEngine::AnonymousEngine;
+
+  Engine::result_t authenticate(const DoutPrefixProvider* dpp, const req_state* s, optional_yield y) const override final;
 
   const char* get_name() const noexcept override {
     return "rgw::auth::s3::S3AnonymousEngine";

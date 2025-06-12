@@ -1,0 +1,311 @@
+syntax = "proto3";
+
+package authorizer.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "bits.linode.com/LinodeApi/obj-endpoint/gen/proto/authorizer/v1";
+
+// Errors mapping to S3 errors.
+// See: https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html#RESTErrorResponses
+message S3ErrorDetails {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    // Access Denied.
+    // 403 Forbidden.
+    TYPE_ACCESS_DENIED = 1;
+    // An internal error occurred. Try again.
+    // 500 Internal Server Error.
+    TYPE_INTERNAL_ERROR = 2;
+    // The action/principal/resource cannot be determined from the request.
+    // 400 Bad Request.
+    TYPE_INVALID_REQUEST = 36;
+    // The specified URI couldn't be parsed.
+    // 400 Bad Request.
+    TYPE_INVALID_URI = 4;
+    // The specified method is not allowed against this resource.
+    // 405 Method Not Allowed.
+    TYPE_METHOD_NOT_ALLOWED = 5;
+  }
+
+  Type type = 1;
+}
+
+// AuthorizerService provides RPCs for authorizing S3 requests.
+service AuthorizerService {
+  // Authorize authorizes an S3 request.
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+
+  // Ping allows us to (a) check and test the connection to the authorizer,
+  // and (b) easily avoid the lazy initialization behaviour of the gRPC
+  // channel, so we can give helpful error messages at startup.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // A request for authorization. Provide easily-available information about
+  // the request such as user, bucket and object key, so that the Authorizer
+  // can work out what additional data it will need to make a proper
+  // decision. Failures here will result in the user getting an error
+  // message. An Allow or Deny code means the protocol is ended. An 'extra
+  // data required' code means the client should either fail authorization
+  // or submit another AuthorizeV2() request with the required data.
+  rpc AuthorizeV2(AuthorizeV2Request) returns (AuthorizeV2Response);
+}
+
+message AuthorizeRequest {
+    enum HTTPMethod {
+      HTTP_METHOD_UNSPECIFIED = 0;
+      HTTP_METHOD_GET = 1;
+      HTTP_METHOD_HEAD = 2;
+      HTTP_METHOD_POST = 3;
+      HTTP_METHOD_PUT = 4;
+      HTTP_METHOD_DELETE = 5;
+    }
+
+    // The arn of the user that is being authorized
+    string user_arn = 1; // ORIGINAL USER
+    // The id of the role that is being authorized
+    optional string role_arn = 2; // SERVICE CALLING ASSUMEROLE
+    // The HTTP method from the user's S3 REST request used for the S3 request.
+    HTTPMethod http_method = 3;
+    // The name of the bucket the operation was performed on from the user's S3 REST request. For actions such as ListBuckets, this field will be empty
+    optional string bucket_name = 4;
+    // The object key the operation was performed on from the user's S3 REST request. For actions performed against a
+    // bucket, this field will be empty.
+    optional string object_key = 5;
+    // A map of all query string parameters from the user's S3 REST request.
+    map<string, string> query_parameters = 6;
+    // A map of all relevant x-amz-* headers from the user's S3 REST request. The map keys must be normalised to lower-case.
+    map<string, string> x_amz_headers = 7;
+    // A generic resource key, used when neither object_key or bucket_name make sense.
+    optional string resource = 8;
+    // Account arn is used to check if the account is suspended or not.
+    string account_arn = 9; // ORIGINAL USER
+  }
+
+// A lack of error indicates the request is succesfully authorized
+message AuthorizeResponse {}
+
+// Common fields for Ping() and AuthorizeV2().
+message AuthorizationCommon
+{
+    // This may be used for debugging and performance analysis.
+    google.protobuf.Timestamp timestamp = 1;
+    // The unique identifier for this request. This must be present in all
+    // requests and responses. It is generated for the AuthorizeRequest
+    // must match in any responses.
+    string authorization_id = 2;
+}
+
+message PingRequest { AuthorizationCommon common = 1; }
+
+message PingResponse { AuthorizationCommon common = 1; }
+
+//
+// Utility messages and enums.
+//
+enum AuthorizationResultCode {
+    AUTHORIZATION_RESULT_CODE_UNSPECIFIED = 0;
+    // Proceed with the request, which is now authorized.
+    AUTHORIZATION_RESULT_CODE_ALLOW = 1;
+    // Refuse the request and stop further processing.
+    AUTHORIZATION_RESULT_CODE_DENY = 2;
+    // This value means that the Authorizer needs more data from Ceph to
+    // authorize. The client must either provide those data or fail the
+    // authorization entirely.
+    AUTHORIZATION_RESULT_CODE_EXTRA_DATA_REQUIRED = 3;
+    // An internal error occurred. This should be logged and investigated.
+    AUTHORIZATION_RESULT_CODE_INTERNAL_ERROR = 4;
+    // We have exceeded a rate limit on the Authorizer.
+    AUTHORIZATION_RESULT_CODE_RATE_LIMIT_EXCEEDED = 5;
+    // requesting account suspended
+    AUTHORIZATION_RESULT_CODE_ACCOUNT_SUSPENDED = 6;
+    // Bucket not found
+    AUTHORIZATION_RESULT_CODE_BUCKET_NOT_FOUND = 7;
+    // XXX this will almost certainly need extended.
+}
+
+// Each S3 Opcode as seen by RGW.
+//
+// These numbers are not arbitrary. They're the values found in
+// src/rgw/rgw_iam_policy.h, and are constexpr uint64_t values that look like
+// rgw::IAM::s3GetObject, mangled to fit protobuf. Since protobuf expects the
+// zero value to be <PREFIX_>_UNSPECIFIED but the opcodes in the RGW source
+// start at zero, we've shifted the values up by one. This is a shame.
+// Nonetheless, we can still easily translate the RGW code number to the
+// protobuf enum by adding one.
+//
+enum S3Opcode {
+    S3_OPCODE_UNSPECIFIED = 0;
+    S3_OPCODE_GET_OBJECT = 1;
+    S3_OPCODE_GET_OBJECT_VERSION = 2;
+    S3_OPCODE_PUT_OBJECT = 3;
+    S3_OPCODE_GET_OBJECT_ACL = 4;
+    S3_OPCODE_GET_OBJECT_VERSION_ACL = 5;
+    S3_OPCODE_PUT_OBJECT_ACL = 6;
+    S3_OPCODE_PUT_OBJECT_VERSION_ACL = 7;
+    S3_OPCODE_DELETE_OBJECT = 8;
+    S3_OPCODE_DELETE_OBJECT_VERSION = 9;
+    S3_OPCODE_LIST_MULTIPART_UPLOAD_PARTS = 10;
+    S3_OPCODE_ABORT_MULTIPART_UPLOAD = 11;
+    S3_OPCODE_GET_OBJECT_TORRENT = 12;
+    S3_OPCODE_GET_OBJECT_VERSION_TORRENT = 13;
+    S3_OPCODE_RESTORE_OBJECT = 14;
+    S3_OPCODE_CREATE_BUCKET = 15;
+    S3_OPCODE_DELETE_BUCKET = 16;
+    S3_OPCODE_LIST_BUCKET = 17;
+    S3_OPCODE_LIST_BUCKET_VERSIONS = 18;
+    S3_OPCODE_LIST_ALL_MY_BUCKETS = 19; // global
+    S3_OPCODE_LIST_BUCKET_MULTIPART_UPLOADS = 20; // bucket
+    S3_OPCODE_GET_ACCELERATE_CONFIGURATION = 21; // object
+    S3_OPCODE_PUT_ACCELERATE_CONFIGURATION = 22; // object
+    S3_OPCODE_GET_BUCKET_ACL = 23; // bucket
+    S3_OPCODE_PUT_BUCKET_ACL = 24;
+    S3_OPCODE_GET_BUCKET_CORS = 25;
+    S3_OPCODE_PUT_BUCKET_CORS = 26;
+    S3_OPCODE_GET_BUCKET_VERSIONING = 27;
+    S3_OPCODE_PUT_BUCKET_VERSIONING = 28;
+    S3_OPCODE_GET_BUCKET_REQUEST_PAYMENT = 29;
+    S3_OPCODE_PUT_BUCKET_REQUEST_PAYMENT = 30;
+    S3_OPCODE_GET_BUCKET_LOCATION = 31;
+    S3_OPCODE_GET_BUCKET_POLICY = 32;
+    S3_OPCODE_DELETE_BUCKET_POLICY = 33;
+    S3_OPCODE_PUT_BUCKET_POLICY = 34;
+    S3_OPCODE_GET_BUCKET_NOTIFICATION = 35;
+    S3_OPCODE_PUT_BUCKET_NOTIFICATION = 36;
+    S3_OPCODE_GET_BUCKET_LOGGING = 37;
+    S3_OPCODE_PUT_BUCKET_LOGGING = 38;
+    S3_OPCODE_GET_BUCKET_TAGGING = 39;
+    S3_OPCODE_PUT_BUCKET_TAGGING = 40;
+    S3_OPCODE_GET_BUCKET_WEBSITE = 41;
+    S3_OPCODE_PUT_BUCKET_WEBSITE = 42;
+    S3_OPCODE_DELETE_BUCKET_WEBSITE = 43;
+    S3_OPCODE_GET_LIFECYCLE_CONFIGURATION = 44;  // lifecycle
+    S3_OPCODE_PUT_LIFECYCLE_CONFIGURATION = 45;
+    S3_OPCODE_PUT_REPLICATION_CONFIGURATION = 46; // replicaiton
+    S3_OPCODE_GET_REPLICATION_CONFIGURATION = 47;
+    S3_OPCODE_DELETE_REPLICATION_CONFIGURATION = 48;
+    S3_OPCODE_GET_OBJECT_TAGGING = 49; // object
+    S3_OPCODE_PUT_OBJECT_TAGGING = 50;
+    S3_OPCODE_DELETE_OBJECT_TAGGING = 51;
+    S3_OPCODE_GET_OBJECT_VERSION_TAGGING = 52;
+    S3_OPCODE_PUT_OBJECT_VERSION_TAGGING = 53;
+    S3_OPCODE_DELETE_OBJECT_VERSION_TAGGING = 54;
+    S3_OPCODE_PUT_BUCKET_OBJECT_LOCK_CONFIGURATION = 55; // object
+    S3_OPCODE_GET_BUCKET_OBJECT_LOCK_CONFIGURATION = 56;
+    S3_OPCODE_PUT_OBJECT_RETENTION = 57;
+    S3_OPCODE_GET_OBJECT_RETENTION = 58;
+    S3_OPCODE_PUT_OBJECT_LEGAL_HOLD = 59;
+    S3_OPCODE_GET_OBJECT_LEGAL_HOLD = 60;
+    S3_OPCODE_BYPASS_GOVERNANCE_RETENTION = 61; // bypass governance
+    S3_OPCODE_GET_BUCKET_POLICY_STATUS = 62; // bucket
+    S3_OPCODE_PUT_PUBLIC_ACCESS_BLOCK = 63; // Access block
+    S3_OPCODE_GET_PUBLIC_ACCESS_BLOCK = 64;
+    S3_OPCODE_DELETE_PUBLIC_ACCESS_BLOCK = 65;
+    S3_OPCODE_GET_BUCKET_PUBLIC_ACCESS_BLOCK = 66;
+    S3_OPCODE_PUT_BUCKET_PUBLIC_ACCESS_BLOCK = 67;
+    S3_OPCODE_DELETE_BUCKET_PUBLIC_ACCESS_BLOCK = 68;
+    S3_OPCODE_GET_BUCKET_ENCRYPTION = 69; // bucket
+    S3_OPCODE_PUT_BUCKET_ENCRYPTION = 70;
+}
+
+// Extra Data: Information that RGW may optionally need to provide in order to
+// properly authorize the request. We don't unconditionally fetch everything
+// for performance reasons.
+
+// AuthorizeResponse may contain an ExtraDataSpecification, to list the extra
+// data fields required. It's down to the authz client to provide these items,
+// or terminate the authorization attempt.
+//
+// Likewise, the AuthorizeRequest may contain an ExtraDataSpecification to
+// indicate which extra data fields are being provided. This makes it easy for
+// Authorizer to distringuish between a piece of extra data that was not sent,
+// and a field that was checked and found to be empty.
+message ExtraDataSpecification
+{
+    // Object key tags provided/required.
+    bool object_key_tags = 1;
+}
+
+message ExtraData
+{
+    // The tags that were present on the object key at the time of the
+    // request.
+    map<string, string> object_key_tags = 1;
+}
+
+//
+// Authorize(). If enough information is provided, the Authorizer can return
+// Allow or Deny and we're done. Otherwise the Authorizer can return a request
+// for extra data, which the client then provides in another Authorize() call.
+//
+message AuthorizeV2Question
+{
+    // common holds an id to match responses
+    AuthorizationCommon common = 1;
+
+    // The canonical user ID is returned by the Authenticator and is reflected
+    // back to the Authorizer verbatim.
+    string canonical_user_id = 2;
+    // user_arn is returned by the Authenticator and is reflected back
+    // to the Authorizer verbatim.
+    string user_arn = 3;
+    // assuming_user_arn is returned by the Authenticator and is reflected
+    // back to the Authorizer verbatim.
+    optional string assuming_user_arn = 4;
+    // account_arn is returned by the Authenticator and is reflected back to
+    // the Authorizer verbatim.
+    string account_arn = 5;
+
+    // The S3 operation.
+    S3Opcode opcode = 6;
+    // The S3 bucket name. May be empty.
+    string bucket_name = 7;
+    // The S3 object key name. May be empty.
+    string object_key_name = 8;
+
+    // All the query parameters from the S3 request.
+    map<string, string> query_parameters = 9;
+    // All the x-amz-* headers from the S3 request. The map keys must be normalised to lower-case.
+    map<string, string> x_amz_headers = 10;
+
+    message IAMMapEntry { repeated string values = 1; }
+    // The authorization 'environment', a multimap of key-value pairs with
+    // authorization parameters. E.g. 's3:prefix' => '/path'. Protobuf has no
+    // multimap type, we have to simulate one.
+    map<string, IAMMapEntry> environment = 11;
+
+    // Mask for which extra data we're sending. This allows the Authorizer to
+    // distinguish between the case where the client hasn't _sent_ a piece of
+    // data, and where the client has sent an _empty_ piece of data.
+    optional ExtraDataSpecification extra_data_provided = 12;
+    // Extra data that the Authorizer may require in order to make a decision.
+    // This can either be added unilaterally by the client, or specifically
+    // requested by the Authorizer in the AuthorizeResponse.
+    optional ExtraData extra_data = 13;
+    // The id of the role that is being authorized, the service in represented here
+    optional string role_arn = 14; // SERVICE CALLING ASSUMEROLE
+}
+
+message AuthorizeV2Request
+{
+    // One or more questions about the S3 request.
+    repeated AuthorizeV2Question questions = 1;
+}
+
+message AuthorizeV2Answer
+{
+    // common holds an id to match responses
+    AuthorizationCommon common = 1;
+    // The result code.
+    AuthorizationResultCode code = 2;
+    // If result.code is AUTHORIZATION_RESULT_CODE_EXTRA_DATA_REQUIRED, this field must be
+    // present and must list the extra data fields required by the Authorizer in
+    // order to properly authorize the request.
+    optional ExtraDataSpecification extra_data_required = 3;
+}
+
+message AuthorizeV2Response
+{
+    // One or more answers to the questions in the AuthorizeV2Request.
+    repeated AuthorizeV2Answer answers = 1;
+}

@@ -295,6 +295,9 @@ void rgw_format_ops_log_entry(struct rgw_log_entry& entry, Formatter *formatter)
     case TYPE_LDAP:
       formatter->dump_string("authentication_type","LDAP");
       break;
+    case TYPE_HANDOFF:
+      formatter->dump_string("authentication_type","HANDOFF");
+      break;
     case TYPE_KEYSTONE:
       formatter->dump_string("authentication_type","Keystone");
       break;

@@ -1,0 +1,7 @@
+# This is a placeholder for .trivyignore.
+# We want a single place to maintain this file -- either here in the ceph code
+# or in akceph-build. We chose akceph-build.
+# But dpkg-buildpackage used when building deb packages will remove
+# any file that isn't in git, so we have this. It will be overwritten
+# by the contents in akceph-build during docker setup.
+s

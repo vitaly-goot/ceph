@@ -921,6 +921,11 @@ void RGWPSListNotifsOp::execute(optional_yield y) {
 }
 
 int RGWPSListNotifsOp::verify_permission(optional_yield y) {
+  // Handoff: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketNotification, y);
+  }
+
   if (!verify_bucket_permission(this, s, rgw::IAM::s3GetBucketNotification)) {
     return -EACCES;
   }

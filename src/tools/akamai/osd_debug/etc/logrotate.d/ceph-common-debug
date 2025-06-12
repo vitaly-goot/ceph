@@ -1,0 +1,8 @@
+/var/log/ceph/ceph-osd.*.log { 
+    postrotate
+        killall -q -1 ceph-osd || pkill -1 -x "ceph-osd" || true
+    endscript
+    missingok
+    notifempty
+    su root ceph
+}

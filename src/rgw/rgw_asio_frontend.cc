@@ -72,19 +72,40 @@ class StreamIO : public rgw::asio::ClientIO {
   timeout_timer& timeout;
   yield_context yield;
   parse_buffer& buffer;
+  bool expect_continue;
   boost::system::error_code fatal_ec;
  public:
   StreamIO(CephContext *cct, Stream& stream, timeout_timer& timeout,
            rgw::asio::parser_type& parser, yield_context yield,
-           parse_buffer& buffer, bool is_ssl,
+           parse_buffer& buffer, bool expect_continue, bool is_ssl,
            const tcp::endpoint& local_endpoint,
            const tcp::endpoint& remote_endpoint)
       : ClientIO(parser, is_ssl, local_endpoint, remote_endpoint),
         cct(cct), stream(stream), timeout(timeout), yield(yield),
-        buffer(buffer)
+        buffer(buffer), expect_continue(expect_continue)
   {}
 
   boost::system::error_code get_fatal_error_code() const { return fatal_ec; }
+
+  size_t complete_header(bool close_conn = false) override {
+    if (cct->_conf->rgw_request_close_conn_on_error_override && close_conn && expect_continue && !sent_100_continue()) {
+      if (cct->_conf->rgw_request_close_conn_on_error_delay) {
+        const uint32_t delay_ms = std::min<uint32_t>(10000, cct->_conf->rgw_request_close_conn_on_error_delay);
+        ldout(cct, 5) << "PCONN abort on error delayed: " << delay_ms << dendl;
+        timeout.async_wait(delay_ms, yield);
+      }
+      ldout(cct, 1) << "PCONN abort on error enforced" << dendl;
+      // Notify client with 'Connection: Close' 
+      size_t bytes = rgw::asio::ClientIO::complete_header(true);
+      // To prevent further reads, close the connection entirely.
+      boost::system::error_code ec_ignored;
+      stream.lowest_layer().shutdown(tcp_socket::shutdown_both, ec_ignored);
+      return bytes;
+
+    } else {
+      return rgw::asio::ClientIO::complete_header(false);
+    } 
+  }
 
   size_t write_data(const char* buf, size_t len) override {
     boost::system::error_code ec;
@@ -264,7 +285,7 @@ void handle_connection(boost::asio::io_context& context,
         return;
       }
 
-      StreamIO real_client{cct, stream, timeout, parser, yield, buffer,
+      StreamIO real_client{cct, stream, timeout, parser, yield, buffer, expect_continue,
                            is_ssl, local_endpoint, remote_endpoint};
 
       auto real_client_io = rgw::io::add_reordering(
@@ -286,8 +307,12 @@ void handle_connection(boost::asio::io_context& context,
 
       if (cct->_conf->subsys.should_gather(ceph_subsys_rgw_access, 1)) {
 	const auto& uri = message.target();
+        std::string tracestr;
+        if (!req.otel_trace_id.empty()) {
+          tracestr = " trace_id " + req.otel_trace_id;
+        }
         // access log line elements begin per Apache Combined Log Format with additions following
-        lsubdout(cct, rgw_access, 1) << "beast: " << std::hex << &req << std::dec << ": "
+        lsubdout(cct, rgw_access, 1) << "beast: " << std::hex << &req << std::dec << tracestr << ": "
             << remote_endpoint.address() << " - " << user << " [" << log_apache_time{started} << "] \""
             << message.method_string() << ' ' 
             << (req.uri_log_rewrite ? (*req.uri_log_rewrite)(std::string(uri.data(), uri.size())) : uri) << ' '

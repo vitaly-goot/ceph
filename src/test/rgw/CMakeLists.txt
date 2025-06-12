@@ -281,6 +281,11 @@ target_include_directories(unittest_rgw_lua
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/store/rados")
 target_link_libraries(unittest_rgw_lua ${rgw_libs})
 
+# unittest_rgw_storequery
+add_executable(unittest_rgw_storequery test_rgw_storequery.cc)
+add_ceph_unittest(unittest_rgw_storequery)
+target_link_libraries(unittest_rgw_storequery ${rgw_libs})
+
 add_executable(radosgw-cr-test rgw_cr_test.cc)
 target_link_libraries(radosgw-cr-test ${rgw_libs} librados
   cls_rgw_client cls_otp_client cls_lock_client cls_refcount_client
@@ -294,3 +299,42 @@ target_link_libraries(radosgw-cr-test ${rgw_libs} librados
 add_executable(unittest_rgw_expat_mitigations test_rgw_expat_mitigations.cc)
 add_ceph_unittest(unittest_rgw_expat_mitigations)
 target_link_libraries(unittest_rgw_expat_mitigations ${EXPAT_LIBRARIES} ${rgw_libs})
+
+# unittest_rgw_grpc
+add_executable(unittest_rgw_grpc
+  test_rgw_grpc.cc test_rgw_grpc_util.h
+)
+add_ceph_unittest(unittest_rgw_grpc)
+target_link_libraries(unittest_rgw_grpc
+  ${UNITTEST_LIBS}
+  ${rgw_libs}
+)
+
+# unittest_rgw_auth_handoff
+add_executable(unittest_rgw_auth_handoff
+  test_rgw_auth_handoff.cc
+  test_rgw_grpc_util.h
+)
+add_ceph_unittest(unittest_rgw_auth_handoff)
+target_link_libraries(unittest_rgw_auth_handoff
+  ${UNITTEST_LIBS}
+  ${rgw_libs}
+)
+
+add_executable(unittest_rgw_expat_mitigations test_rgw_expat_mitigations.cc)
+add_ceph_unittest(unittest_rgw_expat_mitigations)
+target_link_libraries(unittest_rgw_expat_mitigations ${EXPAT_LIBRARIES} ${rgw_libs})
+
+add_executable(unittest_rgw_otel_trace test_rgw_otel_trace.cc)
+add_ceph_unittest(unittest_rgw_otel_trace)
+target_include_directories(unittest_rgw_otel_trace
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/store/rados")
+target_link_libraries(unittest_rgw_otel_trace ${rgw_libs})
+
+add_executable(unittest_rgw_ubns test_rgw_ubns.cc test_rgw_grpc_util.h)
+add_ceph_unittest(unittest_rgw_ubns)
+target_link_libraries(unittest_rgw_ubns
+  ${UNITTEST_LIBS}
+  ${rgw_libs}
+)

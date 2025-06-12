@@ -167,6 +167,7 @@ PerfCountersRef build(CephContext *cct, const std::string& name)
   }
 
   PerfCountersBuilder b(cct, name, l_first, l_last);
+  b.set_prio_default(PerfCountersBuilder::PRIO_USEFUL);
   b.add_u64(l_throttle, "throttle", "Requests throttled");
   b.add_u64(l_outstanding, "outstanding", "Outstanding Requests");
 

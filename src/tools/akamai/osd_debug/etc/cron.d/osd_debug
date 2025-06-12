@@ -1,0 +1,1 @@
+*/5 * * * * /srv/exporter_scripts/socket_stat.sh
