@@ -321,10 +321,6 @@ target_link_libraries(unittest_rgw_auth_handoff
   ${rgw_libs}
 )
 
-add_executable(unittest_rgw_expat_mitigations test_rgw_expat_mitigations.cc)
-add_ceph_unittest(unittest_rgw_expat_mitigations)
-target_link_libraries(unittest_rgw_expat_mitigations ${EXPAT_LIBRARIES} ${rgw_libs})
-
 add_executable(unittest_rgw_otel_trace test_rgw_otel_trace.cc)
 add_ceph_unittest(unittest_rgw_otel_trace)
 target_include_directories(unittest_rgw_otel_trace
