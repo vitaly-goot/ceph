@@ -844,7 +844,7 @@ private:
 
   void* entry() override {
     while (!wk->get_lc()->going_down()) {
-      auto items = dequeue(cct->_conf->rgw_lc_wp_worker_max_aio);
+      auto items = dequeue(wk->cct->_conf->rgw_lc_wp_worker_max_aio);
       if (items.size() == 0) {
         /* going down */
         break;
