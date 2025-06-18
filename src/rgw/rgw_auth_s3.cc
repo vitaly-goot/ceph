@@ -1621,13 +1621,14 @@ bool AWSv4ComplMulti::complete()
 rgw::auth::Completer::cmplptr_t AWSv4ComplMulti::create(
     const req_state *const s, std::string_view date,
     std::string_view credential_scope, std::string_view seed_signature,
+    uint32_t flags,
     const boost::optional<std::string> &secret_key,
     const std::optional<sha256_digest_t> &cached_signing_key) {
 
   if (cached_signing_key.has_value()) {
     return std::make_shared<AWSv4ComplMulti>(
         s, std::move(date), std::move(credential_scope),
-        std::move(seed_signature), *cached_signing_key);
+        std::move(seed_signature), flags, *cached_signing_key);
 
   } else {
     if (!secret_key) {
@@ -1645,7 +1646,7 @@ rgw::auth::Completer::cmplptr_t AWSv4ComplMulti::create(
         s->cct, credential_scope, *secret_key, s);
     return std::make_shared<AWSv4ComplMulti>(
         s, std::move(date), std::move(credential_scope),
-        std::move(seed_signature), signing_key);
+        std::move(seed_signature), flags, signing_key);
   }
 }
 

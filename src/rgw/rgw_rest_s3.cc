@@ -6553,7 +6553,7 @@ rgw::auth::s3::LocalEngine::authenticate(
   if (s->op_type == RGW_OP_OPTIONS_CORS) {
     auto apl = apl_factory->create_apl_local(cct, s, user->get_info(),
                                              k.subuser, std::nullopt, access_key_id);
-    return result_t::grant(std::move(apl), completer_factory(k.key));
+    return result_t::grant(std::move(apl), completer_factory(k.key, std::nullopt));
   }
 
   const VersionAbstractor::server_signature_t server_signature = \

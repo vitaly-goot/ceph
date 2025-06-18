@@ -7091,6 +7091,7 @@ void RGWCompleteMultipart::execute(optional_yield y)
   RGWMultiCompleteUpload *parts;
   RGWMultiXMLParser parser;
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
+  off_t ofs = 0;
   uint64_t olh_epoch = 0;
 
   op_ret = get_params(y);
@@ -7189,8 +7190,8 @@ void RGWCompleteMultipart::execute(optional_yield y)
   s->object->set_attrs(meta_obj->get_attrs());
 
   // make reservation for notification if needed
-  res = driver->get_notification(meta_obj.get(), nullptr, s, rgw::notify::ObjectCreatedCompleteMultipartUpload, y,
-                                 &s->object->get_name());
+  std::unique_ptr<rgw::sal::Notification> res;
+  res = driver->get_notification(s->object.get(), nullptr, s, rgw::notify::ObjectCreatedCompleteMultipartUpload, y);
   op_ret = res->publish_reserve(this);
   if (op_ret < 0) {
     return;
@@ -7202,10 +7203,14 @@ void RGWCompleteMultipart::execute(optional_yield y)
     return;
   }
 
-  upload_time = upload->get_mtime();
-  int r = serializer->unlock();
-  if (r < 0) {
-    ldpp_dout(this, 0) << "WARNING: failed to unlock " << *serializer.get() << dendl;
+  const ceph::real_time upload_time = upload->get_mtime();
+  etag = s->object->get_attrs()[RGW_ATTR_ETAG].to_str();
+
+  // send request to notification manager
+  int ret = res->publish_commit(this, ofs, upload_time, etag, s->object->get_instance());
+  if (ret < 0) {
+    ldpp_dout(this, 1) << "ERROR: publishing notification failed, with error: " << ret << dendl;
+    // too late to rollback operation, hence op_ret is not set here
   }
 
   // remove the upload meta object ; the meta object is not versioned
@@ -7268,43 +7273,6 @@ void RGWCompleteMultipart::complete()
       ldpp_dout(this, 0) << "WARNING: failed to unlock " << *serializer.get() << dendl;
     }
   }
-
-  if (op_ret >= 0 && target_obj.get() != nullptr) {
-    s->object->set_attrs(target_obj->get_attrs());
-    etag = s->object->get_attrs()[RGW_ATTR_ETAG].to_str();
-    // send request to notification manager
-    if (res.get() != nullptr) {
-      int ret = res->publish_commit(this, ofs, upload_time, etag, target_obj->get_instance());
-      if (ret < 0) {
-        ldpp_dout(this, 1) << "ERROR: publishing notification failed, with error: " << ret << dendl;
-        // too late to rollback operation, hence op_ret is not set here
-      }
-    } else {
-      ldpp_dout(this, 1) << "ERROR: reservation is null" << dendl;
-    }
-  } else {
-    ldpp_dout(this, 1) << "ERROR: either op_ret is negative (execute failed) or target_obj is null, op_ret: "
-                       << op_ret << dendl;
-  }
-
-  // remove the upload meta object ; the meta object is not versioned
-  // when the bucket is, as that would add an unneeded delete marker
-  // moved to complete to prevent segmentation fault in publish commit
-  if (meta_obj.get() != nullptr) {
-    int ret = meta_obj->delete_object(this, null_yield, true /* prevent versioning */);
-    if (ret >= 0) {
-      /* serializer's exclusive lock is released */
-      serializer->clear_locked();
-    } else {
-      ldpp_dout(this, 0) << "WARNING: failed to remove object " << meta_obj << ", ret: " << ret << dendl;
-    }
-  } else {
-    ldpp_dout(this, 0) << "WARNING: meta_obj is null" << dendl;
-  }
-
-  res.reset();
-  meta_obj.reset();
-  target_obj.reset();
 
   send_response();
 }
