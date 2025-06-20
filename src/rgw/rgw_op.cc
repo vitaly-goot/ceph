@@ -5948,7 +5948,7 @@ int RGWCopyObj::verify_permission(optional_yield y)
           auto session_policy_res = eval_identity_or_session_policies(this, s->session_policies, s->env,
               rgw::IAM::s3PutObject, obj_arn);
           if (session_policy_res == Effect::Deny) {
-            return false;
+            return -EACCES;
           }
           if (princ_type == rgw::IAM::PolicyPrincipal::Role) {
             // Intersection of session policy and identity policy plus intersection of session policy and bucket policy
