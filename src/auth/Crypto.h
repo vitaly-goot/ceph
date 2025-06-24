@@ -20,6 +20,8 @@
 #include "include/utime.h"
 #include "include/buffer.h"
 
+#include "msg/msg_types.h"
+
 #include <string>
 
 class CryptoKeyContext;
@@ -115,7 +117,7 @@ public:
  */
 class CryptoKey {
 protected:
-  __u16 type;
+  entity_type_t type = 0;
   utime_t created;
   ceph::buffer::ptr secret;   // must set this via set_secret()!
 
@@ -123,16 +125,15 @@ protected:
   // don't have to create it for every crypto operation.
   mutable std::shared_ptr<CryptoKeyHandler> ckh;
 
-  int _set_secret(int type, const ceph::buffer::ptr& s);
+  int _set_secret(entity_type_t type, const ceph::buffer::ptr& s);
 
 public:
-  CryptoKey() : type(0) { }
+  CryptoKey() = default;
   CryptoKey(int t, utime_t c, ceph::buffer::ptr& s)
     : created(c) {
     _set_secret(t, s);
   }
-  ~CryptoKey() {
-  }
+  ~CryptoKey() = default;
 
   void encode(ceph::buffer::list& bl) const;
   void decode(ceph::buffer::list::const_iterator& bl);
@@ -141,11 +142,11 @@ public:
     *this = CryptoKey();
   }
 
-  unsigned get_type() const { return type; }
+  auto get_type() const { return type; }
   utime_t get_created() const { return created; }
   void print(std::ostream& out) const;
 
-  int set_secret(int type, const ceph::buffer::ptr& s, utime_t created);
+  int set_secret(entity_type_t type, const ceph::buffer::ptr& s, utime_t created);
   const ceph::buffer::ptr& get_secret() { return secret; }
   const ceph::buffer::ptr& get_secret() const { return secret; }
 
@@ -178,7 +179,7 @@ public:
   void encode_plaintext(ceph::buffer::list &bl);
 
   // --
-  int create(CephContext *cct, int type);
+  int create(CephContext *cct, entity_type_t type);
   int encrypt(CephContext *cct, const ceph::buffer::list& in,
 	      ceph::buffer::list& out,
 	      std::string *error) const {

@@ -979,7 +979,7 @@ CryptoKeyHandler *CryptoAES256KRB5::get_key_handler_ext(const bufferptr& secret,
 void CryptoKey::encode(bufferlist& bl) const
 {
   using ceph::encode;
-  encode(type, bl);
+  encode_assign<uint16_t>(type, bl);
   encode(created, bl);
   __u16 len = secret.length();
   encode(len, bl);
@@ -989,7 +989,7 @@ void CryptoKey::encode(bufferlist& bl) const
 void CryptoKey::decode(bufferlist::const_iterator& bl)
 {
   using ceph::decode;
-  decode(type, bl);
+  decode_assign<uint16_t>(type, bl);
   decode(created, bl);
   __u16 len;
   decode(len, bl);
@@ -1000,16 +1000,16 @@ void CryptoKey::decode(bufferlist::const_iterator& bl)
 }
 
 
-int CryptoKey::set_secret(int type, const bufferptr& s, utime_t c)
+int CryptoKey::set_secret(entity_type_t t, const bufferptr& s, utime_t c)
 {
-  int r = _set_secret(type, s);
+  int r = _set_secret(t, s);
   if (r < 0)
     return r;
   this->created = c;
   return 0;
 }
 
-int CryptoKey::_set_secret(int t, const bufferptr& s)
+int CryptoKey::_set_secret(entity_type_t t, const bufferptr& s)
 {
   if (s.length() == 0) {
     secret = s;
@@ -1038,7 +1038,7 @@ int CryptoKey::_set_secret(int t, const bufferptr& s)
   return 0;
 }
 
-int CryptoKey::create(CephContext *cct, int t)
+int CryptoKey::create(CephContext *cct, entity_type_t t)
 {
   CryptoHandler *ch = CryptoHandler::create(t);
   if (!ch) {
