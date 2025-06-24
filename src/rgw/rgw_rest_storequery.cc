@@ -8,6 +8,7 @@
 #include <boost/tokenizer.hpp>
 #include <cstdint>
 #include <fmt/format.h>
+#include <rapidjson/document.h>
 #include <stdexcept>
 #include <string>
 
@@ -315,6 +316,50 @@ void RGWStoreQueryOp_ObjectStatus::send_response_json()
 
 // RGWStoreQueryOp_ObjectList
 
+static std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key)
+{
+  bufferlist bl;
+  ceph::JSONFormatter f;
+  f.open_object_section("ContinuationToken");
+  f.dump_string("key", key.name);
+  f.dump_string("instance", key.instance);
+  f.close_section(); // ContinuationToken
+  f.flush(bl);
+  std::string token = bl.to_str();
+  ldpp_dout(dpp, 20)
+      << fmt::format(FMT_STRING("prepared continuation token: {}"), token) << dendl;
+  return token;
+}
+
+static std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProvider* dpp, const std::string& token)
+{
+  if (token[0] != '{') {
+    // Assume we're given just a name, not a JSON object containing the
+    // instance.
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("unpacked legacy continuation token: key='{}', no instance available"), token)
+                       << dendl;
+    return rgw_obj_key(token);
+  }
+  rapidjson::Document doc;
+  doc.Parse(token.c_str());
+  if (doc.HasParseError()) {
+    ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("failed to parse continuation token: {}"), rapidjson::GetParseError_En(doc.GetParseError()))
+                      << dendl;
+    return std::nullopt;
+  }
+  if (!doc.IsObject() || !doc.HasMember("key") || !doc["key"].IsString() || !doc.HasMember("instance") || !doc["instance"].IsString()) {
+    ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("invalid continuation token format: {}"), token)
+                      << dendl;
+    return std::nullopt;
+  }
+  rgw_obj_key key(doc["key"].GetString(),
+      doc["instance"].GetString());
+  ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("unpacked continuation token: key='{}' instance='{}'"),
+      key.name, key.instance)
+                     << dendl;
+  return key;
+}
+
 bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 {
   // The ListParams persists across multiple requests.
@@ -322,11 +367,9 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 
   // Fill in the contination token if we need to.
   if (marker_.has_value()) {
+    std::string init_marker;
     try {
-      std::string init_marker = from_base64(*marker_);
-      params.marker = rgw_obj_key(init_marker);
-      ldpp_dout(this, 10) << fmt::format(FMT_STRING("continuation token '{}' decoded as {}"), *marker_, init_marker)
-                          << dendl;
+      init_marker = from_base64(*marker_);
     } catch (std::exception& e) {
       // We can't catch boost::archive::archive_exception specifically, it
       // doesn't link and I'm not fixing the CMake just for one exception.
@@ -335,6 +378,16 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
       op_ret = -EINVAL;
       return false;
     }
+    std::optional<rgw_obj_key> marker_key = unpack_continuation_token(this, init_marker);
+    if (!marker_key) {
+      ldpp_dout(this, 0) << fmt::format(FMT_STRING("failed to unpack continuation token: '{}'"), init_marker)
+                         << dendl;
+      op_ret = -EINVAL;
+      return false;
+    }
+    ldpp_dout(this, 10) << fmt::format(FMT_STRING("continuation token '{}' decoded as {}"), *marker_, init_marker)
+                        << dendl;
+    params.marker = *marker_key;
   }
 
   // No prefix for a complete list of the bucket.
@@ -356,7 +409,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
   }
 
   bool seen_eof = false;
-  std::string next_marker;
+  rgw_obj_key next_marker;
 
   // Reserve space for the maximum number of entries we might return. This is
   // a compromise - we could reallocate as we issue queries against the
@@ -437,8 +490,8 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
         // If we filled items_, set the token for next time. It's ok if it's
         // actually the end of the list - the next query will just have zero
         // items.
-        next_marker = results.objs[n].key.name;
-        ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next={}"), next_marker) << dendl;
+        next_marker = rgw_obj_key(results.objs[n].key.name, results.objs[n].key.instance);
+        ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next=[name={},instance={}]"), next_marker.name, next_marker.instance) << dendl;
         break;
       }
 
@@ -459,16 +512,23 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
     // Note that it's safe to use to_base64() here. Even though it looks like it
     // will insert line breaks, it's actually a template and the default line
     // wrap width is std::numeric_limits<int>::max().
+
+    std::string marker_str = prepare_continuation_token(this, next_marker);
     std::string encoded_marker;
     try {
-      encoded_marker = to_base64(next_marker);
+      encoded_marker = to_base64(marker_str);
     } catch (std::runtime_error& e) {
       ldpp_dout(this, 0) << fmt::format(FMT_STRING("failed to encode continuation token: '{}'"), e.what())
                          << dendl;
       op_ret = -EINVAL;
       return false;
     }
-    ldpp_dout(this, 20) << fmt::format(FMT_STRING("EOF not reached, next_marker {}"), params.marker.name)
+    while (encoded_marker.length() % 4 != 0) {
+      // Pad the encoded marker with '=' characters to make it a multiple of
+      // 4. Our parser code expects valid base64.
+      encoded_marker += '=';
+    }
+    ldpp_dout(this, 20) << fmt::format(FMT_STRING("EOF not reached, next_marker {}"), marker_str)
                         << dendl;
     ldpp_dout(this, 5) << fmt::format(FMT_STRING("EOF not reached, continuation token {}"), encoded_marker)
                        << dendl;
