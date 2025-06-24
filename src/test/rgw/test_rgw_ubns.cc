@@ -30,6 +30,8 @@
 #include "global/global_init.h"
 #include "rgw/rgw_client_io.h"
 #include "rgw/rgw_common.h"
+#include "rgw_auth_registry.h"
+#include "rgw_process_env.h"
 
 using namespace ::ubdb::v1;
 
@@ -64,9 +66,10 @@ public:
 using namespace rgw;
 
 // Stole this from test_rgw_lua.cc. Set up a req_state s for testing.
-#define DEFINE_REQ_STATE \
-  RGWEnv e;              \
-  req_state s(g_ceph_context, &e, 0);
+#define DEFINE_REQ_STATE                                                       \
+  RGWProcessEnv pe;                                                            \
+  RGWEnv e;                                                                    \
+  req_state s(g_ceph_context, pe, &e, 0);
 
 class LockedSet {
 
