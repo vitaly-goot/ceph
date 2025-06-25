@@ -1240,9 +1240,28 @@ std::vector<int> HandoffHelperImpl::verify_permissions(const RGWOp* op, req_stat
     case AUTHORIZATION_RESULT_CODE_ALLOW:
       retcode = 0;
       break;
+    case AUTHORIZATION_RESULT_CODE_ALLOW_IF_NOTFOUND:
+      retcode = -ERR_ALLOW_IF_NOT_FOUND;
+      s->handoff_authz->set_allow_if_not_found(true);
+      ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned AUTHORIZATION_RESULT_CODE_ALLOW_IF_NOTFOUND, retcode={}"),
+          __func__, index, result_size, retcode)
+                        << dendl;
+      break;
     case AUTHORIZATION_RESULT_CODE_DENY:
       retcode = -EACCES;
       ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned AUTHORIZATION_RESULT_CODE_DENY, retcode={}"),
+          __func__, index, result_size, retcode)
+                        << dendl;
+      break;
+    case AUTHORIZATION_RESULT_CODE_ACCOUNT_SUSPENDED:
+      retcode = -EACCES;
+      ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned AUTHORIZATION_RESULT_CODE_ACCOUNT_SUSPENDED, retcode={}"),
+          __func__, index, result_size, retcode)
+                        << dendl;
+      break;
+    case AUTHORIZATION_RESULT_CODE_BUCKET_NOT_FOUND:
+      retcode = -EACCES;
+      ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}: authz question {}/{} returned AUTHORIZATION_RESULT_CODE_BUCKET_NOT_FOUND, retcode={}"),
           __func__, index, result_size, retcode)
                         << dendl;
       break;

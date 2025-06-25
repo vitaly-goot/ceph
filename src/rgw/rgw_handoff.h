@@ -409,6 +409,9 @@ private:
   bool enabled_ = false;
   std::optional<std::string> trans_id_suffix_;
 
+  // keep state of auth-z conditional permission.
+  bool allow_if_not_found_ = false;
+
   Target target_;
   std::stack<Target> saved_targets_;
 
@@ -484,6 +487,18 @@ public:
   void clear_trans_id_suffix()
   {
     trans_id_suffix_ = std::nullopt;
+  }
+
+  /**
+   * @brief Return the allow_if_not_found flag.
+   *
+   * @return bool The flag indicating conditional permission for the client.
+   */
+  const bool allow_if_not_found() const { return allow_if_not_found_; }
+
+  void set_allow_if_not_found(const bool allow_if_not_found)
+  {
+    allow_if_not_found_ = allow_if_not_found;
   }
 
   /**
