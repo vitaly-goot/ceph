@@ -247,7 +247,10 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
       dout(2) << "overriding permissions due to system operation" << dendl;
     } else if (s->auth.identity->is_admin_of(s->user->get_id())) {
       dout(2) << "overriding permissions due to admin operation" << dendl;
+    } else if (s->handoff_authz->allow_if_not_found()) {
+      dout(2) << "conditional permissions granted to proceed ..." << dendl;
     } else {
+      // all non zero ret value would early return here:
       return ret;
     }
   }

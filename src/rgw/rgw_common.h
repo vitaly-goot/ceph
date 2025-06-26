@@ -319,6 +319,9 @@ static inline const char* to_mime_type(const RGWFormat f)
 #define ERR_UBNS_BUCKET_ALREADY_OWNED_BY_YOU 12002
 #define ERR_UBNS_BAD_REQUEST 12003
 
+// Authorization conditional error:
+#define ERR_ALLOW_IF_NOT_FOUND 13008
+
 // STS Errors
 #define ERR_PACKED_POLICY_TOO_LARGE 2400
 #define ERR_INVALID_IDENTITY_TOKEN  2401

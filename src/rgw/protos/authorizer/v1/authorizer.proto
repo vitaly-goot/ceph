@@ -4,7 +4,7 @@ package authorizer.v1;
 
 import "google/protobuf/timestamp.proto";
 
-option go_package = "bits.linode.com/LinodeApi/obj-endpoint/gen/proto/authorizer/v1";
+option go_package = "bits.linode.com/LinodeAPI/obj-endpoint/gen/proto/authorizer/v1";
 
 // Errors mapping to S3 errors.
 // See: https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html#RESTErrorResponses
@@ -121,6 +121,12 @@ enum AuthorizationResultCode {
     AUTHORIZATION_RESULT_CODE_ACCOUNT_SUSPENDED = 6;
     // Bucket not found
     AUTHORIZATION_RESULT_CODE_BUCKET_NOT_FOUND = 7;
+    // Due to the limitation of the Authorizer only being able to return
+    // a binary (allow/deny) response for each question, we use this gRPC
+    // code to identify when the response to a request for either GetObject
+    // or GetObjectVersion should be handled differently by the caller.
+    // Context: https://docs.google.com/document/d/1WW0Ex4Cbd43Kh21tuotCH_p5vEUaBjrKOj9d3urCY10
+    AUTHORIZATION_RESULT_CODE_ALLOW_IF_NOTFOUND = 8;
     // XXX this will almost certainly need extended.
 }
 
@@ -308,4 +314,12 @@ message AuthorizeV2Response
 {
     // One or more answers to the questions in the AuthorizeV2Request.
     repeated AuthorizeV2Answer answers = 1;
+}
+
+// request-info required by policy evaluation to authorize request.
+message RequestInfoHeaders {
+  optional string x_envoy_external_address= 1;
+  optional string x_forward_proto = 2;
+  optional string referer = 3;
+  optional string user_agent = 4;
 }
