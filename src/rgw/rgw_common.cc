@@ -31,6 +31,10 @@
 #include "rgw_bucket_sync.h"
 #include "rgw_sync_policy.h"
 
+// We need the non-fwd declarations of HandoffAuthzState for the req_state
+// constructor implementation.
+#include "rgw_handoff.h"
+
 #include "services/svc_zone.h"
 
 #include <sstream>
@@ -132,6 +136,10 @@ rgw_http_errors rgw_http_s3_errors({
     { ERR_NO_SUCH_TAG_SET, {404, "NoSuchTagSet"}},
     { ERR_NO_SUCH_BUCKET_ENCRYPTION_CONFIGURATION, {404, "ServerSideEncryptionConfigurationNotFoundError"}},
     { ERR_NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION, {404, "NoSuchPublicAccessBlockConfiguration"}},
+
+    { ERR_UBNS_INVALID_OR_MISSING_PARAMETER, {400, "InvalidOrMissingParameter"}},
+    { ERR_UBNS_BUCKET_ALREADY_OWNED_BY_YOU, {409, "BucketAlreadyOwnedByYou"}},
+    { ERR_UBNS_BAD_REQUEST, {400, "BadRequest"}},
 });
 
 rgw_http_errors rgw_http_swift_errors({
@@ -288,9 +296,13 @@ req_state::~req_state() {
 std::ostream& req_state::gen_prefix(std::ostream& out) const
 {
   auto p = out.precision();
-  return out << "req " << id << ' '
+  out << "req " << id << ' '
       << std::setprecision(3) << std::fixed << time_elapsed() // '0.123s'
       << std::setprecision(p) << std::defaultfloat << ' ';
+  if (!otel_trace_id.empty()) {
+    out << "trace_id " << otel_trace_id << ' ';
+  }
+  return out;
 }
 
 bool search_err(rgw_http_errors& errs, int err_no, int& http_ret, string& code)
@@ -2777,6 +2789,9 @@ void RGWUserInfo::dump(Formatter *f) const
   case TYPE_LDAP:
     user_source_type = "ldap";
     break;
+  case TYPE_HANDOFF:
+    user_source_type = "handoff";
+    break;
   case TYPE_NONE:
     user_source_type = "none";
     break;
@@ -2833,6 +2848,8 @@ void RGWUserInfo::decode_json(JSONObj *obj)
     type = TYPE_KEYSTONE;
   } else if (user_source_type == "ldap") {
     type = TYPE_LDAP;
+  } else if (user_source_type == "handoff") {
+    type = TYPE_HANDOFF;
   } else if (user_source_type == "none") {
     type = TYPE_NONE;
   }

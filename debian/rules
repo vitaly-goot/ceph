@@ -5,13 +5,17 @@ export DESTDIR=$(CURDIR)/debian/tmp
 
 include /usr/share/dpkg/default.mk
 
-ifneq (,$(findstring WITH_STATIC_LIBSTDCXX,$(CEPH_EXTRA_CMAKE_ARGS)))
+extraopts += -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11
+# OBJGEN1-917
+# We are seeing the same OSD crash with Ceph build with static libstdcxx
+# Removing this flags for all
+#ifneq (,$(findstring WITH_STATIC_LIBSTDCXX,$(CEPH_EXTRA_CMAKE_ARGS)))
   # dh_auto_build sets LDFLAGS with `dpkg-buildflags --get LDFLAGS` on ubuntu,
   # which makes the application aborts when the shared library throws
   # exception, so strip this linker option,
   # see http://tracker.ceph.com/issues/25209
   export DEB_LDFLAGS_MAINT_STRIP = -Wl,-Bsymbolic-functions
-endif
+#endif
 ifeq (,$(findstring WITH_SEASTAR,$(CEPH_EXTRA_CMAKE_ARGS)))
   export CEPH_OSD_BASENAME = ceph-osd
 else
@@ -40,6 +44,8 @@ extraopts += -DWITH_RBD_SSD_CACHE=ON
 extraopts += -DCMAKE_INSTALL_LIBDIR=/usr/lib
 extraopts += -DCMAKE_INSTALL_LIBEXECDIR=/usr/libexec
 extraopts += -DCMAKE_INSTALL_SYSCONFDIR=/etc
+extraopts += -DCMAKE_BUILD_TYPE=RelWithDebInfo
+extraopts += -DCMAKE_EXE_LINKER_FLAGS='-fuse-ld=gold'
 ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
   NUMJOBS = $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
   extraopts += -DBOOST_J=$(NUMJOBS)
@@ -149,4 +155,7 @@ override_dh_python3:
 # do not run tests
 override_dh_auto_test:
 
-.PHONY: override_dh_autoreconf override_dh_auto_configure override_dh_auto_clean override_dh_auto_install override_dh_installlogrotate override_dh_installinit override_dh_strip override_dh_auto_test
+# do not run dwz (it's really slow!)
+override_dh_dwz:
+
+.PHONY: override_dh_autoreconf override_dh_auto_configure override_dh_auto_clean override_dh_auto_install override_dh_installlogrotate override_dh_installinit override_dh_strip override_dh_auto_test override_dh_dwz

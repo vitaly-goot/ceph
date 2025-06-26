@@ -1,7 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#include "common/errno.h"
 #include "common/Throttle.h"
 #include "common/WorkQueue.h"
 #include "include/scope_guard.h"
@@ -218,6 +217,24 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
     }
   }
 
+  if (s->handoff_authz->enabled()) {
+    // Copy some state from the request into handoff authz state. This makes
+    // handoff authz a lot easier to test, because we don't have to mock
+    // rgw::sal::Bucket and rgw::sal::Object just to get their names.
+    if (s->bucket_name != "") {
+      // This is set without a bucket object in RGWCreateBucket.
+      s->handoff_authz->set_bucket_name(s->bucket_name);
+    } else if (s->bucket) {
+      // I don't know why we'd not set the name when creating the bucket
+      // object, but let's be safe.
+      s->handoff_authz->set_bucket_name(s->bucket->get_name());
+    }
+    if (s->object) {
+      // There's no equivalent 'object_name' field, alas.
+      s->handoff_authz->set_object_key_name(s->object->get_name());
+    }
+  }
+
   ldpp_dout(op, 2) << "verifying op permissions" << dendl;
   {
     auto span = tracing::rgw::tracer.add_span("verify_permission", s->trace);
@@ -230,7 +247,10 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
       dout(2) << "overriding permissions due to system operation" << dendl;
     } else if (s->auth.identity->is_admin_of(s->user->get_id())) {
       dout(2) << "overriding permissions due to admin operation" << dendl;
+    } else if (s->handoff_authz->allow_if_not_found()) {
+      dout(2) << "conditional permissions granted to proceed ..." << dendl;
     } else {
+      // all non zero ret value would early return here:
       return ret;
     }
   }
@@ -273,8 +293,6 @@ int process_request(const RGWProcessEnv& penv,
                     int* http_ret)
 {
   int ret = client_io->init(g_ceph_context);
-  dout(1) << "====== starting new request req=" << hex << req << dec
-	  << " =====" << dendl;
   perfcounter->inc(l_rgw_req);
 
   RGWEnv& rgw_env = client_io->get_env();
@@ -282,11 +300,61 @@ int process_request(const RGWProcessEnv& penv,
   req_state rstate(g_ceph_context, penv, &rgw_env, req->id);
   req_state *s = &rstate;
 
+  //
+  // Tracing setup.
+  //
+
+  // Check for the traceparent header.
+  const char* traceparent_char = rgw_env.get("HTTP_TRACEPARENT");
+  if (traceparent_char) {
+    std::string traceparent = traceparent_char;
+    boost::algorithm::trim(traceparent);
+    s->otel_traceparent = std::move(traceparent);
+  }
+  if (tracing::rgw::tracer.is_enabled()) {
+    // Likewise the tracestate header, but only if tracing is enabled -
+    // tracestate is only used for Jaeger/Otel traces, whereas traceparent
+    // contains the trace ID which is also used for logging.
+    const char* tracestate_char = rgw_env.get("HTTP_TRACESTATE");
+    if (tracestate_char) {
+      std::string tracestate = tracestate_char;
+      boost::algorithm::trim(tracestate);
+      s->otel_tracestate = std::move(tracestate);
+    }
+  }
+
+  std::string tracestr;
+  if (!s->otel_traceparent.empty()) {
+    auto opt_traceid = get_traceid_from_traceparent(s, s->otel_traceparent);
+    if (opt_traceid) {
+      ldpp_dout(s, 20) << "traceparent header present, trace_id=" << *opt_traceid << dendl;
+
+      // Set the trace ID for req_state s. This will helpfully flow through
+      // automatically to op, set below, because RGWOp::gen_prefix() will use
+      // its consituent req_state to generate the prefix.
+      s->otel_trace_id = *opt_traceid;
+      // The the trace ID in the RGWRequest passed in to us. This allows us to
+      // use it in the beast access log line, which is output by the caller of
+      // process_request().
+      req->otel_trace_id = *opt_traceid;
+      // This is used in the 'starting' and 'req done' log lines below, which
+      // use dout() instead of ldpp_dout().
+      tracestr = " trace_id " + *opt_traceid;
+    }
+  }
+  // End of tracing setup.
+
+  dout(1) << "====== starting new request req=" << hex << req << dec
+          << tracestr << " =====" << dendl;
+
   s->ratelimit_data = penv.ratelimiting->get_active();
 
   rgw::sal::Driver* driver = penv.driver;
   std::unique_ptr<rgw::sal::User> u = driver->get_user(rgw_user());
   s->set_user(u);
+
+  // Save the (possibly null) UBNS client pointer so we can issue gRPC requests.
+  s->ubns_client = penv.ubns_client;
 
   if (ret < 0) {
     s->cio = client_io;
@@ -298,8 +366,16 @@ int process_request(const RGWProcessEnv& penv,
   s->trans_id = driver->zone_unique_trans_id(req->id);
   s->host_id = driver->get_host_id();
   s->yield = yield;
+  s->handoff_helper = penv.handoff_helper; // May be empty.
+  // Initialise authz state, using a pointer to the (possibly empty)
+  // HandoffHelper object.
+  s->handoff_authz = std::make_unique<::rgw::HandoffAuthzState>(s->handoff_helper);
 
   ldpp_dout(s, 2) << "initializing for trans_id = " << s->trans_id << dendl;
+
+  // Akamai: These variables are declared in a C-style block here because
+  // there are some goto statements later, and C++ doesn't allow jumping over
+  // variable declarations.
 
   RGWOp* op = nullptr;
   int init_error = 0;
@@ -311,6 +387,7 @@ int process_request(const RGWProcessEnv& penv,
                                                frontend_prefix,
                                                client_io, &mgr, &init_error);
   rgw::dmclock::SchedulerCompleter c;
+  std::string trace_name;
 
   if (init_error != 0) {
     abort_early(s, nullptr, init_error, nullptr, yield);
@@ -326,6 +403,23 @@ int process_request(const RGWProcessEnv& penv,
     abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler, yield);
     goto done;
   }
+
+  // Start tracing earlier than stock RGW. We want to trace the entire
+  // request, not just post-authentication.
+  trace_name = std::string(op->name()) + " " + s->trans_id;
+  s->trace_enabled = tracing::rgw::tracer.is_enabled();
+  if (!s->otel_traceparent.empty()) {
+    s->trace = tracing::rgw::tracer.start_trace_with_req_state_parent(
+        trace_name, s->trace_enabled, s->otel_traceparent, s->otel_tracestate);
+  } else {
+    s->trace = tracing::rgw::tracer.start_trace(trace_name, s->trace_enabled);
+  }
+  s->trace->SetAttribute(tracing::rgw::OP, op->name());
+  s->trace->SetAttribute(tracing::rgw::TYPE, tracing::rgw::REQUEST);
+  if (s->cct->_conf->rgw_jaeger_agent_extra_attributes) {
+    set_extra_trace_attributes(s, s->trace);
+  }
+
   {
     s->trace_enabled = tracing::rgw::tracer.is_enabled();
     std::string script;
@@ -355,12 +449,17 @@ int process_request(const RGWProcessEnv& penv,
   s->op_type = op->get_type();
 
   try {
-    ldpp_dout(op, 2) << "verifying requester" << dendl;
-    ret = op->verify_requester(*penv.auth_registry, yield);
-    if (ret < 0) {
-      dout(10) << "failed to authorize request" << dendl;
-      abort_early(s, op, ret, handler, yield);
-      goto done;
+    {
+      ldpp_dout(op, 2) << "verifying requester" << dendl;
+      auto span = tracing::rgw::tracer.add_span("verify_requester", s->trace);
+      std::swap(span, s->trace);
+      ret = op->verify_requester(*penv.auth_registry, yield);
+      std::swap(span, s->trace);
+      if (ret < 0) {
+        dout(10) << "failed to authorize request" << dendl;
+        abort_early(s, op, ret, handler, yield);
+        goto done;
+      }
     }
 
     /* FIXME: remove this after switching all handlers to the new authentication
@@ -382,12 +481,6 @@ int process_request(const RGWProcessEnv& penv,
       abort_early(s, op, -ERR_USER_SUSPENDED, handler, yield);
       goto done;
     }
-
-
-    const auto trace_name = std::string(op->name()) + " " + s->trans_id;
-    s->trace = tracing::rgw::tracer.start_trace(trace_name, s->trace_enabled);
-    s->trace->SetAttribute(tracing::rgw::OP, op->name());
-    s->trace->SetAttribute(tracing::rgw::TYPE, tracing::rgw::REQUEST);
 
     ret = rgw_process_authenticated(handler, op, req, s, yield, driver);
     if (ret < 0) {
@@ -450,6 +543,7 @@ done:
 
   if (op) {
     op_ret = op->get_ret();
+    req->uri_log_rewrite = op->get_uri_log_rewrite();
     ldpp_dout(op, 2) << "op status=" << op_ret << dendl;
     ldpp_dout(op, 2) << "http status=" << s->err.http_ret << dendl;
   } else {
@@ -463,12 +557,12 @@ done:
   if (latency) {
     *latency = lat;
   }
-  dout(1) << "====== req done req=" << hex << req << dec
-	  << " op status=" << op_ret
-	  << " http_status=" << s->err.http_ret
-	  << " latency=" << lat
-	  << " ======"
-	  << dendl;
+  dout(1) << "====== req done req=" << hex << req << dec << tracestr
+          << " op status=" << op_ret
+          << " http_status=" << s->err.http_ret
+          << " latency=" << lat
+          << " ======"
+          << dendl;
 
   return (ret < 0 ? ret : s->err.ret);
 } /* process_request */

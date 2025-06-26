@@ -17,6 +17,8 @@ struct RGWRequest
   uint64_t id;
   req_state *s;
   RGWOp *op;
+  std::optional<RGWOp::UriLogRewrite> uri_log_rewrite;
+  std::string otel_trace_id; // OpenTelemetry trace ID.
 
   explicit RGWRequest(uint64_t id) : id(id), s(NULL), op(NULL) {}
 

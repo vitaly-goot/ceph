@@ -194,7 +194,11 @@ protected:
     bufferlist data;
     std::tie(rv, data) = rgw_rest_read_all_input(s, max_len);
     if (rv >= 0) {
-      do_aws4_auth_completion();
+      if (g_ceph_context->_conf->rgw_akamai_ceph_200_revert) {
+        do_aws4_auth_completion();
+      } else {
+        rv = do_aws4_auth_completion();
+      }
     }
 
     return std::make_tuple(rv, std::move(data));
@@ -205,7 +209,11 @@ protected:
                      uint64_t max_len, bool *empty) {
     int r = rgw_rest_get_json_input(cct, s, out, max_len, empty);
     if (r >= 0) {
-      do_aws4_auth_completion();
+      if (g_ceph_context->_conf->rgw_akamai_ceph_200_revert) {
+        do_aws4_auth_completion();
+      } else {
+        r = do_aws4_auth_completion();
+      }
     }
     return r;
   }
@@ -282,6 +290,11 @@ public:
   virtual dmc::client_id dmclock_client() { return dmc::client_id::metadata; }
   virtual dmc::Cost dmclock_cost() { return 1; }
   virtual void write_ops_log_entry(rgw_log_entry& entry) const {};
+
+  using UriLogRewrite = std::function<const std::string(const std::string&)>;
+  virtual std::optional<UriLogRewrite> get_uri_log_rewrite() const {
+    return std::nullopt;
+  }
 };
 
 class RGWDefaultResponseOp : public RGWOp {
@@ -375,6 +388,11 @@ protected:
   bool get_retention;
   bool get_legal_hold;
 
+  // optional partNumber param for s3
+  std::optional<int> multipart_part_num;
+  // PartsCount response when partNumber is specified
+  std::optional<int> multipart_parts_count;
+  
   int init_common();
 public:
   RGWGetObj() {
@@ -1065,12 +1083,14 @@ public:
 class RGWStatBucket : public RGWOp {
 protected:
   std::unique_ptr<rgw::sal::Bucket> bucket;
+  bool report_stats{true};
 
 public:
   int verify_permission(optional_yield y) override;
   void pre_exec() override;
   void execute(optional_yield y) override;
 
+  virtual int get_params(optional_yield y) = 0;
   void send_response() override = 0;
   const char* name() const override { return "stat_bucket"; }
   RGWOpType get_type() override { return RGW_OP_STAT_BUCKET; }
@@ -1845,10 +1865,14 @@ public:
 
 class RGWInitMultipart : public RGWOp {
 protected:
+  RGWObjTags obj_tags;
   std::string upload_id;
   RGWAccessControlPolicy policy;
   ceph::real_time mtime;
   jspan multipart_trace;
+  // object lock
+  std::optional<RGWObjectRetention> obj_retention = std::nullopt;
+  std::optional<RGWObjectLegalHold> obj_legal_hold = std::nullopt;
 
 public:
   RGWInitMultipart() {}
@@ -2066,6 +2090,11 @@ protected:
   bool acl_allowed = false;
   bool bypass_perm;
   bool bypass_governance_mode;
+
+  // In Handoff Authz we'll send one authz request per item. Rather than
+  // change the signature of handle_individual_object(), just keep count and
+  // use the counter to mutate the transaction ID.
+  uint64_t handoff_item_count = 0;
 
 public:
   RGWDeleteMultiObj() {

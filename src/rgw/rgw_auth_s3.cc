@@ -1454,11 +1454,11 @@ size_t AWSv4ComplMulti::recv_body(char* const buf, const size_t buf_max)
   ldout(cct(), 20) << "AWSv4ComplMulti::recv_body() buf_max: " << buf_max << dendl;
 
   uint32_t cnt = 0;
-  while (total < buf_max && !eof) {
+  do {
     ReceiveChunkResult rcr =
       recv_chunk(buf + total, buf_max - total, cnt++, eof);
     total += rcr.received;
-  }
+  } while (total < buf_max && !eof);
 
   dout(20) << "AWSv4ComplMulti: received=" << total << dendl;
   return total;
@@ -1618,30 +1618,36 @@ bool AWSv4ComplMulti::complete()
   }
 } /* AWSv4Complmulti:: complete */
 
-rgw::auth::Completer::cmplptr_t
-AWSv4ComplMulti::create(const req_state* const s,
-                        std::string_view date,
-                        std::string_view credential_scope,
-                        std::string_view seed_signature,
-			uint32_t flags,
-                        const boost::optional<std::string>& secret_key)
-{
-  if (!secret_key) {
-    /* Some external authorizers (like Keystone) aren't fully compliant with
-     * AWSv4. They do not provide the secret_key which is necessary to handle
-     * the streamed upload. */
-    throw -ERR_NOT_IMPLEMENTED;
+rgw::auth::Completer::cmplptr_t AWSv4ComplMulti::create(
+    const req_state *const s, std::string_view date,
+    std::string_view credential_scope, std::string_view seed_signature,
+    uint32_t flags,
+    const boost::optional<std::string> &secret_key,
+    const std::optional<sha256_digest_t> &cached_signing_key) {
+
+  if (cached_signing_key.has_value()) {
+    return std::make_shared<AWSv4ComplMulti>(
+        s, std::move(date), std::move(credential_scope),
+        std::move(seed_signature), flags, *cached_signing_key);
+
+  } else {
+    if (!secret_key) {
+      /* Some external authorizers (like Keystone) aren't fully compliant with
+       * AWSv4. They do not provide the secret_key which is necessary to handle
+       * the streamed upload. */
+      ldpp_dout(s, 1) << __func__
+                      << ": chunked upload cannot proceed without a "
+                         "secret key or cached signing key"
+                      << dendl;
+      throw -ERR_NOT_IMPLEMENTED;
+    }
+
+    const auto signing_key = rgw::auth::s3::get_v4_signing_key(
+        s->cct, credential_scope, *secret_key, s);
+    return std::make_shared<AWSv4ComplMulti>(
+        s, std::move(date), std::move(credential_scope),
+        std::move(seed_signature), flags, signing_key);
   }
-
-  const auto signing_key = \
-    rgw::auth::s3::get_v4_signing_key(s->cct, credential_scope, *secret_key, s);
-
-  return std::make_shared<AWSv4ComplMulti>(s,
-                                           std::move(date),
-                                           std::move(credential_scope),
-                                           std::move(seed_signature),
-					   flags,
-                                           signing_key);
 }
 
 size_t AWSv4ComplSingle::recv_body(char* const buf, const size_t max)

@@ -5,6 +5,9 @@
 
 #include <memory>
 
+#include "rgw/rgw_handoff.h"
+#include "rgw/rgw_ubns.h"
+
 class ActiveRateLimiter;
 class OpsLogSink;
 class RGWREST;
@@ -40,6 +43,9 @@ struct RGWProcessEnv {
   OpsLogSink *olog = nullptr;
   std::unique_ptr<rgw::auth::StrategyRegistry> auth_registry;
   ActiveRateLimiter* ratelimiting = nullptr;
+  std::shared_ptr<rgw::HandoffHelper> handoff_helper;
+  // Point (optionally) to the ubns_client, with its persistent gRPC channel.
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
 
 #ifdef WITH_ARROW_FLIGHT
   // managed by rgw:flight::FlightFrontend in rgw_flight_frontend.cc

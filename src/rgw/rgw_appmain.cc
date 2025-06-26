@@ -55,6 +55,7 @@
 #include "rgw_kmip_client.h"
 #include "rgw_kmip_client_impl.h"
 #include "rgw_perf_counters.h"
+#include "rgw_secret_encryption.h"
 #include "rgw_signal.h"
 #ifdef WITH_RADOSGW_AMQP_ENDPOINT
 #include "rgw_amqp.h"
@@ -198,7 +199,13 @@ void rgw::AppMain::init_numa()
 
 void rgw::AppMain::init_storage()
 {
-    auto run_gc =
+  // Initialize before storage store is open
+  rgw::secret::init_encrypter(g_ceph_context,
+                              g_conf().get_val<bool>("rgw_secret_encrypt_enabled"),
+                              g_conf().get_val<std::string>("rgw_secret_encrypt_key_file"),
+                              g_conf().get_val<uint64_t>("rgw_secret_encrypt_key_reload_interval"));
+
+  auto run_gc =
     (g_conf()->rgw_enable_gc_threads &&
       ((!nfs) || (nfs && g_conf()->rgw_nfs_run_gc_threads)));
 
@@ -268,16 +275,22 @@ void rgw::AppMain::cond_init_apis()
     const bool s3website_enabled = apis_map.count("s3website") > 0;
     const bool sts_enabled = apis_map.count("sts") > 0;
     const bool iam_enabled = apis_map.count("iam") > 0;
+    const bool storequery_enabled = apis_map.count("storequery") > 0;
+    if (storequery_enabled) {
+      dout(0) << "Akamai StoreQuery enabled" << dendl;
+    } else {
+      dout(0) << "Akamai StoreQuery present but not enabled" << dendl;
+    }
     const bool pubsub_enabled =
         apis_map.count("pubsub") > 0 || apis_map.count("notifications") > 0;
     // Swift API entrypoint could placed in the root instead of S3
     const bool swift_at_root = g_conf()->rgw_swift_url_prefix == "/";
     if (apis_map.count("s3") > 0 || s3website_enabled) {
       if (!swift_at_root) {
-        rest.register_default_mgr(set_logging(
-            rest_filter(env.driver, RGW_REST_S3,
-                        new RGWRESTMgr_S3(s3website_enabled, sts_enabled,
-                                          iam_enabled, pubsub_enabled))));
+        rest.register_default_mgr(set_logging(rest_filter(
+            env.driver, RGW_REST_S3,
+            new RGWRESTMgr_S3(s3website_enabled, sts_enabled, iam_enabled,
+                              pubsub_enabled, storequery_enabled))));
       } else {
         derr << "Cannot have the S3 or S3 Website enabled together with "
              << "Swift API placed in the root of hierarchy" << dendl;
@@ -409,12 +422,36 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
   ratelimiter.reset(new ActiveRateLimiter{dpp->get_cct()});
   ratelimiter->start();
 
+  /* Initialise Akamai UBNS. We have to explicitly pass this pointer around a
+   * fair bit in v17, via process_request() and into req_state, the 's'
+   * pointer that all operations receive. We end up placing it in the
+   * ProcessEnv, because in v18 it's a tiny bit better due to
+   * process_request() already taking a ProcessEnv* rather than an explicit
+   * list of pointers to various items.
+   */
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
+  if (g_conf()->rgw_ubns_enabled) {
+    if (!rgw::ubns_validate_startup_configuration(g_conf()) != 0) {
+      derr << "FATAL: UBNS configuration is invalid" << dendl;
+      return EINVAL;
+    }
+    dout(1) << "Akamai UBNS enabled" << dendl;
+    ubns_client = std::make_shared<rgw::UBNSClient>();
+    ubns_client->init(dpp->get_cct(), "");
+  } else {
+    dout(1) << "Akamai UBNS present but disabled" << dendl;
+  }
+
   // initialize RGWProcessEnv
   env.rest = &rest;
   env.olog = olog;
   env.auth_registry = rgw::auth::StrategyRegistry::create(
       dpp->get_cct(), *implicit_tenant_context, env.driver);
   env.ratelimiting = ratelimiter.get();
+  env.ubns_client = ubns_client;
+  // Store the handoff helper created by ExternalAuthStrategy. This may be
+  // null, that's ok.
+  env.handoff_helper = rgw::auth::s3::g_handoff_helper;
 
   int fe_count = 0;
   for (multimap<string, RGWFrontendConfig *>::iterator fiter = fe_map.begin();

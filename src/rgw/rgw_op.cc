@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 smarttab ft=cpp
 
 #include <errno.h>
+#include <rgw_common.h>
 #include <stdlib.h>
 #include <system_error>
 #include <unistd.h>
@@ -13,14 +14,15 @@
 #include <boost/optional.hpp>
 #include <boost/utility/in_place_factory.hpp>
 
-#include "include/scope_guard.h"
 #include "common/Clock.h"
 #include "common/armor.h"
+#include "common/ceph_json.h"
+#include "common/dout.h"
 #include "common/errno.h"
 #include "common/mime.h"
-#include "common/utf8.h"
-#include "common/ceph_json.h"
 #include "common/static_ptr.h"
+#include "common/utf8.h"
+#include "include/scope_guard.h"
 #include "rgw_tracer.h"
 
 #include "rgw_rados.h"
@@ -54,6 +56,8 @@
 #include "rgw_sal_rados.h"
 #include "rgw_lua_data_filter.h"
 #include "rgw_lua.h"
+#include "rgw_ubns.h"
+#include "rgw_ubns_machine.h"
 
 #include "services/svc_zone.h"
 #include "services/svc_quota.h"
@@ -358,10 +362,13 @@ static int read_bucket_policy(const DoutPrefixProvider *dpp,
     return 0;
   }
 
-  int ret = rgw_op_get_bucket_policy_from_attr(dpp, s->cct, driver, bucket_info, bucket_attrs, policy, y);
+  int ret = 0;
+  // if (!s->handoff_authz->enabled()) {
+  ret = rgw_op_get_bucket_policy_from_attr(dpp, s->cct, driver, bucket_info, bucket_attrs, policy, y);
   if (ret == -ENOENT) {
-      ret = -ERR_NO_SUCH_BUCKET;
+    ret = -ERR_NO_SUCH_BUCKET;
   }
+  // }
 
   return ret;
 }
@@ -446,6 +453,14 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
       ret = -ENOENT;
     }
   }
+  if (ret == -ENOENT && !upload_id.empty()) {
+    /* multipart upload */
+    ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message =
+        "The specified multipart upload does not exist. The upload ID might "
+        "be invalid, "
+        "or the multipart upload might have been aborted or completed";
+  }
 
   return ret;
 }
@@ -458,6 +473,7 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
  */
 int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* driver, req_state* s, optional_yield y)
 {
+  // HANDOFF: Visited.
   int ret = 0;
 
   string bi = s->info.args.get(RGW_SYS_PARAM_PREFIX "bucket-instance");
@@ -526,16 +542,57 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     }
     
     s->bucket_mtime = s->bucket->get_modification_time();
+    // HANDOFF: Allow read of bucket attrs, these aren't just for authz.
     s->bucket_attrs = s->bucket->get_attrs();
-    ret = read_bucket_policy(dpp, driver, s, s->bucket->get_info(),
-			     s->bucket->get_attrs(),
-			     s->bucket_acl.get(), s->bucket->get_key(), y);
-    acct_acl_user = {
-      s->bucket->get_info().owner,
-      s->bucket_acl->get_owner().get_display_name(),
-    };
 
-    s->bucket_owner = s->bucket_acl->get_owner();
+    if (s->handoff_authz->enabled()) {
+      // HANDOFF: We can skip the policy read, but we *must* set the
+      // s->bucket_owner as it's used by usage logging.
+      //
+      // This call follows the chain of events that occurs when there's no
+      // policy available:
+      //
+      //   read_bucket_policy() -> rgw_op_get_bucket_policy_from_attr() ->
+      //     RGWAccessControlPolicy::create_default()
+      //
+      // The end result is that we fetch the owner from the bucket object.
+      //
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip read_bucket_policy(), fetch owner from bucket info" << dendl;
+
+      // Duplicate the check in read_bucket_policy(). I can't find any code
+      // that actually sets this flag (nothing calls
+      // driver->set_bucket_enabled(), which is the only thing that sets it in
+      // the rados driver).
+      RGWBucketInfo bucket_info = s->bucket->get_info();
+      if (!s->system_request && bucket_info.flags & BUCKET_SUSPENDED) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " is suspended" << dendl;
+        return -ERR_USER_SUSPENDED;
+      }
+      // Duplicate the user load in rgw_op_get_bucket_policy_from_attr() and
+      // make sure the owner user is loaded.
+      rgw_user owner = bucket_info.owner;
+      std::unique_ptr<rgw::sal::User> user = driver->get_user(owner);
+      int r = user->load_user(dpp, y);
+      if (r < 0) {
+        ldpp_dout(dpp, 0) << "NOTICE: bucket " << bucket_info.bucket.name
+                          << " owner failed to load" << dendl;
+        return r;
+      }
+      s->bucket_owner = owner;
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): set bucket_owner: " << owner.to_str() << dendl;
+
+    } else {
+      ret = read_bucket_policy(dpp, driver, s, s->bucket->get_info(),
+          s->bucket->get_attrs(),
+          s->bucket_acl.get(), s->bucket->get_key(), y);
+      acct_acl_user = {
+        s->bucket->get_info().owner,
+        s->bucket_acl->get_owner().get_display_name(),
+      };
+
+      s->bucket_owner = s->bucket_acl->get_owner();
+    }
 
     std::unique_ptr<rgw::sal::ZoneGroup> zonegroup;
     int r = driver->get_zonegroup(s->bucket->get_info().zonegroup, &zonegroup);
@@ -574,75 +631,94 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
       return -EINVAL;
     }
 
-    s->bucket_access_conf = get_public_access_conf_from_attr(s->bucket->get_attrs());
-  }
-
-  /* handle user ACL only for those APIs which support it */
-  if (s->user_acl) {
-    std::unique_ptr<rgw::sal::User> acl_user = driver->get_user(acct_acl_user.uid);
-
-    ret = acl_user->read_attrs(dpp, y);
-    if (!ret) {
-      ret = get_user_policy_from_attr(dpp, s->cct, acl_user->get_attrs(), *s->user_acl);
-    }
-    if (-ENOENT == ret) {
-      /* In already existing clusters users won't have ACL. In such case
-       * assuming that only account owner has the rights seems to be
-       * reasonable. That allows to have only one verification logic.
-       * NOTE: there is small compatibility kludge for global, empty tenant:
-       *  1. if we try to reach an existing bucket, its owner is considered
-       *     as account owner.
-       *  2. otherwise account owner is identity stored in s->user->user_id.  */
-      s->user_acl->create_default(acct_acl_user.uid,
-                                  acct_acl_user.display_name);
-      ret = 0;
-    } else if (ret < 0) {
-      ldpp_dout(dpp, 0) << "NOTICE: couldn't get user attrs for handling ACL "
-          "(user_id=" << s->user->get_id() << ", ret=" << ret << ")" << dendl;
-      return ret;
+    if (s->handoff_authz->enabled()) {
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip get_public_access_conf_from_attr()" << dendl;
+    } else {
+      s->bucket_access_conf = get_public_access_conf_from_attr(s->bucket->get_attrs());
     }
   }
+
+  if (s->handoff_authz->enabled()) {
+    ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip get_user_policy_from_attr() for user ACL" << dendl;
+  } else {
+    /* handle user ACL only for those APIs which support it */
+    if (s->user_acl) {
+      std::unique_ptr<rgw::sal::User> acl_user = driver->get_user(acct_acl_user.uid);
+
+      ret = acl_user->read_attrs(dpp, y);
+      if (!ret) {
+        ret = get_user_policy_from_attr(dpp, s->cct, acl_user->get_attrs(), *s->user_acl);
+      }
+      if (-ENOENT == ret) {
+        /* In already existing clusters users won't have ACL. In such case
+         * assuming that only account owner has the rights seems to be
+         * reasonable. That allows to have only one verification logic.
+         * NOTE: there is small compatibility kludge for global, empty tenant:
+         *  1. if we try to reach an existing bucket, its owner is considered
+         *     as account owner.
+         *  2. otherwise account owner is identity stored in s->user->user_id.  */
+        s->user_acl->create_default(acct_acl_user.uid,
+            acct_acl_user.display_name);
+        ret = 0;
+      } else if (ret < 0) {
+        ldpp_dout(dpp, 0) << "NOTICE: couldn't get user attrs for handling ACL "
+                             "(user_id="
+                          << s->user->get_id() << ", ret=" << ret << ")" << dendl;
+        return ret;
+      }
+    }
+  }
+
   // We don't need user policies in case of STS token returned by AssumeRole,
   // hence the check for user type
-  if (! s->user->get_id().empty() && s->auth.identity->get_identity_type() != TYPE_ROLE) {
-    try {
-      ret = s->user->read_attrs(dpp, y);
-      if (ret == 0) {
-	auto user_policies = get_iam_user_policy_from_attr(s->cct,
-							   s->user->get_attrs(),
-							   s->user->get_tenant());
+  if (!s->user->get_id().empty() && s->auth.identity->get_identity_type() != TYPE_ROLE) {
+    if (s->handoff_authz->enabled()) {
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip get_iam_user_policy_from_attr() for STS Role" << dendl;
+    } else {
+      try {
+        ret = s->user->read_attrs(dpp, y);
+        if (ret == 0) {
+          auto user_policies = get_iam_user_policy_from_attr(s->cct,
+              s->user->get_attrs(),
+              s->user->get_tenant());
           s->iam_user_policies.insert(s->iam_user_policies.end(),
-                                      std::make_move_iterator(user_policies.begin()),
-                                      std::make_move_iterator(user_policies.end()));
-      } else {
-        if (ret == -ENOENT)
-          ret = 0;
-        else ret = -EACCES;
+              std::make_move_iterator(user_policies.begin()),
+              std::make_move_iterator(user_policies.end()));
+        } else {
+          if (ret == -ENOENT)
+            ret = 0;
+          else
+            ret = -EACCES;
+        }
+      } catch (const std::exception& e) {
+        ldpp_dout(dpp, -1) << "Error reading IAM User Policy: " << e.what() << dendl;
+        if (!s->system_request) {
+          ret = -EACCES;
+        }
       }
+    }
+  }
+
+  if (s->handoff_authz->enabled()) {
+    ldpp_dout(dpp, 20) << "handoff authz: rgw_build_bucket_policies(): Skip get_iam_policy_from_attr() for IAM policy" << dendl;
+  } else {
+    try {
+      s->iam_policy = get_iam_policy_from_attr(s->cct, s->bucket_attrs, s->bucket_tenant);
     } catch (const std::exception& e) {
-      ldpp_dout(dpp, -1) << "Error reading IAM User Policy: " << e.what() << dendl;
+      ldpp_dout(dpp, 0) << "Error reading IAM Policy: " << e.what() << dendl;
+
+      // This really shouldn't happen. We parse the policy when it's given to us,
+      // so a parsing failure here means we broke backward compatibility. The only
+      // sensible thing to do in this case is to deny access, because the policy
+      // may have.
+      //
+      // However, the only way for an administrator to repair such a bucket is to
+      // send a PutBucketPolicy or DeleteBucketPolicy request as an admin/system
+      // user. We can allow such requests, because even if the policy denied
+      // access, admin/system users override that error from verify_permission().
       if (!s->system_request) {
         ret = -EACCES;
       }
-    }
-  }
-
-  try {
-    s->iam_policy = get_iam_policy_from_attr(s->cct, s->bucket_attrs, s->bucket_tenant);
-  } catch (const std::exception& e) {
-    ldpp_dout(dpp, 0) << "Error reading IAM Policy: " << e.what() << dendl;
-
-    // This really shouldn't happen. We parse the policy when it's given to us,
-    // so a parsing failure here means we broke backward compatibility. The only
-    // sensible thing to do in this case is to deny access, because the policy
-    // may have.
-    //
-    // However, the only way for an administrator to repair such a bucket is to
-    // send a PutBucketPolicy or DeleteBucketPolicy request as an admin/system
-    // user. We can allow such requests, because even if the policy denied
-    // access, admin/system users override that error from verify_permission().
-    if (!s->system_request) {
-      ret = -EACCES;
     }
   }
 
@@ -663,6 +739,7 @@ int rgw_build_bucket_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
 int rgw_build_object_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* driver,
 			      req_state *s, bool prefetch_data, optional_yield y)
 {
+  // HANDOFF: Visited.
   int ret = 0;
 
   if (!rgw::sal::Object::empty(s->object.get())) {
@@ -675,9 +752,13 @@ int rgw_build_object_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     if (prefetch_data) {
       s->object->set_prefetch_data();
     }
-    ret = read_obj_policy(dpp, driver, s, s->bucket->get_info(), s->bucket_attrs,
-			  s->object_acl.get(), nullptr, s->iam_policy, s->bucket.get(),
-                          s->object.get(), y);
+    if (s->handoff_authz->enabled()) {
+      ldpp_dout(dpp, 20) << "handoff authz: rgw_build_object_policies(): Skip read_obj_policy()" << dendl;
+    } else {
+      ret = read_obj_policy(dpp, driver, s, s->bucket->get_info(), s->bucket_attrs,
+          s->object_acl.get(), nullptr, s->iam_policy, s->bucket.get(),
+          s->object.get(), y);
+    }
   }
 
   return ret;
@@ -883,6 +964,7 @@ static void rgw_add_grant_to_iam_environment(rgw::IAM::Environment& e, req_state
 void rgw_build_iam_environment(rgw::sal::Driver* driver,
 	                              req_state* s)
 {
+  // HANDOFF: Visited.
   const auto& m = s->info.env->get_map();
   auto t = ceph::real_clock::now();
   s->env.emplace("aws:CurrentTime", std::to_string(ceph::real_clock::to_time_t(t)));
@@ -1015,15 +1097,18 @@ int retry_raced_bucket_write(const DoutPrefixProvider *dpp, rgw::sal::Bucket* b,
 
 int RGWGetObj::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
   s->object->set_atomic();
 
   if (prefetch_data()) {
     s->object->set_prefetch_data();
   }
 
-  auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
+  if (s->handoff_authz->disabled()) {
+    auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
+  }
 
   if (torrent.get_flag()) {
     if (s->object->get_instance().empty()) {
@@ -1039,13 +1124,51 @@ int RGWGetObj::verify_permission(optional_yield y)
     }
   }
 
-  if (!verify_object_permission(this, s, action)) {
-    return -EACCES;
+  std::vector<int> h_ret;
+  size_t i_retention;
+  size_t i_legal_hold;
+
+  if (s->handoff_authz->enabled()) {
+    // Issue one Authorizer request for all possible operations.
+    const auto i_get = 0;
+    std::vector<uint64_t> ops { action };
+    // If object lock is enabled, we need to know if we can show the caller
+    // information about retention and legal hold.
+    i_retention = ops.size();
+    i_legal_hold = i_retention + 1;
+    if (s->bucket->get_info().obj_lock_enabled()) {
+      ops.push_back(rgw::IAM::s3GetObjectRetention);
+      ops.push_back(rgw::IAM::s3GetObjectLegalHold);
+    };
+
+    h_ret = s->handoff_helper->verify_permissions(this, s, ops, y);
+    ceph_assert(h_ret.size() == ops.size());
+    if (h_ret[i_get] < 0) {
+      return h_ret[i_get];
+    }
+    // We need to fall through to evaluate the object lock permissions.
+
+  } else {
+    if (!verify_object_permission(this, s, action)) {
+      return -EACCES;
+    }
   }
 
   if (s->bucket->get_info().obj_lock_enabled()) {
-    get_retention = verify_object_permission(this, s, rgw::IAM::s3GetObjectRetention);
-    get_legal_hold = verify_object_permission(this, s, rgw::IAM::s3GetObjectLegalHold);
+    if (s->handoff_authz->enabled()) {
+      // We already asked the Authorizer these questions.
+      if (h_ret[i_retention] == 0) {
+        ldpp_dout(this, 20) << "Object Lock is enabled on the bucket, get_retention set true" << dendl;
+        get_retention = true;
+      }
+      if (h_ret[i_legal_hold] == 0) {
+        ldpp_dout(this, 20) << "Object Lock is enabled on the bucket, get_legal_hold set true" << dendl;
+        get_legal_hold = true;
+      }
+    } else {
+      get_retention = verify_object_permission(this, s, rgw::IAM::s3GetObjectRetention);
+      get_legal_hold = verify_object_permission(this, s, rgw::IAM::s3GetObjectLegalHold);
+    }
   }
 
   return 0;
@@ -1078,6 +1201,10 @@ int RGWGetObjTags::verify_permission(optional_yield y)
   auto iam_action = s->object->get_instance().empty()?
     rgw::IAM::s3GetObjectTagging:
     rgw::IAM::s3GetObjectVersionTagging;
+
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, iam_action, y);
+  }
 
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
   if (has_s3_existing_tag || has_s3_resource_tag)
@@ -1114,9 +1241,14 @@ void RGWGetObjTags::execute(optional_yield y)
 
 int RGWPutObjTags::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
   auto iam_action = s->object->get_instance().empty() ?
     rgw::IAM::s3PutObjectTagging:
     rgw::IAM::s3PutObjectVersionTagging;
+
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, iam_action, y);
+  }
 
   //Using buckets tags for authorization makes more sense.
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, true);
@@ -1160,11 +1292,15 @@ int RGWDeleteObjTags::verify_permission(optional_yield y)
       rgw::IAM::s3DeleteObjectTagging:
       rgw::IAM::s3DeleteObjectVersionTagging;
 
-  auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
-  if (has_s3_existing_tag || has_s3_resource_tag)
-    rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
-  if (!verify_object_permission(this, s, iam_action))
-    return -EACCES;
+    if (s->handoff_authz->enabled()) {
+      return s->handoff_helper->verify_permission(this, s, iam_action, y);
+    }
+
+    auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
+    if (has_s3_existing_tag || has_s3_resource_tag)
+      rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
+    if (!verify_object_permission(this, s, iam_action))
+      return -EACCES;
   }
   return 0;
 }
@@ -1179,6 +1315,11 @@ void RGWDeleteObjTags::execute(optional_yield y)
 
 int RGWGetBucketTags::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketTagging, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -1208,6 +1349,11 @@ void RGWGetBucketTags::execute(optional_yield y)
 }
 
 int RGWPutBucketTags::verify_permission(optional_yield y) {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketTagging, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -1242,6 +1388,11 @@ void RGWDeleteBucketTags::pre_exec()
 
 int RGWDeleteBucketTags::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketTagging, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -1273,6 +1424,15 @@ void RGWDeleteBucketTags::execute(optional_yield y)
 
 int RGWGetBucketReplication::verify_permission(optional_yield y)
 {
+  // Handoff: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see get-bucket-replication" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetReplicationConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -1295,6 +1455,15 @@ void RGWGetBucketReplication::execute(optional_yield y)
 }
 
 int RGWPutBucketReplication::verify_permission(optional_yield y) {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see put-bucket-replication" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutReplicationConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -1339,6 +1508,15 @@ void RGWDeleteBucketReplication::pre_exec()
 
 int RGWDeleteBucketReplication::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see delete-bucket-replication" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3DeleteReplicationConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -2238,11 +2416,24 @@ void RGWGetObj::execute(optional_yield y)
   read_op->params.if_match = if_match;
   read_op->params.if_nomatch = if_nomatch;
   read_op->params.lastmod = &lastmod;
+  if (multipart_part_num) {
 
+    read_op->params.part_num = &*multipart_part_num;
+  }
   op_ret = read_op->prepare(s->yield, this);
   version_id = s->object->get_instance();
   s->obj_size = s->object->get_obj_size();
   attrs = s->object->get_attrs();
+  multipart_parts_count = read_op->params.parts_count;
+  if(s->handoff_authz->allow_if_not_found()){
+    if (op_ret == -ENOENT){
+      op_ret = -ENOENT;
+      ldpp_dout(this, 4) << "Object missing and user is allowed to get 404 info. Returning: " << op_ret << dendl;
+    } else {
+      op_ret = -EACCES;
+      ldpp_dout(this, 4) << "revoke conditional permission. Returning: " << op_ret << dendl;
+    }
+  }
   if (op_ret < 0)
     goto done_err;
 
@@ -2468,6 +2659,11 @@ int RGWGetObj::init_common()
 
 int RGWListBuckets::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3ListAllMyBuckets, y);
+  }
+
   rgw::Partition partition = rgw::Partition::aws;
   rgw::Service service = rgw::Service::s3;
 
@@ -2718,6 +2914,11 @@ void RGWStatAccount::execute(optional_yield y)
 
 int RGWGetBucketVersioning::verify_permission(optional_yield y)
 {
+  // Handoff: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketVersioning, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -2744,11 +2945,17 @@ void RGWGetBucketVersioning::execute(optional_yield y)
 
 int RGWSetBucketVersioning::verify_permission(optional_yield y)
 {
-  auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
-  if (has_s3_resource_tag)
-    rgw_iam_add_buckettags(this, s);
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketVersioning, y);
 
-  return verify_bucket_owner_or_policy(s, rgw::IAM::s3PutBucketVersioning);
+  } else {
+    auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
+    if (has_s3_resource_tag)
+      rgw_iam_add_buckettags(this, s);
+
+    return verify_bucket_owner_or_policy(s, rgw::IAM::s3PutBucketVersioning);
+  }
 }
 
 void RGWSetBucketVersioning::pre_exec()
@@ -2798,6 +3005,12 @@ void RGWSetBucketVersioning::execute(optional_yield y)
     }
   }
 
+  if (s->info.env->exists("HTTP_X_RGW_VALIDATE_ONLY")) {
+    ldpp_dout(this, 15) << "x-rgw-validate-only header set - exiting early"
+                        << dendl;
+    return;
+  }
+
   op_ret = driver->forward_request_to_master(this, s->user.get(), nullptr, in_data, nullptr, s->info, y);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
@@ -2842,6 +3055,15 @@ void RGWSetBucketVersioning::execute(optional_yield y)
 
 int RGWGetBucketWebsite::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: in gen2 we should not see get-bucket-website" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketWebsite, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -2863,6 +3085,15 @@ void RGWGetBucketWebsite::execute(optional_yield y)
 
 int RGWSetBucketWebsite::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: in gen2 we should not see put-bucket-website" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketWebsite, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -2909,6 +3140,15 @@ void RGWSetBucketWebsite::execute(optional_yield y)
 
 int RGWDeleteBucketWebsite::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: in gen2 we should not see delete-bucket-website" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3DeleteBucketWebsite, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -2951,6 +3191,11 @@ void RGWDeleteBucketWebsite::execute(optional_yield y)
 
 int RGWStatBucket::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3ListBucket, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -2970,6 +3215,11 @@ void RGWStatBucket::pre_exec()
 
 void RGWStatBucket::execute(optional_yield y)
 {
+  op_ret = get_params(y);
+  if (op_ret < 0) {
+    return;
+  }
+
   if (!s->bucket_exists) {
     op_ret = -ERR_NO_SUCH_BUCKET;
     return;
@@ -2979,11 +3229,15 @@ void RGWStatBucket::execute(optional_yield y)
   if (op_ret) {
     return;
   }
-  op_ret = bucket->update_container_stats(s);
+
+  if (report_stats) {
+    op_ret = bucket->update_container_stats(s);
+  }
 }
 
 int RGWListBucket::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
   op_ret = get_params(y);
   if (op_ret < 0) {
     return op_ret;
@@ -2996,19 +3250,23 @@ int RGWListBucket::verify_permission(optional_yield y)
 
   s->env.emplace("s3:max-keys", std::to_string(max));
 
-  auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
-  if (has_s3_resource_tag)
-    rgw_iam_add_buckettags(this, s);
+  if (s->handoff_authz->enabled()) {
+    auto operation = list_versions ? rgw::IAM::s3ListBucketVersions : rgw::IAM::s3ListBucket;
+    return s->handoff_helper->verify_permission(this, this->s, operation, y);
 
-  if (!verify_bucket_permission(this,
-                                s,
-				list_versions ?
-				rgw::IAM::s3ListBucketVersions :
-				rgw::IAM::s3ListBucket)) {
-    return -EACCES;
+  } else {
+    auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
+    if (has_s3_resource_tag)
+      rgw_iam_add_buckettags(this, s);
+
+    if (!verify_bucket_permission(this,
+            s,
+            list_versions ? rgw::IAM::s3ListBucketVersions : rgw::IAM::s3ListBucket)) {
+      return -EACCES;
+    }
+
+    return 0;
   }
-
-  return 0;
 }
 
 int RGWListBucket::parse_max_keys()
@@ -3067,6 +3325,11 @@ void RGWListBucket::execute(optional_yield y)
 
 int RGWGetBucketLogging::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, this->s, rgw::IAM::s3GetBucketLogging, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -3076,11 +3339,17 @@ int RGWGetBucketLogging::verify_permission(optional_yield y)
 
 int RGWGetBucketLocation::verify_permission(optional_yield y)
 {
-  auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
-  if (has_s3_resource_tag)
-    rgw_iam_add_buckettags(this, s);
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, this->s, rgw::IAM::s3GetBucketLocation, y);
 
-  return verify_bucket_owner_or_policy(s, rgw::IAM::s3GetBucketLocation);
+  } else {
+    auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
+    if (has_s3_resource_tag)
+      rgw_iam_add_buckettags(this, s);
+
+    return verify_bucket_owner_or_policy(s, rgw::IAM::s3GetBucketLocation);
+  }
 }
 
 int RGWCreateBucket::verify_permission(optional_yield y)
@@ -3092,22 +3361,30 @@ int RGWCreateBucket::verify_permission(optional_yield y)
     return -EACCES;
   }
 
-  rgw_bucket bucket;
-  bucket.name = s->bucket_name;
-  bucket.tenant = s->bucket_tenant;
-  ARN arn = ARN(bucket);
-  if (!verify_user_permission(this, s, arn, rgw::IAM::s3CreateBucket, false)) {
-    return -EACCES;
-  }
+  if (s->handoff_authz->enabled()) {
+    int ret = s->handoff_helper->verify_permission(this, this->s, rgw::IAM::s3CreateBucket, y);
+    if (ret < 0) {
+      return ret;
+    }
 
-  if (s->user->get_tenant() != s->bucket_tenant) {
-    //AssumeRole is meant for cross account access
-    if (s->auth.identity->get_identity_type() != TYPE_ROLE) {
-      ldpp_dout(this, 10) << "user cannot create a bucket in a different tenant"
-                        << " (user_id.tenant=" << s->user->get_tenant()
-                        << " requested=" << s->bucket_tenant << ")"
-                        << dendl;
+  } else {
+    rgw_bucket bucket;
+    bucket.name = s->bucket_name;
+    bucket.tenant = s->bucket_tenant;
+    ARN arn = ARN(bucket);
+    if (!verify_user_permission(this, s, arn, rgw::IAM::s3CreateBucket, false)) {
       return -EACCES;
+    }
+
+    if (s->user->get_tenant() != s->bucket_tenant) {
+      // AssumeRole is meant for cross account access
+      if (s->auth.identity->get_identity_type() != TYPE_ROLE) {
+        ldpp_dout(this, 10) << "user cannot create a bucket in a different tenant"
+                            << " (user_id.tenant=" << s->user->get_tenant()
+                            << " requested=" << s->bucket_tenant << ")"
+                            << dendl;
+        return -EACCES;
+      }
     }
   }
 
@@ -3309,9 +3586,42 @@ void RGWCreateBucket::execute(optional_yield y)
   buffer::list corsbl;
   string bucket_name = rgw_make_bucket_entry_name(s->bucket_tenant, s->bucket_name);
 
+  // UBNS: Create an empty optional<UBNSCreateMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSCreateMachine> ubns_creater(std::nullopt);
+
+  if (s->ubns_client) {
+    // Create a real ubns_creater. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_creater.emplace(this, s->ubns_client, bucket_name, s->ubns_client->cluster_id(), s->user->get_id().to_str());
+  }
+
   op_ret = get_params(y);
   if (op_ret < 0)
     return;
+
+  if (ubns_creater) {
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::CREATE_START);
+    if (!success) {
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request failed with unknown error" << dendl;
+        op_ret = -EEXIST;
+      }
+      return;
+    }
+    // creater state is CREATE_RPC_SUCCEEDED or CREATE_RPC_SOFT_FAILURE.
+    if (ubns_creater->state() == rgw::UBNSCreateMachine::CreateMachineState::CREATE_RPC_SOFT_FAILURE) {
+      ldpp_dout(this, 1) << "UBNS state CREATE_RPC_SOFT_FAILURE: stop RGWCreateBucket::execute() and return success code" << dendl;
+      op_ret = 0; // Success.
+      return;
+    }
+  }
 
   if (!relaxed_region_enforcement &&
       !location_constraint.empty() &&
@@ -3495,19 +3805,43 @@ void RGWCreateBucket::execute(optional_yield y)
       op_ret = -ERR_BUCKET_EXISTS;
     }
   }
+
+  if (ubns_creater) {
+    // Move the state machine from CREATE_RPC_SUCCEEDED to UPDATE_START.
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::UPDATE_START);
+    if (!success) {
+      // We've created the bucket! We will need to be reconcile this
+      // externally, there's no obvious way to roll this back from
+      // RGWCreateBucket::execute().
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed UpdateBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // creater state is UPDATE_RPC_SUCCEEDED or UPDATE_RPC_FAILED.
+  }
 }
 
 int RGWDeleteBucket::verify_permission(optional_yield y)
 {
-  auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
-  if (has_s3_resource_tag)
-    rgw_iam_add_buckettags(this, s);
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, this->s, rgw::IAM::s3DeleteBucket, y);
 
-  if (!verify_bucket_permission(this, s, rgw::IAM::s3DeleteBucket)) {
-    return -EACCES;
+  } else {
+    auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
+    if (has_s3_resource_tag)
+      rgw_iam_add_buckettags(this, s);
+
+    if (!verify_bucket_permission(this, s, rgw::IAM::s3DeleteBucket)) {
+      return -EACCES;
+    }
+
+    return 0;
   }
-
-  return 0;
 }
 
 void RGWDeleteBucket::pre_exec()
@@ -3520,6 +3854,41 @@ void RGWDeleteBucket::execute(optional_yield y)
   if (s->bucket_name.empty()) {
     op_ret = -EINVAL;
     return;
+  }
+
+  // UBNS: Create an empty optional<UBNSDeleteMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSDeleteMachine> ubns_deleter(std::nullopt);
+
+  if (s->ubns_client) {
+    // Fetch the user ID from the bucket. UBNS requires us to pass a matching
+    // owner, and there's no guarantee that the user requesting bucket
+    // deletion is the owner of the bucket.
+    const std::string& user_id = s->bucket->get_owner()->get_id().id;
+    ldpp_dout(this, 5) << fmt::format(FMT_STRING("UBNS RGWDeleteBucket::execute(): bucket('{}','{}',''): fetched owner '{}'"), s->bucket_name, s->ubns_client->cluster_id(), user_id) << dendl;
+
+    // Create a real ubns_deleter. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_deleter.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), user_id);
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::UPDATE_START);
+    if (!success) {
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request with unknown error" << dendl;
+        // This is an internal error, it has nothing to do with the bucket.
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+      return;
+    }
+    // deleter state is UPDATE_RPC_SUCCEEDED.
   }
 
   if (!s->bucket_exists) {
@@ -3578,6 +3947,24 @@ void RGWDeleteBucket::execute(optional_yield y)
       // lost a race, either with mdlog sync or another delete bucket operation.
       // in either case, we've already called ctl.bucket->unlink_bucket()
       op_ret = 0;
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::DELETE_START);
+    if (!success) {
+      // There's an error, but we've already deleted the bucket! We need to
+      // reconcile this externally, there's no obvious way to roll this back
+      // from RGWDeleteBucket::execute() - what do we do, recreate the bucket?
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request failed with unknown error" << dendl;
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // deleter state is DELETE_RPC_SUCCEEDED or DELETE_RPC_FAILED.
   }
 
   return;
@@ -3644,6 +4031,8 @@ int RGWPutObj::init_processing(optional_yield y) {
       return ret;
     }
     copy_source_bucket_info = bucket->get_info();
+    // Save copy source's bucket attrs in order to retrieve
+    // bucket policy/ACL later for permission verification.
     copy_source_bucket_attrs = bucket->get_attrs();
 
     /* handle x-amz-copy-source-range */
@@ -3686,7 +4075,16 @@ int RGWPutObj::init_processing(optional_yield y) {
 
 int RGWPutObj::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
   if (! copy_source.empty()) {
+
+    if (s->handoff_authz->enabled()) {
+      // We shouldn't get here! The microservice platform should not have
+      // allowed a copy source to be specified in a put-object request, it
+      // should have decomposed it to a separate put and get.
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see a copy source specified in put-object request" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
 
     RGWAccessControlPolicy cs_acl(s->cct);
     boost::optional<Policy> policy;
@@ -3748,84 +4146,99 @@ int RGWPutObj::verify_permission(optional_yield y)
 	return -EACCES;
       }
     }
-  }
+  } // if copy_source
 
-  if (s->bucket_access_conf && s->bucket_access_conf->block_public_acls()) {
-    if (s->canned_acl.compare("public-read") ||
-        s->canned_acl.compare("public-read-write") ||
-        s->canned_acl.compare("authenticated-read"))
-      return -EACCES;
-  }
+  if (s->handoff_authz->enabled()) {
 
-  auto op_ret = get_params(y);
-  if (op_ret < 0) {
-    ldpp_dout(this, 20) << "get_params() returned ret=" << op_ret << dendl;
-    return op_ret;
-  }
-
-  if (s->iam_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
-    rgw_add_grant_to_iam_environment(s->env, s);
-
-    rgw_add_to_iam_environment(s->env, "s3:x-amz-acl", s->canned_acl);
-
-    if (obj_tags != nullptr && obj_tags->count() > 0){
-      auto tags = obj_tags->get_tags();
-      for (const auto& kv: tags){
-        rgw_add_to_iam_environment(s->env, "s3:RequestObjectTag/"+kv.first, kv.second);
-      }
+    // Most of the other leg of the if statement is not needed for gen2, but
+    // we do need to get_params() and load the crypt attributes.
+    // Note that get_params() has multiple overloads in subclasses.
+    auto op_ret = get_params(y);
+    if (op_ret < 0) {
+      ldpp_dout(this, 20) << "get_params() returned ret=" << op_ret << dendl;
+      return op_ret;
     }
 
     // add server-side encryption headers
     rgw_iam_add_crypt_attrs(s->env, s->info.crypt_attribute_map);
 
-    // Add bucket tags for authorization
-    auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
-    if (has_s3_resource_tag)
-      rgw_iam_add_buckettags(this, s);
+    return s->handoff_helper->verify_permission(this, this->s, rgw::IAM::s3PutObject, y);
 
-    auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies, s->env,
-                                            rgw::IAM::s3PutObject,
-                                            s->object->get_obj());
-    if (identity_policy_res == Effect::Deny)
-      return -EACCES;
+  } else {
+    if (s->bucket_access_conf && s->bucket_access_conf->block_public_acls()) {
+      if (s->canned_acl.compare("public-read") || s->canned_acl.compare("public-read-write") || s->canned_acl.compare("authenticated-read"))
+        return -EACCES;
+    }
 
-    rgw::IAM::Effect e = Effect::Pass;
-    rgw::IAM::PolicyPrincipal princ_type = rgw::IAM::PolicyPrincipal::Other;
-    if (s->iam_policy) {
-      ARN obj_arn(s->object->get_obj());
-      e = s->iam_policy->eval(s->env, *s->auth.identity,
+    auto op_ret = get_params(y);
+    if (op_ret < 0) {
+      ldpp_dout(this, 20) << "get_params() returned ret=" << op_ret << dendl;
+      return op_ret;
+    }
+
+    if (s->iam_policy || !s->iam_user_policies.empty() || !s->session_policies.empty()) {
+      rgw_add_grant_to_iam_environment(s->env, s);
+
+      rgw_add_to_iam_environment(s->env, "s3:x-amz-acl", s->canned_acl);
+
+      if (obj_tags != nullptr && obj_tags->count() > 0) {
+        auto tags = obj_tags->get_tags();
+        for (const auto& kv : tags) {
+          rgw_add_to_iam_environment(s->env, "s3:RequestObjectTag/" + kv.first, kv.second);
+        }
+      }
+
+      // add server-side encryption headers
+      rgw_iam_add_crypt_attrs(s->env, s->info.crypt_attribute_map);
+
+      // Add bucket tags for authorization
+      auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
+      if (has_s3_resource_tag)
+        rgw_iam_add_buckettags(this, s);
+
+      auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies, s->env,
           rgw::IAM::s3PutObject,
-          obj_arn,
-          princ_type);
-    }
-    if (e == Effect::Deny) {
-      return -EACCES;
-    }
+          s->object->get_obj());
+      if (identity_policy_res == Effect::Deny)
+        return -EACCES;
 
-    if (!s->session_policies.empty()) {
-      auto session_policy_res = eval_identity_or_session_policies(this, s->session_policies, s->env,
-                                              rgw::IAM::s3PutObject,
-                                              s->object->get_obj());
-      if (session_policy_res == Effect::Deny) {
+      rgw::IAM::Effect e = Effect::Pass;
+      rgw::IAM::PolicyPrincipal princ_type = rgw::IAM::PolicyPrincipal::Other;
+      if (s->iam_policy) {
+        ARN obj_arn(s->object->get_obj());
+        e = s->iam_policy->eval(s->env, *s->auth.identity,
+            rgw::IAM::s3PutObject,
+            obj_arn,
+            princ_type);
+      }
+      if (e == Effect::Deny) {
+        return -EACCES;
+      }
+
+      if (!s->session_policies.empty()) {
+        auto session_policy_res = eval_identity_or_session_policies(this, s->session_policies, s->env,
+            rgw::IAM::s3PutObject,
+            s->object->get_obj());
+        if (session_policy_res == Effect::Deny) {
           return -EACCES;
+        }
+        if (princ_type == rgw::IAM::PolicyPrincipal::Role) {
+          // Intersection of session policy and identity policy plus intersection of session policy and bucket policy
+          if ((session_policy_res == Effect::Allow && identity_policy_res == Effect::Allow) || (session_policy_res == Effect::Allow && e == Effect::Allow))
+            return 0;
+        } else if (princ_type == rgw::IAM::PolicyPrincipal::Session) {
+          // Intersection of session policy and identity policy plus bucket policy
+          if ((session_policy_res == Effect::Allow && identity_policy_res == Effect::Allow) || e == Effect::Allow)
+            return 0;
+        } else if (princ_type == rgw::IAM::PolicyPrincipal::Other) { // there was no match in the bucket policy
+          if (session_policy_res == Effect::Allow && identity_policy_res == Effect::Allow)
+            return 0;
+        }
+        return -EACCES;
       }
-      if (princ_type == rgw::IAM::PolicyPrincipal::Role) {
-        //Intersection of session policy and identity policy plus intersection of session policy and bucket policy
-        if ((session_policy_res == Effect::Allow && identity_policy_res == Effect::Allow) ||
-            (session_policy_res == Effect::Allow && e == Effect::Allow))
-          return 0;
-      } else if (princ_type == rgw::IAM::PolicyPrincipal::Session) {
-        //Intersection of session policy and identity policy plus bucket policy
-        if ((session_policy_res == Effect::Allow && identity_policy_res == Effect::Allow) || e == Effect::Allow)
-          return 0;
-      } else if (princ_type == rgw::IAM::PolicyPrincipal::Other) {// there was no match in the bucket policy
-        if (session_policy_res == Effect::Allow && identity_policy_res == Effect::Allow)
-          return 0;
+      if (e == Effect::Allow || identity_policy_res == Effect::Allow) {
+        return 0;
       }
-      return -EACCES;
-    }
-    if (e == Effect::Allow || identity_policy_res == Effect::Allow) {
-      return 0;
     }
   }
 
@@ -4084,6 +4497,10 @@ void RGWPutObj::execute(optional_yield y)
       } else {// -ENOENT: raced with upload complete/cancel, no need to spam log
         ldpp_dout(this, 20) << "failed to get multipart info (returned " << op_ret << ": " << cpp_strerror(-op_ret) << "): probably raced with upload complete / cancel" << dendl;
       }
+      if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+        s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                         "or the multipart upload might have been aborted or completed";
+      }
       return;
     }
     /* upload will go out of scope, so copy the dest placement for later use */
@@ -4287,7 +4704,7 @@ void RGWPutObj::execute(optional_yield y)
     cs_info.compression_type = plugin->get_type_name();
     cs_info.orig_size = s->obj_size;
     cs_info.compressor_message = compressor->get_compressor_message();
-    cs_info.blocks = move(compressor->get_compression_blocks());
+    cs_info.blocks = std::move(compressor->get_compression_blocks());
     encode(cs_info, tmp);
     attrs[RGW_ATTR_COMPRESSION] = tmp;
     ldpp_dout(this, 20) << "storing " << RGW_ATTR_COMPRESSION
@@ -4391,6 +4808,7 @@ void RGWPutObj::execute(optional_yield y)
 
 int RGWPostObj::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
   return 0;
 }
 
@@ -4401,6 +4819,8 @@ void RGWPostObj::pre_exec()
 
 void RGWPostObj::execute(optional_yield y)
 {
+  // HANDOFF: Visited.
+
   boost::optional<RGWPutObj_Compress> compressor;
   CompressorRef plugin;
   char supplied_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
@@ -4418,6 +4838,15 @@ void RGWPostObj::execute(optional_yield y)
 
   // add server-side encryption headers
   rgw_iam_add_crypt_attrs(s->env, s->info.crypt_attribute_map);
+
+  if (s->handoff_authz->enabled()) {
+    auto ret = s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutObject, y);
+    if (ret < 0) {
+      op_ret = ret;
+      return;
+    }
+    goto auth_done; // Sue me. This is to reduce the diff.
+  }
 
   if (s->iam_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
     auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies, s->env,
@@ -4481,6 +4910,8 @@ void RGWPostObj::execute(optional_yield y)
     return;
   }
 
+auth_done:
+
   // make reservation for notification if needed
   std::unique_ptr<rgw::sal::Notification> res
     = driver->get_notification(s->object.get(), s->src_object.get(), s, rgw::notify::ObjectCreatedPost, y);
@@ -4519,8 +4950,15 @@ void RGWPostObj::execute(optional_yield y)
       ldpp_dout(this, 15) << "supplied_md5=" << supplied_md5 << dendl;
     }
 
+    std::string filename = get_current_filename();
+    ldpp_dout(this, 15) << "post form processing file [" << filename.length() << "] " << filename << dendl;
+    if (g_conf().get_val<bool>("rgw_post_check_null_byte_in_filename") && filename.find('\0') != std::string::npos) {
+      ldpp_dout(this, 1) << "ERROR: reject request since uploaded filename includes a null character midway." << filename << dendl;
+      op_ret = -ERR_ZERO_IN_URL;
+      return;
+    } 
     std::unique_ptr<rgw::sal::Object> obj =
-		     s->bucket->get_object(rgw_obj_key(get_current_filename()));
+                    s->bucket->get_object(rgw_obj_key(filename));
     if (s->bucket->versioning_enabled()) {
       obj->gen_rand_obj_instance_name();
     }
@@ -4635,7 +5073,7 @@ void RGWPostObj::execute(optional_yield y)
       cs_info.compression_type = plugin->get_type_name();
       cs_info.orig_size = s->obj_size;
       cs_info.compressor_message = compressor->get_compressor_message();
-      cs_info.blocks = move(compressor->get_compression_blocks());
+      cs_info.blocks = std::move(compressor->get_compression_blocks());
       encode(cs_info, tmp);
       emplace_attr(RGW_ATTR_COMPRESSION, std::move(tmp));
     }
@@ -4992,9 +5430,46 @@ int RGWDeleteObj::handle_slo_manifest(bufferlist& bl, optional_yield y)
 
 int RGWDeleteObj::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
   int op_ret = get_params(y);
   if (op_ret) {
     return op_ret;
+  }
+
+  if (s->handoff_authz->enabled()) {
+    std::vector<uint64_t> ops;
+
+    auto i_bypass = ops.size(); // The next append index.
+    bool bypass_gov = s->bucket->get_info().obj_lock_enabled() && bypass_governance_mode;
+    if (bypass_gov) {
+      ops.push_back(rgw::IAM::s3BypassGovernanceRetention);
+    }
+    auto i_delete = ops.size(); // The next append index.
+    if (s->object->get_instance().empty()) {
+      ops.push_back(rgw::IAM::s3DeleteObject);
+    } else {
+      ops.push_back(rgw::IAM::s3DeleteObjectVersion);
+    }
+
+    auto h_ret = s->handoff_helper->verify_permissions(this, s, ops, y);
+    ceph_assert(h_ret.size() == ops.size());
+
+    // Check the s3BypassGovernanceRetention permission first, if it applies.
+    if (bypass_gov) {
+      auto bypass_ret = h_ret[i_bypass];
+      if (bypass_ret == -EACCES) {
+        bypass_perm = false; // Checked by verify_object_lock().
+      } else if (bypass_ret < 0) {
+        // An error other than EACCES.
+        return bypass_ret;
+      }
+    }
+    // Check the actual delete permission.
+    if (h_ret[i_delete] < 0) {
+      return h_ret[i_delete];
+    }
+
+    return 0;
   }
 
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
@@ -5106,6 +5581,12 @@ void RGWDeleteObj::execute(optional_yield y)
     std::string etag;
     {
       RGWObjState* astate = nullptr;
+      //// AKAMAI (André 20240821): I'm convinced this is bugged - if we just do
+      //// a regular delete (e.g. s3cmd rm) on an object, even with a legal hold
+      //// on it, it succeeds. s->object->have_instance() is false in that case.
+      //// I think we should be checking if the bucket is versioned.
+      // Working version: bool check_obj_lock = s->bucket->get_info().obj_lock_enabled();
+
       bool check_obj_lock = s->object->have_instance() && s->bucket->get_info().obj_lock_enabled();
 
       op_ret = s->object->get_obj_state(this, &astate, s->yield, true);
@@ -5316,6 +5797,16 @@ int RGWCopyObj::init_processing(optional_yield y)
 
 int RGWCopyObj::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (!s->handoff_helper->allow_native_copy_object() && s->handoff_helper->reject_filtered_commands()) {
+      // The microservice platform should not have allowed a copy through to
+      // RGW, it should have decomposed it to a separate put and get.
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see a copy-object request" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+  }
+
   RGWAccessControlPolicy src_acl(s->cct);
   boost::optional<Policy> src_policy;
 
@@ -5326,11 +5817,13 @@ int RGWCopyObj::verify_permission(optional_yield y)
 
     rgw_placement_rule src_placement;
 
-    /* check source object permissions */
-    op_ret = read_obj_policy(this, driver, s, src_bucket->get_info(), src_bucket->get_attrs(), &src_acl, &src_placement.storage_class,
-			     src_policy, src_bucket.get(), s->src_object.get(), y);
-    if (op_ret < 0) {
-      return op_ret;
+    if (s->handoff_authz->disabled()) {
+      /* check source object permissions */
+      op_ret = read_obj_policy(this, driver, s, src_bucket->get_info(), src_bucket->get_attrs(), &src_acl, &src_placement.storage_class,
+          src_policy, src_bucket.get(), s->src_object.get(), y);
+      if (op_ret < 0) {
+        return op_ret;
+      }
     }
 
     /* follow up on previous checks that required reading source object head */
@@ -5343,163 +5836,174 @@ int RGWCopyObj::verify_permission(optional_yield y)
       }
     }
 
-    /* admin request overrides permission checks */
-    if (!s->auth.identity->is_admin_of(src_acl.get_owner().get_id())) {
-      if (src_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
-        auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, src_policy, s->iam_user_policies, s->session_policies);
-        if (has_s3_existing_tag || has_s3_resource_tag)
-          rgw_iam_add_objtags(this, s, s->src_object.get(), has_s3_existing_tag, has_s3_resource_tag);
+    if (s->handoff_authz->enabled()) {
+      // We're operating on the source object, so push the target object.
+      s->handoff_authz->push();
+      s->handoff_authz->set_bucket_name(src_bucket->get_name());
+      s->handoff_authz->set_object_key_name(s->src_object->get_name());
+      s->handoff_authz->set_trans_id_suffix("sourceobj");
 
-        ARN obj_arn(s->src_object->get_obj());
-        auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies, s->env,
-                                                  s->src_object->get_instance().empty() ?
-                                                  rgw::IAM::s3GetObject :
-                                                  rgw::IAM::s3GetObjectVersion,
-                                                  obj_arn);
-        if (identity_policy_res == Effect::Deny) {
+      auto action = s->src_object->get_instance().empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion;
+      auto ret = s->handoff_helper->verify_permission(this, s, action, y);
+      if (ret < 0) {
+        return ret;
+      }
+      // Back to the target object.
+      s->handoff_authz->pop();
+
+    } else {
+      /* admin request overrides permission checks */
+      if (!s->auth.identity->is_admin_of(src_acl.get_owner().get_id())) {
+        if (src_policy || !s->iam_user_policies.empty() || !s->session_policies.empty()) {
+          auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, src_policy, s->iam_user_policies, s->session_policies);
+          if (has_s3_existing_tag || has_s3_resource_tag)
+            rgw_iam_add_objtags(this, s, s->src_object.get(), has_s3_existing_tag, has_s3_resource_tag);
+
+          ARN obj_arn(s->src_object->get_obj());
+          auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies, s->env,
+              s->src_object->get_instance().empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion,
+              obj_arn);
+          if (identity_policy_res == Effect::Deny) {
+            return -EACCES;
+          }
+          auto e = Effect::Pass;
+          rgw::IAM::PolicyPrincipal princ_type = rgw::IAM::PolicyPrincipal::Other;
+          if (src_policy) {
+            e = src_policy->eval(s->env, *s->auth.identity,
+                s->src_object->get_instance().empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion,
+                obj_arn,
+                princ_type);
+          }
+          if (e == Effect::Deny) {
+            return -EACCES;
+          }
+          if (!s->session_policies.empty()) {
+            auto session_policy_res = eval_identity_or_session_policies(this, s->session_policies, s->env,
+                s->src_object->get_instance().empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion,
+                obj_arn);
+            if (session_policy_res == Effect::Deny) {
+              return -EACCES;
+            }
+            if (princ_type == rgw::IAM::PolicyPrincipal::Role) {
+              // Intersection of session policy and identity policy plus intersection of session policy and bucket policy
+              if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) && (session_policy_res != Effect::Allow || e != Effect::Allow)) {
+                return -EACCES;
+              }
+            } else if (princ_type == rgw::IAM::PolicyPrincipal::Session) {
+              // Intersection of session policy and identity policy plus bucket policy
+              if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) && e != Effect::Allow) {
+                return -EACCES;
+              }
+            } else if (princ_type == rgw::IAM::PolicyPrincipal::Other) { // there was no match in the bucket policy
+              if (session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) {
+                return -EACCES;
+              }
+            }
+          }
+          if (identity_policy_res == Effect::Pass && e == Effect::Pass && !src_acl.verify_permission(this, *s->auth.identity, s->perm_mask, RGW_PERM_READ)) {
+            return -EACCES;
+          }
+          // remove src object tags as it may interfere with policy evaluation of destination obj
+          if (has_s3_existing_tag || has_s3_resource_tag)
+            rgw_iam_remove_objtags(this, s, s->src_object.get(), has_s3_existing_tag, has_s3_resource_tag);
+
+        } else if (!src_acl.verify_permission(this, *s->auth.identity,
+                       s->perm_mask,
+                       RGW_PERM_READ)) {
           return -EACCES;
         }
-        auto e = Effect::Pass;
-        rgw::IAM::PolicyPrincipal princ_type = rgw::IAM::PolicyPrincipal::Other;
-        if (src_policy) {
-	        e = src_policy->eval(s->env, *s->auth.identity,
-            s->src_object->get_instance().empty() ?
-            rgw::IAM::s3GetObject :
-            rgw::IAM::s3GetObjectVersion,
-            obj_arn,
-            princ_type);
-        }
-	if (e == Effect::Deny) {
-	  return -EACCES;
-	}
-        if (!s->session_policies.empty()) {
-	  auto session_policy_res = eval_identity_or_session_policies(this, s->session_policies, s->env,
-                                                  s->src_object->get_instance().empty() ?
-                                                  rgw::IAM::s3GetObject :
-                                                  rgw::IAM::s3GetObjectVersion,
-                                                  obj_arn);
-        if (session_policy_res == Effect::Deny) {
-            return -EACCES;
-        }
-        if (princ_type == rgw::IAM::PolicyPrincipal::Role) {
-          //Intersection of session policy and identity policy plus intersection of session policy and bucket policy
-          if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) &&
-              (session_policy_res != Effect::Allow || e != Effect::Allow)) {
-            return -EACCES;
-          }
-        } else if (princ_type == rgw::IAM::PolicyPrincipal::Session) {
-          //Intersection of session policy and identity policy plus bucket policy
-          if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) && e != Effect::Allow) {
-            return -EACCES;
-          }
-        } else if (princ_type == rgw::IAM::PolicyPrincipal::Other) {// there was no match in the bucket policy
-          if (session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) {
-            return -EACCES;
-          }
-        }
       }
-  if (identity_policy_res == Effect::Pass && e == Effect::Pass &&
-		   !src_acl.verify_permission(this, *s->auth.identity, s->perm_mask,
-					      RGW_PERM_READ)) { 
-	  return -EACCES;
-	}
-      //remove src object tags as it may interfere with policy evaluation of destination obj
-      if (has_s3_existing_tag || has_s3_resource_tag)
-        rgw_iam_remove_objtags(this, s, s->src_object.get(), has_s3_existing_tag, has_s3_resource_tag);
-
-      } else if (!src_acl.verify_permission(this, *s->auth.identity,
-					       s->perm_mask,
-					    RGW_PERM_READ)) {
-	return -EACCES;
-      }
-    }
+    } // if !handoff_authz enabled
   }
 
   RGWAccessControlPolicy dest_bucket_policy(s->cct);
 
   s->object->set_atomic();
 
-  /* check dest bucket permissions */
-  op_ret = read_bucket_policy(this, driver, s, s->bucket->get_info(),
-			      s->bucket->get_attrs(),
-                              &dest_bucket_policy, s->bucket->get_key(), y);
-  if (op_ret < 0) {
-    return op_ret;
-  }
-  auto dest_iam_policy = get_iam_policy_from_attr(s->cct, s->bucket->get_attrs(), s->bucket->get_tenant());
-  /* admin request overrides permission checks */
-  if (! s->auth.identity->is_admin_of(dest_policy.get_owner().get_id())){
-    if (dest_iam_policy != boost::none || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
-      //Add destination bucket tags for authorization
-      auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, dest_iam_policy, s->iam_user_policies, s->session_policies);
-      if (has_s3_resource_tag)
-        rgw_iam_add_buckettags(this, s, s->bucket.get());
-
-      rgw_add_to_iam_environment(s->env, "s3:x-amz-copy-source", copy_source);
-      if (md_directive)
-	rgw_add_to_iam_environment(s->env, "s3:x-amz-metadata-directive",
-				   *md_directive);
-
-      ARN obj_arn(s->object->get_obj());
-      auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies,
-                                                                  s->env,
-                                                                  rgw::IAM::s3PutObject,
-                                                                  obj_arn);
-      if (identity_policy_res == Effect::Deny) {
-        return -EACCES;
-      }
-      auto e = Effect::Pass;
-      rgw::IAM::PolicyPrincipal princ_type = rgw::IAM::PolicyPrincipal::Other;
-      if (dest_iam_policy) {
-        e = dest_iam_policy->eval(s->env, *s->auth.identity,
-                                      rgw::IAM::s3PutObject,
-                                      obj_arn,
-                                      princ_type);
-      }
-      if (e == Effect::Deny) {
-        return -EACCES;
-      }
-      if (!s->session_policies.empty()) {
-        auto session_policy_res = eval_identity_or_session_policies(this, s->session_policies, s->env,
-								    rgw::IAM::s3PutObject, obj_arn);
-        if (session_policy_res == Effect::Deny) {
-            return false;
-        }
-        if (princ_type == rgw::IAM::PolicyPrincipal::Role) {
-          //Intersection of session policy and identity policy plus intersection of session policy and bucket policy
-          if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) &&
-              (session_policy_res != Effect::Allow || e == Effect::Allow)) {
-            return -EACCES;
-          }
-        } else if (princ_type == rgw::IAM::PolicyPrincipal::Session) {
-          //Intersection of session policy and identity policy plus bucket policy
-          if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) && e != Effect::Allow) {
-            return -EACCES;
-          }
-        } else if (princ_type == rgw::IAM::PolicyPrincipal::Other) {// there was no match in the bucket policy
-          if (session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) {
-            return -EACCES;
-          }
-        }
-      }
-      if (identity_policy_res == Effect::Pass && e == Effect::Pass &&
-                 ! dest_bucket_policy.verify_permission(this,
-                                                        *s->auth.identity,
-                                                        s->perm_mask,
-                                                        RGW_PERM_WRITE)){
-        return -EACCES;
-      }
-    } else if (! dest_bucket_policy.verify_permission(this, *s->auth.identity, s->perm_mask,
-                                                      RGW_PERM_WRITE)) {
-      return -EACCES;
+  if (s->handoff_authz->enabled()) {
+    s->handoff_authz->set_trans_id_suffix("destobj");
+    auto ret = s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutObject, y);
+    if (ret < 0) {
+      return ret;
     }
 
-  }
+  } else {
+    /* check dest bucket permissions */
+    op_ret = read_bucket_policy(this, driver, s, s->bucket->get_info(),
+        s->bucket->get_attrs(),
+        &dest_bucket_policy, s->bucket->get_key(), y);
+    if (op_ret < 0) {
+      return op_ret;
+    }
+    auto dest_iam_policy = get_iam_policy_from_attr(s->cct, s->bucket->get_attrs(), s->bucket->get_tenant());
+    /* admin request overrides permission checks */
+    if (!s->auth.identity->is_admin_of(dest_policy.get_owner().get_id())) {
+      if (dest_iam_policy != boost::none || !s->iam_user_policies.empty() || !s->session_policies.empty()) {
+        // Add destination bucket tags for authorization
+        auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, dest_iam_policy, s->iam_user_policies, s->session_policies);
+        if (has_s3_resource_tag)
+          rgw_iam_add_buckettags(this, s, s->bucket.get());
 
-  op_ret = init_dest_policy();
-  if (op_ret < 0) {
-    return op_ret;
-  }
+        rgw_add_to_iam_environment(s->env, "s3:x-amz-copy-source", copy_source);
+        if (md_directive)
+          rgw_add_to_iam_environment(s->env, "s3:x-amz-metadata-directive",
+              *md_directive);
+
+        ARN obj_arn(s->object->get_obj());
+        auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies,
+            s->env,
+            rgw::IAM::s3PutObject,
+            obj_arn);
+        if (identity_policy_res == Effect::Deny) {
+          return -EACCES;
+        }
+        auto e = Effect::Pass;
+        rgw::IAM::PolicyPrincipal princ_type = rgw::IAM::PolicyPrincipal::Other;
+        if (dest_iam_policy) {
+          e = dest_iam_policy->eval(s->env, *s->auth.identity,
+              rgw::IAM::s3PutObject,
+              obj_arn,
+              princ_type);
+        }
+        if (e == Effect::Deny) {
+          return -EACCES;
+        }
+        if (!s->session_policies.empty()) {
+          auto session_policy_res = eval_identity_or_session_policies(this, s->session_policies, s->env,
+              rgw::IAM::s3PutObject, obj_arn);
+          if (session_policy_res == Effect::Deny) {
+            return -EACCES;
+          }
+          if (princ_type == rgw::IAM::PolicyPrincipal::Role) {
+            // Intersection of session policy and identity policy plus intersection of session policy and bucket policy
+            if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) && (session_policy_res != Effect::Allow || e == Effect::Allow)) {
+              return -EACCES;
+            }
+          } else if (princ_type == rgw::IAM::PolicyPrincipal::Session) {
+            // Intersection of session policy and identity policy plus bucket policy
+            if ((session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) && e != Effect::Allow) {
+              return -EACCES;
+            }
+          } else if (princ_type == rgw::IAM::PolicyPrincipal::Other) { // there was no match in the bucket policy
+            if (session_policy_res != Effect::Allow || identity_policy_res != Effect::Allow) {
+              return -EACCES;
+            }
+          }
+        }
+        if (identity_policy_res == Effect::Pass && e == Effect::Pass && !dest_bucket_policy.verify_permission(this, *s->auth.identity, s->perm_mask, RGW_PERM_WRITE)) {
+          return -EACCES;
+        }
+      } else if (!dest_bucket_policy.verify_permission(this, *s->auth.identity, s->perm_mask,
+                     RGW_PERM_WRITE)) {
+        return -EACCES;
+      }
+    }
+
+    op_ret = init_dest_policy();
+    if (op_ret < 0) {
+      return op_ret;
+    }
+  } // if !handoff_authz enabled
 
   return 0;
 }
@@ -5690,6 +6194,28 @@ void RGWCopyObj::execute(optional_yield y)
 
 int RGWGetACLs::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (!rgw::sal::Object::empty(s->object.get())) {
+      // Object ACLs.
+      if (s->handoff_helper->reject_filtered_commands()) {
+        ldpp_dout(this, 0) << "ERROR: In gen2 we should not see a get-object-acl request" << dendl;
+        return -ERR_INVALID_REQUEST;
+      }
+      auto action = s->object->get_instance().empty() ? rgw::IAM::s3GetObjectAcl : rgw::IAM::s3GetObjectVersionAcl;
+      return s->handoff_helper->verify_permission(this, s, action, y);
+
+    } else {
+      // Bucket ACLs. Gen2 does support bucket ACLs, but we shouldn't see this
+      // in the microservices environment.
+      if (s->handoff_helper->reject_filtered_commands()) {
+        ldpp_dout(this, 0) << "ERROR: In gen2 we should not see a get-bucket-acl request" << dendl;
+        return -ERR_INVALID_REQUEST;
+      }
+      return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketAcl, y);
+    }
+  }
+
   bool perm;
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
   if (!rgw::sal::Object::empty(s->object.get())) {
@@ -5733,6 +6259,29 @@ void RGWGetACLs::execute(optional_yield y)
 
 int RGWPutACLs::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see a put-object-acl request" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+
+    if (!rgw::sal::Object::empty(s->object.get())) {
+      // Object ACLs. Gen2 doesn't support object ACLs.
+      auto action = s->object->get_instance().empty() ? rgw::IAM::s3PutObjectAcl : rgw::IAM::s3PutObjectVersionAcl;
+      return s->handoff_helper->verify_permission(this, s, action, y);
+
+    } else {
+      // Bucket ACLs. Gen2 does support bucket ACLs, but we shouldn't see this
+      // in the microservices environment.
+      if (s->handoff_helper->reject_filtered_commands()) {
+        ldpp_dout(this, 0) << "ERROR: In gen2 we should not see a put-bucket-acl request" << dendl;
+        return -ERR_INVALID_REQUEST;
+      }
+      return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketAcl, y);
+    }
+  }
+
   bool perm;
 
   rgw_add_to_iam_environment(s->env, "s3:x-amz-acl", s->canned_acl);
@@ -5754,6 +6303,11 @@ int RGWPutACLs::verify_permission(optional_yield y)
 
 int RGWGetLC::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetLifecycleConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -5768,6 +6322,11 @@ int RGWGetLC::verify_permission(optional_yield y)
 
 int RGWPutLC::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutLifecycleConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -5782,6 +6341,11 @@ int RGWPutLC::verify_permission(optional_yield y)
 
 int RGWDeleteLC::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutLifecycleConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -5816,6 +6380,21 @@ void RGWDeleteLC::pre_exec()
 
 void RGWPutACLs::execute(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    std::string request = rgw::sal::Object::empty(s->object.get()) ? "put-bucket-acl" : "put-object-acl";
+    ldpp_dout(this, 0) << fmt::format(FMT_STRING("ERROR: In gen2 we should not see a {} request"), request) << dendl;
+    if (s->handoff_helper->reject_filtered_commands()) {
+      // If we got here by mistake, because of an error in
+      // verify_permission(), still fail.
+      op_ret = -ERR_INVALID_REQUEST;
+    } else {
+      // In test-only mode, just do nothing.
+      op_ret = 0;
+    }
+    return;
+  }
+
   bufferlist bl;
 
   RGWAccessControlPolicy_S3 *policy = NULL;
@@ -6031,6 +6610,12 @@ void RGWPutLC::execute(optional_yield y)
     ldpp_dout(this, 15) << "New LifecycleConfiguration:" << ss.str() << dendl;
   }
 
+  if (s->info.env->exists("HTTP_X_RGW_VALIDATE_ONLY")) {
+    ldpp_dout(this, 15) << "x-rgw-validate-only header set - exiting early"
+                        << dendl;
+    return;
+  }
+
   op_ret = driver->forward_request_to_master(this, s->user.get(), nullptr, data, nullptr, s->info, y);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
@@ -6062,6 +6647,11 @@ void RGWDeleteLC::execute(optional_yield y)
 
 int RGWGetCORS::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketCORS, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -6084,6 +6674,11 @@ void RGWGetCORS::execute(optional_yield y)
 
 int RGWPutCORS::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketCORS, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -6114,6 +6709,12 @@ void RGWPutCORS::execute(optional_yield y)
 
 int RGWDeleteCORS::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    // No separate delete permission.OR
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketCORS, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -6209,6 +6810,11 @@ void RGWOptionsCORS::execute(optional_yield y)
 
 int RGWGetRequestPayment::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketRequestPayment, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -6228,6 +6834,11 @@ void RGWGetRequestPayment::execute(optional_yield y)
 
 int RGWSetRequestPayment::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketRequestPayment, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -6265,6 +6876,14 @@ void RGWSetRequestPayment::execute(optional_yield y)
 
 int RGWInitMultipart::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    // Add server-side encryption headers to the IAM environment.
+    rgw_iam_add_crypt_attrs(s->env, s->info.crypt_attribute_map);
+
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutObject, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
   if (has_s3_existing_tag || has_s3_resource_tag)
     rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -6337,9 +6956,18 @@ void RGWInitMultipart::pre_exec()
 
 void RGWInitMultipart::execute(optional_yield y)
 {
-  multipart_trace = tracing::rgw::tracer.start_trace(tracing::rgw::MULTIPART, s->trace_enabled);
   bufferlist aclbl, tracebl;
   rgw::sal::Attrs attrs;
+
+  if (!s->otel_traceparent.empty()) {
+    multipart_trace = tracing::rgw::tracer.start_trace_with_req_state_parent(tracing::rgw::MULTIPART,
+        s->trace_enabled, s->otel_traceparent, s->otel_tracestate);
+  } else {
+    multipart_trace = tracing::rgw::tracer.start_trace(tracing::rgw::MULTIPART, s->trace_enabled);
+  }
+  if (s->cct->_conf->rgw_jaeger_agent_extra_attributes) {
+    set_extra_trace_attributes(s, multipart_trace);
+  }
 
   op_ret = get_params(y);
   if (op_ret < 0) {
@@ -6369,9 +6997,15 @@ void RGWInitMultipart::execute(optional_yield y)
     return;
   }
 
+  encode_obj_tags_attr(&obj_tags, attrs);
+  rgw_cond_decode_objtags(s, attrs);
+
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
   upload = s->bucket->get_multipart_upload(s->object->get_name(),
 				       upload_id);
+  upload->obj_legal_hold = obj_legal_hold;
+  upload->obj_retention = obj_retention;
+
   op_ret = upload->init(this, s->yield, s->owner, s->dest_placement, attrs);
 
   if (op_ret == 0) {
@@ -6379,11 +7013,18 @@ void RGWInitMultipart::execute(optional_yield y)
   }
   s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, upload_id);
   multipart_trace->UpdateName(tracing::rgw::MULTIPART + upload_id);
-
 }
 
 int RGWCompleteMultipart::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    // Add server-side encryption headers to the IAM environment.
+    rgw_iam_add_crypt_attrs(s->env, s->info.crypt_attribute_map);
+
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutObject, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
   if (has_s3_existing_tag || has_s3_resource_tag)
     rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -6530,8 +7171,9 @@ void RGWCompleteMultipart::execute(optional_yield y)
       op_ret = 0;
       return;
     }
-    op_ret = -ERR_INTERNAL_ERROR;
-    s->err.message = "This multipart completion is already in progress";
+    op_ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
     return;
   }
 
@@ -6646,6 +7288,26 @@ void RGWCompleteMultipart::complete()
 
 int RGWAbortMultipart::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+
+    // I interpret the standard checks as follows:
+    // If the user is denied s3AbortMultipartUpload, the operation is denied.
+    // Otherwise, if the user is allowed s3PutObject, the operation is
+    // allowed.
+
+    std::vector<uint64_t> ops;
+    auto i_abort = ops.size();
+    ops.push_back(rgw::IAM::s3AbortMultipartUpload);
+    auto i_put = ops.size();
+    ops.push_back(rgw::IAM::s3PutObject);
+    auto res = s->handoff_helper->verify_permissions(this, s, ops, y);
+    if (res[i_abort] < 0) {
+      return res[i_abort];
+    }
+    return res[i_put];
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
   if (has_s3_existing_tag || has_s3_resource_tag)
     rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -6749,10 +7411,19 @@ void RGWAbortMultipart::execute(optional_yield y)
   }
   op_ret = upload->abort(this, s->cct);
   serializer->unlock();
+  if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
+  }
 }
 
 int RGWListMultipart::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3ListMultipartUploadParts, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
   if (has_s3_existing_tag || has_s3_resource_tag)
     rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -6797,6 +7468,11 @@ void RGWListMultipart::execute(optional_yield y)
 
 int RGWListBucketMultiparts::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3ListBucketMultipartUploads, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -6859,9 +7535,68 @@ void RGWGetHealthCheck::execute(optional_yield y)
 
 int RGWDeleteMultiObj::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
   int op_ret = get_params(y);
   if (op_ret) {
     return op_ret;
+  }
+
+  if (s->handoff_authz->enabled()) {
+
+    /* Handoff: Be aware that every object to be deleted will be checked later
+     * in the request processing, in
+     * RGWDeleteMultiObj::handle_individual_object(). This appears (in the
+     * original code) to just check delete permission on the bucket.
+     */
+    std::vector<uint64_t> ops;
+
+    auto i_bypass = ops.size();
+    bool bypass_gov = s->bucket->get_info().obj_lock_enabled() && bypass_governance_mode;
+    if (bypass_gov) {
+      ops.push_back(rgw::IAM::s3BypassGovernanceRetention);
+    }
+    auto i_delete = ops.size(); // The next append index.
+    bool not_versioned = rgw::sal::Object::empty(s->object.get()) || s->object->get_instance().empty();
+    if (not_versioned) {
+      ops.push_back(rgw::IAM::s3DeleteObject);
+    } else {
+      ops.push_back(rgw::IAM::s3DeleteObjectVersion);
+    }
+
+    /*
+     * This first call to verify_permissions() will, if necessary, update
+     * s->handoff_authz's state variables to indicate whether or not we need
+     * object tags (or other extra data should they become a thing) to make
+     * decisions. We will allow this state to persist for the duration of the
+     * RGWDeleteMultiObj run, knowing that verify_permission() (singular) will
+     * be called once for every object in the request body XML. Likewise, we
+     * won't reset the state for every call.
+     *
+     * This makes the assumption that, for related objects anyway, the need
+     * for object tags will be the same for many objects in a single request.
+     * If that's true, we've saved a round-trip to the Authorizer. If it's
+     * false, we've loaded tags when we didn't need to. We need to test.
+     */
+
+    auto h_ret = s->handoff_helper->verify_permissions(this, s, ops, y);
+    ceph_assert(h_ret.size() == ops.size());
+
+    // Check the s3BypassGovernanceRetention permission first, if it applies.
+    if (bypass_gov) {
+      auto bypass_ret = h_ret[i_bypass];
+      if (bypass_ret == -EACCES) {
+        bypass_perm = false; // Checked by verify_object_lock().
+      } else if (bypass_ret < 0) {
+        // An error other than EACCES.
+        return bypass_ret;
+      }
+    }
+    // Check the actual delete permission.
+    if (h_ret[i_delete] < 0) {
+      return h_ret[i_delete];
+    }
+
+    return 0;
   }
 
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
@@ -6992,8 +7727,59 @@ void RGWDeleteMultiObj::wait_flush(optional_yield y,
 void RGWDeleteMultiObj::handle_individual_object(const rgw_obj_key& o, optional_yield y,
                                                  boost::asio::deadline_timer *formatter_flush_cond)
 {
+  // HANDOFF: Visited.
   std::string version_id;
   std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(o);
+
+  /* Handoff: The first part of this function does a lot of permissions checks
+   * for this object key, and if the permissions checks fail it sends a
+   * partial response and returns. This means we can have a handoff-specific
+   * section first, then allow the internal permissions checks to run because
+   * in handoff mode we've made all their preconditions fail! Their policies
+   * will be empty (we didn't load them).
+   *
+   * This matters because we want to minimise the diff.
+   *
+   * HOWEVER... I'm not really happy leaving this to chance, because a version
+   * upgrade might break the assumption that all the old-code checks will
+   * fail. So in fine BSD kernel style I'm going to use a goto to achieve the
+   * result I want. Sue me.
+   *
+   * As noted in RGWDeleteMultiObj::verify_permissions(), we're allowing
+   * s->handoff_authz's extra data state variables to persist between calls to
+   * the Authorizer, on the assumption that the policy's requirement for extra
+   * data will be the same for many objects in a single request. If that's not
+   * true, we can use the stack (s->handoff_authz->push_requirements(),
+   * ->pop_requirements()) to save and restore the state per-request.
+   *
+   * We're changing the target for each request, because that's the point.
+   *
+   * XXX each instance of this method is called in an individual yield
+   * context. We *MUST* test this in rgw_beast_enable_async = true mode, to
+   * make sure the boost async stuff works well with gRPC. Small-scale testing
+   * seems to indicate that it does work, but I'd be happier with larger
+   * tests. This is a detail note; any test at scale would almost certainly be
+   * in async=true mode, it's just a developer trick to turn it off.
+   */
+
+  if (s->handoff_authz->enabled()) {
+    // This relies on the caller updating handoff_item_count...
+    s->handoff_authz->set_trans_id_suffix(fmt::format(FMT_STRING("item{}"), handoff_item_count));
+
+    s->handoff_authz->push_target();
+    s->handoff_authz->set_object_key_name(o.name);
+    s->handoff_authz->set_bucket_name(s->bucket_name);
+    ldpp_dout(this, 20) << fmt::format(FMT_STRING("{}: checking s3DeleteObject permissions for object key {}"), __func__, o.name) << dendl;
+    auto ret = s->handoff_helper->verify_permission(this, s, rgw::IAM::s3DeleteObject, y);
+    s->handoff_authz->pop_target();
+
+    if (ret < 0) {
+      send_partial_response(o, false, "", -EACCES, formatter_flush_cond);
+      return;
+    }
+    goto authz_done; // Sue me.
+  }
+
   if (s->iam_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
     auto identity_policy_res = eval_identity_or_session_policies(this, s->iam_user_policies, s->env,
                                                                  o.instance.empty() ?
@@ -7061,6 +7847,7 @@ void RGWDeleteMultiObj::handle_individual_object(const rgw_obj_key& o, optional_
     }
   }
 
+authz_done:
   uint64_t obj_size = 0;
   std::string etag;
 
@@ -7202,6 +7989,9 @@ void RGWDeleteMultiObj::execute(optional_yield y)
   for (iter = multi_delete->objects.begin();
         iter != multi_delete->objects.end();
         ++iter) {
+    // This means the item count will be 1-based, not 0-based. That's ok.
+    // Easier to just increment it than to check the optional first.
+    handoff_item_count++;
     rgw_obj_key obj_key = *iter;
     if (y) {
       wait_flush(y, &*formatter_flush_cond, [&aio_count, max_aio] {
@@ -8146,6 +8936,7 @@ int RGWHandler::init(rgw::sal::Driver* _driver,
 
 int RGWHandler::do_init_permissions(const DoutPrefixProvider *dpp, optional_yield y)
 {
+  // HANDOFF: Visited.
   int ret = rgw_build_bucket_policies(dpp, driver, s, y);
   if (ret < 0) {
     ldpp_dout(dpp, 10) << "init_permissions on " << s->bucket
@@ -8159,6 +8950,7 @@ int RGWHandler::do_init_permissions(const DoutPrefixProvider *dpp, optional_yiel
 
 int RGWHandler::do_read_permissions(RGWOp *op, bool only_bucket, optional_yield y)
 {
+  // HANDOFF: Visited.
   if (only_bucket) {
     /* already read bucket info */
     return 0;
@@ -8216,6 +9008,15 @@ void RGWPutBucketPolicy::send_response()
 
 int RGWPutBucketPolicy::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see put-bucket-policy" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketPolicy, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8288,6 +9089,15 @@ void RGWGetBucketPolicy::send_response()
 
 int RGWGetBucketPolicy::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see get-bucket-policy" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketPolicy, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8337,6 +9147,15 @@ void RGWDeleteBucketPolicy::send_response()
 
 int RGWDeleteBucketPolicy::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see delete-bucket-policy" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3DeleteBucketPolicy, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8372,6 +9191,11 @@ void RGWPutBucketObjectLock::pre_exec()
 
 int RGWPutBucketObjectLock::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketObjectLockConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8417,6 +9241,12 @@ void RGWPutBucketObjectLock::execute(optional_yield y)
     return;
   }
 
+  if (s->info.env->exists("HTTP_X_RGW_VALIDATE_ONLY")) {
+    ldpp_dout(this, 15) << "x-rgw-validate-only header set - exiting early"
+                        << dendl;
+    return;
+  }
+
   op_ret = driver->forward_request_to_master(this, s->user.get(), nullptr, data, nullptr, s->info, y);
   if (op_ret < 0) {
     ldpp_dout(this, 20) << __func__ << "forward_request_to_master returned ret=" << op_ret << dendl;
@@ -8438,6 +9268,11 @@ void RGWGetBucketObjectLock::pre_exec()
 
 int RGWGetBucketObjectLock::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketObjectLockConfiguration, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8455,6 +9290,38 @@ void RGWGetBucketObjectLock::execute(optional_yield y)
 
 int RGWPutObjRetention::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    // Duplicate the existing verify_permission() logic here to avoid
+    // confusing diff.
+
+    // Have to call get_params() to set bypass_governance_mode.
+    op_ret = get_params(y);
+    if (op_ret) {
+      return op_ret;
+    }
+
+    std::vector<uint64_t> ops;
+    size_t i_retention = ops.size();
+    ops.push_back(rgw::IAM::s3PutObjectRetention);
+    size_t i_bypass = ops.size();
+    if (bypass_governance_mode) {
+      // Only ask two questions if we need to.
+      ops.push_back(rgw::IAM::s3BypassGovernanceRetention);
+    }
+    auto h_ret = s->handoff_helper->verify_permissions(this, s, ops, y);
+    ceph_assert(h_ret.size() == ops.size());
+
+    if (h_ret[i_retention] < 0) {
+      return h_ret[i_retention];
+    }
+    if (bypass_governance_mode && h_ret[i_bypass] == 0) {
+      ldpp_dout(this, 20) << "enable governance bypass mode" << dendl;
+      bypass_perm = true;
+    }
+    return 0;
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -8512,6 +9379,7 @@ void RGWPutObjRetention::execute(optional_yield y)
     op_ret = -EINVAL;
     return;
   }
+
   bufferlist bl;
   obj_retention.encode(bl);
 
@@ -8558,6 +9426,11 @@ void RGWPutObjRetention::execute(optional_yield y)
 
 int RGWGetObjRetention::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetObjectRetention, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -8607,6 +9480,11 @@ void RGWGetObjRetention::execute(optional_yield y)
 
 int RGWPutObjLegalHold::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutObjectLegalHold, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -8662,6 +9540,11 @@ void RGWPutObjLegalHold::execute(optional_yield y) {
 
 int RGWGetObjLegalHold::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetObjectLegalHold, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
@@ -8716,6 +9599,11 @@ void RGWGetClusterStat::execute(optional_yield y)
 
 int RGWGetBucketPolicyStatus::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketPolicyStatus, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8734,6 +9622,15 @@ void RGWGetBucketPolicyStatus::execute(optional_yield y)
 
 int RGWPutBucketPublicAccessBlock::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see put-bucket-public-access-block" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketPublicAccessBlock, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8797,6 +9694,15 @@ void RGWPutBucketPublicAccessBlock::execute(optional_yield y)
 
 int RGWGetBucketPublicAccessBlock::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see get-bucket-public-access-block" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetPublicAccessBlock, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
@@ -8847,10 +9753,20 @@ void RGWDeleteBucketPublicAccessBlock::send_response()
 
 int RGWDeleteBucketPublicAccessBlock::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    if (s->handoff_helper->reject_filtered_commands()) {
+      ldpp_dout(this, 0) << "ERROR: In gen2 we should not see delete-bucket-public-access-block" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3DeletePublicAccessBlock, y);
+  }
+
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s, false);
   if (has_s3_resource_tag)
     rgw_iam_add_buckettags(this, s);
 
+  // AKAMAI (André 20240823): I believe this is a bug, should be s3DeletePublicAccessBlock.
   if (!verify_bucket_permission(this, s, rgw::IAM::s3PutBucketPublicAccessBlock)) {
     return -EACCES;
   }
@@ -8884,6 +9800,11 @@ int RGWPutBucketEncryption::get_params(optional_yield y)
 
 int RGWPutBucketEncryption::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketEncryption, y);
+  }
+
   if (!verify_bucket_permission(this, s, rgw::IAM::s3PutBucketEncryption)) {
     return -EACCES;
   }
@@ -8933,6 +9854,11 @@ void RGWPutBucketEncryption::execute(optional_yield y)
 
 int RGWGetBucketEncryption::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3GetBucketEncryption, y);
+  }
+
   if (!verify_bucket_permission(this, s, rgw::IAM::s3GetBucketEncryption)) {
     return -EACCES;
   }
@@ -8962,6 +9888,11 @@ void RGWGetBucketEncryption::execute(optional_yield y)
 
 int RGWDeleteBucketEncryption::verify_permission(optional_yield y)
 {
+  // HANDOFF: Visited.
+  if (s->handoff_authz->enabled()) {
+    return s->handoff_helper->verify_permission(this, s, rgw::IAM::s3PutBucketEncryption, y);
+  }
+
   if (!verify_bucket_permission(this, s, rgw::IAM::s3PutBucketEncryption)) {
     return -EACCES;
   }

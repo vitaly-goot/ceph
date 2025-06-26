@@ -59,7 +59,7 @@ static int usage()
  * start up the RADOS connection and then handle HTTP messages as they come in
  */
 int main(int argc, char *argv[])
-{ 
+{
   int r{0};
 
   // dout() messages will be sent to stderr, but FCGX wants messages on stdout

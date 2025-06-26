@@ -107,6 +107,7 @@ class ExternalAuthStrategy : public rgw::auth::Strategy,
 
   boost::optional <EC2Engine> keystone_engine;
   LDAPEngine ldap_engine;
+  HandoffEngine handoff_engine;
 
   aplptr_t create_apl_remote(CephContext* const cct,
                              const req_state* const s,
@@ -128,6 +129,8 @@ public:
     : driver(driver),
       implicit_tenant_context(implicit_tenant_context),
       ldap_engine(cct, driver, *ver_abstractor,
+                  static_cast<rgw::auth::RemoteApplier::Factory*>(this)),
+      handoff_engine(cct, driver, *ver_abstractor,
                   static_cast<rgw::auth::RemoteApplier::Factory*>(this)) {
 
     if (cct->_conf->rgw_s3_auth_use_keystone &&
@@ -144,6 +147,9 @@ public:
 
     if (ldap_engine.valid()) {
       add_engine(Control::SUFFICIENT, ldap_engine);
+    }
+    if (handoff_engine.valid()) {
+      add_engine(Control::SUFFICIENT, handoff_engine);
     }
   }
 
@@ -435,13 +441,12 @@ class AWSv4ComplMulti : public rgw::auth::Completer,
   bool complete() override;
 
   /* Factories. */
-  static cmplptr_t create(const req_state* s,
-                          std::string_view date,
-                          std::string_view credential_scope,
-                          std::string_view seed_signature,
-			  uint32_t flags,
-                          const boost::optional<std::string>& secret_key);
-
+  static cmplptr_t create(
+      const req_state *s, std::string_view date,
+      std::string_view credential_scope, std::string_view seed_signature,
+      uint32_t flags,
+      const boost::optional<std::string> &secret_key,
+      const std::optional<sha256_digest_t> &cached_signing_key = std::nullopt);
 };
 
 class AWSv4ComplSingle : public rgw::auth::Completer,

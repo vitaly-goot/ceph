@@ -761,6 +761,7 @@ public:
 
 /* The anonymous abstract engine. */
 class AnonymousEngine : public Engine {
+protected:
   CephContext* const cct;
   const rgw::auth::LocalApplier::Factory* const apl_factory;
 
@@ -775,7 +776,7 @@ public:
     return "rgw::auth::AnonymousEngine";
   }
 
-  Engine::result_t authenticate(const DoutPrefixProvider* dpp, const req_state* s, optional_yield y) const override final;
+  Engine::result_t authenticate(const DoutPrefixProvider* dpp, const req_state* s, optional_yield y) const override;
 
 protected:
   virtual bool is_applicable(const req_state*) const noexcept {

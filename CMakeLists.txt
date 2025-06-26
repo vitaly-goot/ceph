@@ -134,7 +134,7 @@ else(ENABLE_SHARED)
 endif(ENABLE_SHARED)
 set(CMAKE_POSITION_INDEPENDENT_CODE ${ENABLE_SHARED})
 
-option(WITH_STATIC_LIBSTDCXX "Link against libstdc++ statically" OFF)
+option(WITH_STATIC_LIBSTDCXX "Link against libstdc++ statically" ON)
 if(WITH_STATIC_LIBSTDCXX)
   if(NOT CMAKE_COMPILER_IS_GNUCXX)
     message(FATAL_ERROR "Please use GCC to enable WITH_STATIC_LIBSTDCXX")
@@ -450,12 +450,57 @@ option(WITH_RADOSGW_DAOS "DAOS backend for RADOS Gateway" OFF)
 option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
 option(WITH_RADOSGW_ARROW_FLIGHT "Build arrow flight when not using system-provided arrow" OFF)
 option(WITH_RADOSGW_BACKTRACE_LOGGING "Enable backtraces in rgw logs" OFF)
+option(WITH_RADOSGW_GRPC "Rados Gateway gRPC support" ON)
 
 option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
 option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)
 
 if(WITH_RADOSGW)
-  find_package(EXPAT REQUIRED)
+  # OBJGEN-627 begin.
+  # Build Expat in-tree so we are sure of the version.
+  include(FetchContent)
+
+  set(RGW_EXPAT_RELEASE_TAG R_2_6_0)
+
+  # libexpat spews a bunch of messages at level STATUS. Suppress it. (This is
+  # a CMake >= 3.17 feature, on earlier versions it does nothing.)
+  set(_saved_CMAKE_MESSAGE_LOG_LEVEL ${CMAKE_MESSAGE_LOG_LEVEL})
+  set(CMAKE_MESSAGE_LOG_LEVEL NOTICE)
+
+  # Don't confuse matters by having an in-tree shared library version of
+  # expat. We only want the static library.
+  set(EXPAT_SHARED_LIBS OFF)
+  set(EXPAT_BUILD_TESTS OFF)
+
+  # SOURCE_SUBDIR is a CMake 3.18 feature. Ubuntu 20.04's version is 3.16.3.
+  FetchContent_Declare(
+    expat
+    GIT_REPOSITORY https://github.com/libexpat/libexpat.git
+    GIT_TAG ${RGW_EXPAT_RELEASE_TAG}
+    GIT_SHALLOW TRUE
+    GIT_PROGRESS TRUE
+
+    # When we can rely on CMake >= 3.18, SOURCE_SUBDIR will come to life and
+    # we can remove the add_subdirectory() call immediately below.
+    SOURCE_SUBDIR expat
+  )
+  FetchContent_MakeAvailable(expat)
+
+  # Ubuntu 20.04 ships CMake 3.16.x, which doesn't support SOURCE_SUBDIR. We
+  # need to add the subdirectory manually.
+  if(${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION} VERSION_LESS "3.18")
+    add_subdirectory(${expat_SOURCE_DIR}/expat)
+  endif()
+
+  # Reset the message level.
+  set(CMAKE_MESSAGE_LOG_LEVEL ${_saved_CMAKE_MESSAGE_LOG_LEVEL})
+
+  message(STATUS "expat_SOURCE_DIR:      ${expat_SOURCE_DIR}")
+  message(STATUS "RGW_EXPAT_RELEASE_TAG: ${RGW_EXPAT_RELEASE_TAG}")
+
+  set(EXPAT_LIBRARIES expat)
+  # OBJGEN1-627 end.
+
   find_package(OATH REQUIRED)
 
 # https://curl.haxx.se/docs/install.html mentions the
@@ -505,6 +550,34 @@ if(WITH_RADOSGW)
   endif()
   message(STATUS "ssl soname: ${LIBSSL_SONAME}")
   message(STATUS "crypto soname: ${LIBCRYPTO_SONAME}")
+
+  if(WITH_RADOSGW_GRPC)
+    # # See: https://github.com/protocolbuffers/protobuf/issues/12185
+    set(RGW_ABSL_ROOT_DIR /usr/local/abseil-cpp)
+    set(RGW_GRPC_ROOT_DIR /usr/local/grpc)
+
+    list(APPEND CMAKE_PREFIX_PATH ${RGW_ABSL_ROOT_DIR}/lib/cmake/absl)
+
+    foreach(pkg utf8_range protobuf grpc)
+      list(APPEND CMAKE_PREFIX_PATH ${RGW_GRPC_ROOT_DIR}/lib/cmake/${pkg})
+    endforeach()
+
+    find_package(absl REQUIRED)
+    find_package(utf8_range REQUIRED)
+    set(protobuf_MODULE_COMPATIBLE TRUE)
+    find_package(protobuf REQUIRED)
+    find_package(gRPC REQUIRED)
+
+    # Help OTel (Jaeger) by adding HAVE_ABSEIL to the compile definitions
+    # everywhere, and the Abseil include directory to the include directory
+    # path everywhere. I know target_include_directories() is preferred, and
+    # for good reason, but there's no easy way to add these in a targeted way
+    # as tracing can in principle be used from anywhere.
+    add_compile_definitions(HAVE_ABSEIL)
+    include_directories(BEFORE SYSTEM /usr/local/abseil-cpp/include)
+
+
+  endif(WITH_RADOSGW_GRPC)
 endif (WITH_RADOSGW)
 
 #option for CephFS

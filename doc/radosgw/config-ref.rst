@@ -71,6 +71,8 @@ aggressiveness of lifecycle processing:
 
 .. confval:: rgw_lc_max_worker
 .. confval:: rgw_lc_max_wp_worker
+.. confval:: rgw_lc_multi_shard_list
+.. confval:: rgw_lc_multi_shard_list_cnt
 
 These values can be tuned based upon your specific workload to further increase the
 aggressiveness of lifecycle processing. For a workload with a larger number of buckets (thousands)

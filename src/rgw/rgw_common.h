@@ -38,6 +38,7 @@
 #include "rgw_tag.h"
 #include "rgw_op_type.h"
 #include "rgw_sync_policy.h"
+#include "rgw_ubns.h"
 #include "cls/version/cls_version_types.h"
 #include "cls/user/cls_user_types.h"
 #include "cls/rgw/cls_rgw_types.h"
@@ -45,6 +46,8 @@
 #include "rgw_public_access.h"
 #include "common/tracer.h"
 #include "rgw_sal_fwd.h"
+
+#include "rgw_handoff_fwd.h"
 
 namespace ceph {
   class Formatter;
@@ -311,6 +314,14 @@ static inline const char* to_mime_type(const RGWFormat f)
 #define ERR_NO_SUCH_ENTITY       2301
 #define ERR_LIMIT_EXCEEDED       2302
 
+// UBNS-specific errors
+#define ERR_UBNS_INVALID_OR_MISSING_PARAMETER 12001
+#define ERR_UBNS_BUCKET_ALREADY_OWNED_BY_YOU 12002
+#define ERR_UBNS_BAD_REQUEST 12003
+
+// Authorization conditional error:
+#define ERR_ALLOW_IF_NOT_FOUND 13008
+
 // STS Errors
 #define ERR_PACKED_POLICY_TOO_LARGE 2400
 #define ERR_INVALID_IDENTITY_TOKEN  2401
@@ -508,6 +519,7 @@ enum RGWIdentityType
   TYPE_LDAP=3,
   TYPE_ROLE=4,
   TYPE_WEB=5,
+  TYPE_HANDOFF=6,
 };
 
 void encode_json(const char *name, const rgw_placement_rule& val, ceph::Formatter *f);
@@ -1101,6 +1113,7 @@ struct req_state : DoutPrefixProvider {
   RGWRateLimitInfo bucket_ratelimit;
   std::string ratelimit_bucket_marker;
   std::string ratelimit_user_name;
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
   bool content_started{false};
   RGWFormat format{RGWFormat::PLAIN};
   ceph::Formatter *formatter{nullptr};
@@ -1192,6 +1205,9 @@ struct req_state : DoutPrefixProvider {
   boost::optional<PublicAccessBlockConfiguration> bucket_access_conf;
   std::vector<rgw::IAM::Policy> iam_user_policies;
 
+  std::shared_ptr<::rgw::HandoffHelper> handoff_helper;
+  std::unique_ptr<::rgw::HandoffAuthzState> handoff_authz;
+
   /* Is the request made by an user marked as a system one?
    * Being system user means we also have the admin status. */
   bool system_request{false};
@@ -1201,6 +1217,7 @@ struct req_state : DoutPrefixProvider {
   bool local_source{false}; /* source is local */
 
   int prot_flags{0};
+  bool close_conn{false};
 
   /* Content-Disposition override for TempURL of Swift API. */
   struct {
@@ -1221,6 +1238,9 @@ struct req_state : DoutPrefixProvider {
   std::string dialect;
   std::string req_id;
   std::string trans_id;
+  std::string otel_traceparent; // OpenTelemetery traceparent header (verbatim).
+  std::string otel_tracestate; // OpenTelemetery tracestate header (verbatim).
+  std::string otel_trace_id; // OpenTelemetery traceparent id.
   uint64_t id;
 
   RGWObjTags tagset;
@@ -1357,16 +1377,34 @@ inline std::ostream& operator<<(std::ostream& out, const rgw_obj &o) {
 struct multipart_upload_info
 {
   rgw_placement_rule dest_placement;
+  // object lock
+  bool obj_retention_exist{false};
+  bool obj_legal_hold_exist{false};
+  RGWObjectRetention obj_retention;
+  RGWObjectLegalHold obj_legal_hold;
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(dest_placement, bl);
+    encode(obj_retention_exist, bl);
+    encode(obj_legal_hold_exist, bl);
+    encode(obj_retention, bl);
+    encode(obj_legal_hold, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(dest_placement, bl);
+    if (struct_v >= 2) {
+      decode(obj_retention_exist, bl);
+      decode(obj_legal_hold_exist, bl);
+      decode(obj_retention, bl);
+      decode(obj_legal_hold, bl);
+    } else {
+      obj_retention_exist = false;
+      obj_legal_hold_exist = false;
+    }
     DECODE_FINISH(bl);
   }
 };

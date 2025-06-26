@@ -45,7 +45,7 @@ class ClientIO : public io::RestfulClient,
   size_t send_header(const std::string_view& name,
                      const std::string_view& value) override;
   size_t send_content_length(uint64_t len) override;
-  size_t complete_header() override;
+  size_t complete_header(bool close_conn = false) override;
 
   size_t send_body(const char* buf, size_t len) override {
     return write_data(buf, len);

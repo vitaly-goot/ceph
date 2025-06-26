@@ -2302,6 +2302,8 @@ public:
   std::string uri;
   std::map<std::string, buffer::list> attrs;
   RGWLibFS::BucketStats& bs;
+  real_time ctime;
+  bool name_matched = false;
 
   RGWStatBucketRequest(CephContext* _cct, std::unique_ptr<rgw::sal::User> _user,
 		       const std::string& _path,
@@ -2316,9 +2318,7 @@ public:
     return (iter != attrs.end()) ? &(iter->second) : nullptr;
   }
 
-  real_time get_ctime() const {
-    return bucket->get_creation_time();
-  }
+  real_time get_ctime() const { return ctime; }
 
   bool only_bucket() override { return false; }
 
@@ -2346,22 +2346,26 @@ public:
     return 0;
   }
 
-  virtual int get_params() {
-    return 0;
+  virtual int get_params(optional_yield y) override { return 0; }
+
+  void complete() override {
+    // get_state() will no longer be there after execute_req()
+    // so save what we need from get_state()->bucket
+    ctime = get_state()->bucket->get_creation_time();
+    name_matched = get_state()->bucket->get_name().length() > 0;
+
+    RGWOp::complete();
   }
 
   void send_response() override {
-    bucket->get_creation_time() = get_state()->bucket->get_info().creation_time;
     bs.size = bucket->get_size();
     bs.size_rounded = bucket->get_size_rounded();
-    bs.creation_time = bucket->get_creation_time();
+    bs.creation_time = get_state()->bucket->get_info().creation_time;
     bs.num_entries = bucket->get_count();
     std::swap(attrs, get_state()->bucket_attrs);
   }
 
-  bool matched() {
-    return (bucket->get_name().length() > 0);
-  }
+  bool matched() { return name_matched; }
 
 }; /* RGWStatBucketRequest */
 

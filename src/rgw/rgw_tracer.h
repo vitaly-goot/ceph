@@ -21,6 +21,21 @@ const auto MULTIPART = "multipart_upload ";
 extern tracing::Tracer tracer;
 
 } // namespace rgw
+
+// Have a separate namespace for Akamai-specific attributes.
+namespace akamai {
+
+#define _PREFIX "akamai.rgw."
+
+const auto HOST = _PREFIX "host";
+const auto RELATIVE_URI = _PREFIX "relative_uri";
+const auto REQUEST_URI = _PREFIX "request_uri";
+const auto EARLY_ABORT = _PREFIX "early_abort";
+const auto REDIRECT = _PREFIX "redirect";
+const auto VERBOSE_ATTR = _PREFIX "verbose_attr";
+
+} // namespace akamai
+
 } // namespace tracing
 
 static inline void extract_span_context(const rgw::sal::Attrs& attr, jspan_context& span_ctx) {
@@ -32,3 +47,8 @@ static inline void extract_span_context(const rgw::sal::Attrs& attr, jspan_conte
     } catch (buffer::error& err) {}
   }
 }
+
+// Utility function for process_request(), used also by unit tests.
+extern std::optional<std::string> get_traceid_from_traceparent(DoutPrefixProvider* dpp, const std::string& traceparent);
+
+extern void set_extra_trace_attributes(const req_state* s, jspan span);

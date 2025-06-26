@@ -270,12 +270,13 @@ private:
  * logging-related config changes to the log.
  */
 class LogObs : public md_config_obs_t {
+  CephContext *_cct;
   ceph::logging::Log *log;
   ceph::mutex lock;
 
 public:
-  explicit LogObs(ceph::logging::Log *l)
-    : log(l), lock(ceph::make_mutex("log_obs")) {
+  explicit LogObs(CephContext *cct, ceph::logging::Log *l)
+    : _cct(cct), log(l), lock(ceph::make_mutex("log_obs")) {
   }
 
   const char** get_tracked_conf_keys() const override {
@@ -298,6 +299,7 @@ public:
       "log_coarse_timestamps",
       "fsid",
       "host",
+      "enable_accesslog",
       NULL
     };
     return KEYS;
@@ -382,9 +384,16 @@ public:
     if (log->graylog() && changed.count("fsid")) {
       log->graylog()->set_fsid(conf.get_val<uuid_d>("fsid"));
     }
+
+    if (changed.count("enable_accesslog")) {
+      if (conf.get_val<bool>("enable_accesslog")) {
+        log->start_accesslog(conf->host);
+      } else {
+        log->stop_accesslog();
+      }
+    }
   }
 };
-
 
 namespace ceph::common {
 // cct config watcher
@@ -729,7 +738,7 @@ CephContext::CephContext(uint32_t module_type_,
     _log = new ceph::logging::Log(&_conf->subsys);
   }
 
-  _log_obs = new LogObs(_log);
+  _log_obs = new LogObs(this, _log);
   _conf.add_observer(_log_obs);
 
   _cct_obs = new CephContextObs(this);
