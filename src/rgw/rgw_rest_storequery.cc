@@ -397,7 +397,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
   // return zero objects, for which we'll return ENOENT.
   params.list_versions = true;
   // It appears pagination works fine with unordered queries.
-  params.allow_unordered = true;
+  params.allow_unordered = false;
 
   // Cap the number of entries we'll return to our LIST_QUERY_SIZE_HARD_LIMIT.
   // We can experiment with this in a lab, but in production let's make sure
