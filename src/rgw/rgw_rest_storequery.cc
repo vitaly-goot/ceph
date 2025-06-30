@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "ceph_ver.h"
 #include "cls/rgw/cls_rgw_types.h"
 #include "common/async/yield_context.h"
 #include "common/dout.h"
@@ -362,6 +363,9 @@ static std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProv
 
 bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 {
+  // XXX remove this, it's to make sure the devs are running the right container.
+  ldpp_dout(this, 20) << "XXX storequery debug: ceph version " << CEPH_GIT_NICE_VER << dendl;
+
   // The ListParams persists across multiple requests.
   rgw::sal::Bucket::ListParams params {};
 
@@ -397,7 +401,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
   // return zero objects, for which we'll return ENOENT.
   params.list_versions = true;
   // It appears pagination works fine with unordered queries.
-  params.allow_unordered = false;
+  params.allow_unordered = g_conf()->rgw_storequery_objectlist_sort ? false : true;
 
   // Cap the number of entries we'll return to our LIST_QUERY_SIZE_HARD_LIMIT.
   // We can experiment with this in a lab, but in production let's make sure
@@ -427,8 +431,8 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
     rgw::sal::Bucket::ListResults results;
 
     ldpp_dout(this, 20) << fmt::format(
-        FMT_STRING("issue bucket list() query query_max={} next_marker={}"),
-        query_max, params.marker.name)
+        FMT_STRING("issue bucket list() query query_max={} next=[marker={}, instance={}]"),
+        query_max, params.marker.name, params.marker.instance)
                         << dendl;
     // Note that rgw::sal::RadosBucket::list() updates params.marker as it
     // goes. This isn't how list_multiparts() works, don't get caught.
