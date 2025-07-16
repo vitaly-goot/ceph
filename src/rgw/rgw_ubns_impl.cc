@@ -121,10 +121,16 @@ UBNSClientResult UBNSgRPCClient::_delete_bucket_xform_result(const ::grpc::Statu
         fmt::format(FMT_STRING("ERR_UBNS_BAD_REQUEST: Invalid or missing parameter: gRPC code INVALID_ARGUMENT message: {}"),
             status.error_message()));
 
+  case ::grpc::StatusCode::NOT_FOUND:
   case ::grpc::StatusCode::FAILED_PRECONDITION:
+    // There is only one condition that triggers this response, i.e. UBNS doesn't have this bucket entry.
+    // This should be considered as a success since the result is the same as the successful delete.
+    return UBNSClientResult::success();
+    /*
     return UBNSClientResult::error(ERR_NOT_FOUND,
         fmt::format(FMT_STRING("ERR_NOT_FOUND: Bucket is hosted on another cluster: gRPC code FAILED_PRECONDITION message: {}"),
             status.error_message()));
+    */
 
   default:
     return UBNSClientResult::error(ERR_INTERNAL_ERROR,
@@ -287,6 +293,9 @@ UBNSClientResult UBNSClientImpl::update_bucket_entry(const DoutPrefixProvider* d
     break;
   case rgw::UBNSBucketUpdateState::DELETING:
     rpc_state = ubdb::v1::BucketState::BUCKET_STATE_DELETING;
+    break;
+  default:
+    rpc_state = ubdb::v1::BucketState::BUCKET_STATE_UNSPECIFIED;
     break;
   }
   req.set_state(rpc_state);
