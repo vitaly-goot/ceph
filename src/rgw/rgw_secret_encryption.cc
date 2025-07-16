@@ -40,7 +40,7 @@ public:
     curr_db(std::make_shared<RGWEncryptKeyMap>()),
     reload_interval(reload_interval)
   {
-    ldout(cct, 1)  << "Create secret encrypter with enablement " << enabled << dendl;
+    ldout(cct, 20)  << "Create secret encrypter with enablement " << enabled << dendl;
     auto ret = reload_keys(0);
     if (enabled && ret < 0) {
       ldout(cct, 1)  << "Failure of key file reload when the feature is enabled is intolerable" << dendl;
@@ -110,7 +110,9 @@ static int read_input(CephContext *const cct, const std::string& infile, bufferl
     fd = open(infile.c_str(), O_RDONLY);
     if (fd < 0) {
       int err = -errno;
-      ldout(cct, 1)  << "error reading input file " << infile << " " << err << dendl;
+      if (err != -ENOENT) {
+        ldout(cct, 1)  << "error reading input file " << infile << " " << err << dendl;
+      }
       return err;
     }
   }
@@ -145,7 +147,9 @@ static int read_decode_json(CephContext *const cct, const std::string& infile, T
   bufferlist bl;
   int ret = read_input(cct, infile, bl);
   if (ret < 0) {
-    ldout(cct, 1) << "ERROR: failed to read input: " << cpp_strerror(-ret) << dendl;
+    if (ret != -ENOENT) {
+      ldout(cct, 1) << "ERROR: failed to read input: " << cpp_strerror(-ret) << dendl;
+    }
     return ret;
   }
   JSONParser p;
@@ -175,11 +179,13 @@ static RGWEncryptKey get_key_to_use(const RGWEncryptKeyMap &db_to_use)
 
 int RGWSecretEncrypterImpl::reload_keys(uint32_t expect_key_id)
 {
-  ldout(cct, 1) << "Reload keys from " << encrypt_key_file << dendl;
+  ldout(cct, 20) << "Reload keys from " << encrypt_key_file << dendl;
   std::list<RGWEncryptKey> key_list;
   int r = read_decode_json(cct, encrypt_key_file, key_list);
   if (r < 0) {
-    ldout(cct, 1) << "WARNING: failed to load secret encrypt keys" << dendl;
+    if (r != -ENOENT) {
+      ldout(cct, 1) << "WARNING: failed to load secret encrypt keys" << dendl;
+    }
     return r;
   }
 
