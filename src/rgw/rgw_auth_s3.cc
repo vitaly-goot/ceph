@@ -864,6 +864,22 @@ get_v4_canon_req_hash(CephContext* cct,
   return canonical_req_hash;
 }
 
+sha256_digest_t 
+get_v4_canon_req_hash(CephContext *cct,
+                      const std::string &canonical_req,
+                      const DoutPrefixProvider *dpp) 
+{
+  const auto canonical_req_hash = calc_hash_sha256(canonical_req);
+
+  using sanitize = rgw::crypt_sanitize::log_content;
+  ldpp_dout(dpp, 10) << "canonical request = " << sanitize{canonical_req}
+                     << dendl;
+  ldpp_dout(dpp, 10) << "canonical request hash = " << canonical_req_hash
+                     << dendl;
+
+  return canonical_req_hash;
+}
+
 /*
  * create string to sign for signature version 4
  *

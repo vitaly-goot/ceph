@@ -23,6 +23,7 @@
 #include <string>
 #include <fmt/format.h>
 
+#include <vector>
 #include "include/types.h"
 #include "rgw_compression_types.h"
 #include "rgw_pool_types.h"
@@ -55,6 +56,7 @@ struct rgw_err {
   int ret;
   std::string err_code;
   std::string message;
+  std::vector<std::pair<std::string_view, std::string>> addlHeaders;
 }; /* rgw_err */
 
 struct rgw_zone_id {

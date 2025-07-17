@@ -965,6 +965,7 @@ public:
       string_to_sign_t string_to_sign;
       signature_factory_t signature_factory;
       completer_factory_t completer_factory;
+      std::string canonical_request;
     };
 
     virtual auth_data_t get_auth_data(const req_state* s) const = 0;
@@ -996,6 +997,12 @@ protected:
                                 const completer_factory_t& completer_factory,
                                 const req_state* s,
 				optional_yield y) const = 0;
+
+  /* If an error occurs during authentication, we may want to fill in some
+   * additional information for the error message */
+  void FillErrorInfo(const int error_reason,
+                     const VersionAbstractor::auth_data_t &auth_data,
+                     const rgw_err &err) const;
 
 public:
   result_t authenticate(const DoutPrefixProvider* dpp, const req_state* const s,

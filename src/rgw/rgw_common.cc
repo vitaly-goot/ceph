@@ -382,7 +382,11 @@ void dump(req_state* s)
   if (!s->err.err_code.empty())
     s->formatter->dump_string("Code", s->err.err_code);
   s->formatter->dump_string("Message", s->err.message);
-  if (!s->bucket_name.empty())	// TODO: connect to expose_bucket
+  for (std::pair<std::string_view, std::string> addlHeader :
+       s->err.addlHeaders) {
+    s->formatter->dump_string(addlHeader.first, addlHeader.second);
+  }
+  if (!s->bucket_name.empty()) // TODO: connect to expose_bucket
     s->formatter->dump_string("BucketName", s->bucket_name);
   if (!s->trans_id.empty())	// TODO: connect to expose_bucket or another toggle
     s->formatter->dump_string("RequestId", s->trans_id);

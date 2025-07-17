@@ -725,6 +725,11 @@ get_v4_canon_req_hash(CephContext* cct,
                       const std::string_view& request_payload_hash,
                       const DoutPrefixProvider *dpp);
 
+extern sha256_digest_t 
+get_v4_canon_req_hash(CephContext *cct,
+                      const std::string &canonical_req,
+                      const DoutPrefixProvider *dpp);
+
 AWSEngine::VersionAbstractor::string_to_sign_t
 get_v4_string_to_sign(CephContext* cct,
                       const std::string_view& algorithm,

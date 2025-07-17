@@ -5888,15 +5888,17 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
   auto canonical_method = rgw::auth::s3::get_v4_canonical_method(s);
 
   /* Craft canonical request. */
-  auto canonical_req_hash = \
-    rgw::auth::s3::get_v4_canon_req_hash(s->cct,
-                                         std::move(canonical_method),
-                                         std::move(canonical_uri),
-                                         std::move(canonical_qs),
-                                         std::move(*canonical_headers),
-                                         signed_hdrs,
-                                         exp_payload_hash,
-                                         s);
+  const auto canonical_req = string_join_reserve("\n",
+    canonical_method,
+    canonical_uri,
+    canonical_qs,
+    *canonical_headers,
+    signed_hdrs,
+    exp_payload_hash
+  );
+
+  auto canonical_req_hash =
+    rgw::auth::s3::get_v4_canon_req_hash(s->cct, canonical_req, s);
 
   auto string_to_sign = \
     rgw::auth::s3::get_v4_string_to_sign(s->cct,
@@ -5948,7 +5950,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
       session_token,
       std::move(string_to_sign),
       sig_factory,
-      null_completer_factory
+      null_completer_factory,
+      std::move(canonical_req)
     };
   } else {
     /* We're going to handle a signed payload. Be aware that even empty HTTP
@@ -6013,7 +6016,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
         session_token,
         std::move(string_to_sign),
         sig_factory,
-        cmpl_factory
+        cmpl_factory,
+        std::move(canonical_req)
       };
     } else {
       ldpp_dout(s, 10) << "body content detected in multiple chunks" << dendl;
@@ -6068,14 +6072,13 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
 					  flags,
                                           std::placeholders::_1,
                                           std::placeholders::_2);
-      return {
-        access_key_id,
-        client_signature,
-        session_token,
-        std::move(string_to_sign),
-        sig_factory,
-        cmpl_factory
-      };
+      return {access_key_id,
+              client_signature,
+              session_token,
+              std::move(string_to_sign),
+              sig_factory,
+              cmpl_factory,
+              std::move(canonical_req)};
     }
   }
 }
@@ -6241,17 +6244,77 @@ AWSEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s,
   if (auth_data.access_key_id.empty() || auth_data.client_signature.empty()) {
     return result_t::deny(-EINVAL);
   } else {
-    return authenticate(dpp,
-                        auth_data.access_key_id,
-		        auth_data.client_signature,
-			auth_data.session_token,
-			auth_data.string_to_sign,
-                        auth_data.signature_factory,
-			auth_data.completer_factory,
-			s, y);
+    result_t engine_result = authenticate(
+        dpp, auth_data.access_key_id, auth_data.client_signature,
+        auth_data.session_token, auth_data.string_to_sign,
+        auth_data.signature_factory, auth_data.completer_factory, s, y);
+
+    if (engine_result.get_reason() != 0) {
+      FillErrorInfo(engine_result.get_reason(), auth_data, s->err);
+    }
+
+    return engine_result;
   }
 }
 
+void AWSEngine::FillErrorInfo(const int error_reason,
+                              const VersionAbstractor::auth_data_t &auth_data,
+                              const rgw_err &cerr) const 
+{
+  /* use of const_cast<>
+   * There's a lot of thought in the industry that const_cast<>
+   * should be avoided at all cost. I believe "all cost" is a bit  much.
+   * In this case, we are faced with needing to return a bunch of stuff
+   * in the err object. We have three options. The industry accepted option
+   * would be to modify the signature to include err as a separate argument to
+   * authenticate(). This change of signature affects a lot of code, and won't be done
+   * upstream, so upgrading will be a bother. The next option is to modify
+   * AWSEngine::result_t to accept this info and return that. Then later, when
+   * the call tree has reached a point where req_state is no longer const, copy/move 
+   * all the err stuff from result_t to req_state.err. Extra work. The last option
+   * is to use const_cast<> to cast away the constness of cerr, and then    
+   * modify the cerr object directly. This is the option we are going with.
+   * We are not breaking the constness of req_state but only modifying the err object.
+  */
+  rgw_err &err = const_cast<rgw_err&>(cerr);
+  switch (error_reason) {
+  case -ERR_SIGNATURE_NO_MATCH: {
+    err.message = "The request signature we calculated does not match the "
+                  "signature you provided. Check your key and signing method.";
+    err.addlHeaders.clear();
+    err.addlHeaders.reserve(6);
+    err.addlHeaders.push_back(
+        make_pair("AWSAccessKeyId", std::string(auth_data.access_key_id)));
+    err.addlHeaders.push_back(
+        make_pair("StringToSign", auth_data.string_to_sign));
+    err.addlHeaders.push_back(make_pair(
+        "SignatureProvided", std::string(auth_data.client_signature)));
+    std::stringstream hexStream;
+    hexStream << std::hex << std::setfill('0');
+    for (char c : auth_data.string_to_sign) {
+      hexStream << std::setw(2)
+                << static_cast<int>(static_cast<unsigned char>(c)) << " ";
+    }
+    err.addlHeaders.push_back(make_pair("StringToSignBytes", hexStream.str()));
+    if (auth_data.canonical_request.size() > 0) {
+      using sanitize = rgw::crypt_sanitize::log_content;
+      std::stringstream canonicalStream;
+      canonicalStream << sanitize{auth_data.canonical_request};
+      err.addlHeaders.push_back(
+          make_pair("CanonicalRequest", canonicalStream.str()));
+      hexStream.str(""); // Clear the content of the string buffer
+      for (char c : canonicalStream.str()) {
+        hexStream << std::setw(2)
+                  << static_cast<int>(static_cast<unsigned char>(c)) << " ";
+      }
+      err.addlHeaders.push_back(
+          make_pair("CanonicalRequestBytes", hexStream.str()));
+    }
+  } break;
+  default:
+    break;
+  }
+}
 } // namespace rgw::auth::s3
 
 rgw::LDAPHelper* rgw::auth::s3::LDAPEngine::ldh = nullptr;
@@ -6297,7 +6360,8 @@ rgw::auth::s3::LDAPEngine::get_acl_strategy() const
 }
 
 rgw::auth::RemoteApplier::AuthInfo
-rgw::auth::s3::LDAPEngine::get_creds_info(const rgw::RGWToken& token) const noexcept
+rgw::auth::s3::LDAPEngine::get_creds_info(const rgw::RGWToken& token) const
+noexcept
 {
   /* The short form of "using" can't be used here -- we're aliasing a class'
    * member. */
