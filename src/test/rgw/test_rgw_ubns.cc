@@ -152,7 +152,7 @@ public:
       DeleteBucketEntryResponse* response) override
   {
     if (!buckets_.check_erase(request->bucket())) {
-      return grpc::Status(grpc::StatusCode::NOT_FOUND, "Bucket not found");
+      return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "Bucket not found");
     }
     return grpc::Status::OK;
   }
@@ -268,7 +268,7 @@ TEST_F(UBNSTestImplGRPCTest, AddRemoveAddSucceeds)
   EXPECT_TRUE(res.ok()) << "re-add of same bucket after deletion should succeed, but got: " << res.message();
 }
 
-TEST_F(UBNSTestImplGRPCTest, DeleteNonexistentFails)
+TEST_F(UBNSTestImplGRPCTest, DeleteNonexistentSucceeds)
 {
   server().start();
   helper_init();
@@ -276,10 +276,10 @@ TEST_F(UBNSTestImplGRPCTest, DeleteNonexistentFails)
   DEFINE_REQ_STATE;
   s.cio = &cio;
   auto res = uci_.delete_bucket_entry(&dpp_, "foo", "cluster", "owner");
-  EXPECT_FALSE(res.ok()) << "delete of nonexistent bucket should fail";
+  EXPECT_TRUE(res.ok()) << "delete of nonexistent bucket should succeed";
 }
 
-TEST_F(UBNSTestImplGRPCTest, SecondDeleteFails)
+TEST_F(UBNSTestImplGRPCTest, SecondDeleteSucceeds)
 {
   server().start();
   helper_init();
@@ -291,7 +291,7 @@ TEST_F(UBNSTestImplGRPCTest, SecondDeleteFails)
   res = uci_.delete_bucket_entry(&dpp_, "foo", "cluster", "owner");
   EXPECT_TRUE(res.ok()) << "delete of existing bucket should succeed, but got: " << res.message();
   res = uci_.delete_bucket_entry(&dpp_, "foo", "cluster", "owner");
-  EXPECT_FALSE(res.ok()) << "second delete of non-nonexistent bucket should fail";
+  EXPECT_TRUE(res.ok()) << "second delete of non-nonexistent bucket should succeed";
 }
 
 TEST_F(UBNSTestImplGRPCTest, Update)
