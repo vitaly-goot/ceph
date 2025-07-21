@@ -5757,15 +5757,16 @@ AWSSignerV4::prepare(const DoutPrefixProvider *dpp,
   auto cct = dpp->get_cct();
 
   /* Craft canonical request. */
-  auto canonical_req_hash = \
-    rgw::auth::s3::get_v4_canon_req_hash(cct,
-                                         info.method,
-                                         std::move(canonical_uri),
-                                         std::move(canonical_qs),
-                                         std::move(canonical_headers),
-                                         signed_hdrs,
-                                         exp_payload_hash,
-                                         dpp);
+  const auto canonical_req = string_join_reserve("\n",
+    info.method,
+    std::move(canonical_uri),
+    std::move(canonical_qs),
+    std::move(canonical_headers),
+    signed_hdrs,
+    exp_payload_hash);
+
+  auto canonical_req_hash =
+    rgw::auth::s3::get_v4_canon_req_hash(cct, canonical_req, dpp);
 
   auto string_to_sign = \
     rgw::auth::s3::get_v4_string_to_sign(cct,

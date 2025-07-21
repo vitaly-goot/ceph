@@ -834,35 +834,6 @@ std::string gen_v4_canonical_headers(const req_info& info,
  *
  * http://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html
  */
-sha256_digest_t
-get_v4_canon_req_hash(CephContext* cct,
-                      const std::string_view& http_verb,
-                      const std::string& canonical_uri,
-                      const std::string& canonical_qs,
-                      const std::string& canonical_hdrs,
-                      const std::string_view& signed_hdrs,
-                      const std::string_view& request_payload_hash,
-                      const DoutPrefixProvider *dpp)
-{
-  ldpp_dout(dpp, 10) << "payload request hash = " << request_payload_hash << dendl;
-
-  const auto canonical_req = string_join_reserve("\n",
-    http_verb,
-    canonical_uri,
-    canonical_qs,
-    canonical_hdrs,
-    signed_hdrs,
-    request_payload_hash);
-
-  const auto canonical_req_hash = calc_hash_sha256(canonical_req);
-
-  using sanitize = rgw::crypt_sanitize::log_content;
-  ldpp_dout(dpp, 10) << "canonical request = " << sanitize{canonical_req} << dendl;
-  ldpp_dout(dpp, 10) << "canonical request hash = "
-                 << canonical_req_hash << dendl;
-
-  return canonical_req_hash;
-}
 
 sha256_digest_t 
 get_v4_canon_req_hash(CephContext *cct,

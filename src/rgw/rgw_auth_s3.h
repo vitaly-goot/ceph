@@ -715,16 +715,6 @@ std::string gen_v4_canonical_headers(const req_info& info,
                                      const std::map<std::string, std::string>& extra_headers,
                                      string *signed_hdrs);
 
-extern sha256_digest_t
-get_v4_canon_req_hash(CephContext* cct,
-                      const std::string_view& http_verb,
-                      const std::string& canonical_uri,
-                      const std::string& canonical_qs,
-                      const std::string& canonical_hdrs,
-                      const std::string_view& signed_hdrs,
-                      const std::string_view& request_payload_hash,
-                      const DoutPrefixProvider *dpp);
-
 extern sha256_digest_t 
 get_v4_canon_req_hash(CephContext *cct,
                       const std::string &canonical_req,
