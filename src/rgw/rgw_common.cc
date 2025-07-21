@@ -382,9 +382,9 @@ void dump(req_state* s)
   if (!s->err.err_code.empty())
     s->formatter->dump_string("Code", s->err.err_code);
   s->formatter->dump_string("Message", s->err.message);
-  for (std::pair<std::string_view, std::string> addlHeader :
-       s->err.addlHeaders) {
-    s->formatter->dump_string(addlHeader.first, addlHeader.second);
+  for (std::pair<std::string_view, std::string> extraHeader :
+       s->extraHeaders) {
+    s->formatter->dump_string(extraHeader.first, extraHeader.second);
   }
   if (!s->bucket_name.empty()) // TODO: connect to expose_bucket
     s->formatter->dump_string("BucketName", s->bucket_name);

@@ -1123,6 +1123,9 @@ struct req_state : DoutPrefixProvider {
   int64_t content_length{0};
   std::map<std::string, std::string> generic_attrs;
   rgw_err err;
+  // Aplace to hold stuff to be returned to the client
+  // This is most likely stuff for error responses, but could be anything.
+  std::vector<std::pair<std::string_view, std::string>> extraHeaders;
   bool expect_cont{false};
   uint64_t obj_size{0};
   bool enable_ops_log;

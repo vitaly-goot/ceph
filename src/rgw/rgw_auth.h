@@ -6,6 +6,7 @@
 #include <functional>
 #include <optional>
 #include <ostream>
+#include <string_view>
 #include <type_traits>
 #include <system_error>
 #include <utility>
@@ -210,6 +211,9 @@ public:
     struct rejection_mark_t {};
     bool is_rejected = false;
     int reason = 0;
+    // Error stuff to be moved to req_state when req_state is no longer const.
+    std::string_view message;
+    std::vector<std::pair<std::string_view, std::string>> extraHeaders;
 
     std::pair<IdentityApplier::aplptr_t, Completer::cmplptr_t> result_pair;
 
@@ -284,8 +288,28 @@ public:
                             Completer::cmplptr_t&& completer) {
       return AuthResult(std::move(applier), std::move(completer));
     }
-  };
+    
+    void set_message(std::string_view message) {
+      this->message = std::move(message);
+    }
 
+    const std::string_view get_message() const {
+      return message;
+    }
+
+    void clear_extra_headers(int n = 1) {
+      extraHeaders.clear();
+      extraHeaders.reserve(n);
+    }
+    
+    void add_extra_header(std::string_view key, std::string value) {
+      extraHeaders.emplace_back(key, std::move(value));
+    }
+    
+    std::vector<std::pair<std::string_view, std::string>>& get_extra_headers() {
+      return extraHeaders;
+    }
+  };
   using result_t = AuthResult;
 
   /* Get name of the auth engine. */

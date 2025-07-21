@@ -6250,65 +6250,47 @@ AWSEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s,
         auth_data.signature_factory, auth_data.completer_factory, s, y);
 
     if (engine_result.get_reason() != 0) {
-      FillErrorInfo(engine_result.get_reason(), auth_data, s->err);
+      FillErrorInfo(auth_data, engine_result);
     }
 
     return engine_result;
   }
 }
-
-void AWSEngine::FillErrorInfo(const int error_reason,
-                              const VersionAbstractor::auth_data_t &auth_data,
-                              const rgw_err &cerr) const 
+void AWSEngine::FillErrorInfo(const VersionAbstractor::auth_data_t &auth_data,
+                              result_t &engine_result) const
 {
-  /* use of const_cast<>
-   * There's a lot of thought in the industry that const_cast<>
-   * should be avoided at all cost. I believe "all cost" is a bit  much.
-   * In this case, we are faced with needing to return a bunch of stuff
-   * in the err object. We have three options. The industry accepted option
-   * would be to modify the signature to include err as a separate argument to
-   * authenticate(). This change of signature affects a lot of code, and won't be done
-   * upstream, so upgrading will be a bother. The next option is to modify
-   * AWSEngine::result_t to accept this info and return that. Then later, when
-   * the call tree has reached a point where req_state is no longer const, copy/move 
-   * all the err stuff from result_t to req_state.err. Extra work. The last option
-   * is to use const_cast<> to cast away the constness of cerr, and then    
-   * modify the cerr object directly. This is the option we are going with.
-   * We are not breaking the constness of req_state but only modifying the err object.
+  /* Place a message and any extra headers in the result object.
+   * This is done to provide more information to the user about the error.
+   * This information will be moved to req_state when req_state is no longer const
   */
-  rgw_err &err = const_cast<rgw_err&>(cerr);
-  switch (error_reason) {
+  switch (engine_result.get_reason()) 
+  {
   case -ERR_SIGNATURE_NO_MATCH: {
-    err.message = "The request signature we calculated does not match the "
-                  "signature you provided. Check your key and signing method.";
-    err.addlHeaders.clear();
-    err.addlHeaders.reserve(6);
-    err.addlHeaders.push_back(
-        make_pair("AWSAccessKeyId", std::string(auth_data.access_key_id)));
-    err.addlHeaders.push_back(
-        make_pair("StringToSign", auth_data.string_to_sign));
-    err.addlHeaders.push_back(make_pair(
-        "SignatureProvided", std::string(auth_data.client_signature)));
-    std::stringstream hexStream;
+    engine_result.set_message("The request signature we calculated does not match the "
+        "signature you provided. Check your key and signing method.");
+    engine_result.clear_extra_headers(6);
+    engine_result.add_extra_header("AWSAccessKeyId", std::string(auth_data.access_key_id));
+    engine_result.add_extra_header("StringToSign", auth_data.string_to_sign);
+    engine_result.add_extra_header("SignatureProvided", std::string(auth_data.client_signature));
+    std::stringstream hexStream;  
     hexStream << std::hex << std::setfill('0');
     for (char c : auth_data.string_to_sign) {
       hexStream << std::setw(2)
                 << static_cast<int>(static_cast<unsigned char>(c)) << " ";
     }
-    err.addlHeaders.push_back(make_pair("StringToSignBytes", hexStream.str()));
+    engine_result.add_extra_header("StringToSignBytes", hexStream.str());
     if (auth_data.canonical_request.size() > 0) {
       using sanitize = rgw::crypt_sanitize::log_content;
       std::stringstream canonicalStream;
       canonicalStream << sanitize{auth_data.canonical_request};
-      err.addlHeaders.push_back(
-          make_pair("CanonicalRequest", canonicalStream.str()));
+      engine_result.add_extra_header("CanonicalRequest", canonicalStream.str());
+          
       hexStream.str(""); // Clear the content of the string buffer
       for (char c : canonicalStream.str()) {
         hexStream << std::setw(2)
                   << static_cast<int>(static_cast<unsigned char>(c)) << " ";
       }
-      err.addlHeaders.push_back(
-          make_pair("CanonicalRequestBytes", hexStream.str()));
+      engine_result.add_extra_header("CanonicalRequestBytes", hexStream.str());
     }
   } break;
   default:
