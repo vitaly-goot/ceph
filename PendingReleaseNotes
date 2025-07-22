@@ -1,3 +1,8 @@
+>=18.2.7
+--------
+
+* The ``auth_supported`` config has been removed.
+
 >=18.2.5
 --------
 
