@@ -23,7 +23,6 @@
 #include <string>
 #include <fmt/format.h>
 
-#include <vector>
 #include "include/types.h"
 #include "rgw_compression_types.h"
 #include "rgw_pool_types.h"

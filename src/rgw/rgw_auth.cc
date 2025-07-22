@@ -307,7 +307,7 @@ rgw::auth::Strategy::apply(const DoutPrefixProvider *dpp, const rgw::auth::Strat
 
       s->err.message = result.get_message();
       for (const auto& extraHeader : result.get_extra_headers()) {
-          s->extraHeaders.emplace_back(extraHeader.first, extraHeader.second);
+          s->extra_headers.emplace_back(extraHeader.first, extraHeader.second);
       }
       return result.get_reason();
     }

@@ -213,7 +213,7 @@ public:
     int reason = 0;
     // Error stuff to be moved to req_state when req_state is no longer const.
     std::string_view message;
-    std::vector<std::pair<std::string_view, std::string>> extraHeaders;
+    std::vector<std::pair<std::string_view, std::string>> extra_headers;
 
     std::pair<IdentityApplier::aplptr_t, Completer::cmplptr_t> result_pair;
 
@@ -298,16 +298,16 @@ public:
     }
 
     void clear_extra_headers(int n = 1) {
-      extraHeaders.clear();
-      extraHeaders.reserve(n);
+      extra_headers.clear();
+      extra_headers.reserve(n);
     }
     
     void add_extra_header(std::string_view key, std::string value) {
-      extraHeaders.emplace_back(key, std::move(value));
+      extra_headers.emplace_back(key, std::move(value));
     }
     
     std::vector<std::pair<std::string_view, std::string>>& get_extra_headers() {
-      return extraHeaders;
+      return extra_headers;
     }
   };
   using result_t = AuthResult;

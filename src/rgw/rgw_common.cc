@@ -382,8 +382,7 @@ void dump(req_state* s)
   if (!s->err.err_code.empty())
     s->formatter->dump_string("Code", s->err.err_code);
   s->formatter->dump_string("Message", s->err.message);
-  for (std::pair<std::string_view, std::string> extraHeader :
-       s->extraHeaders) {
+  for (auto extraHeader : s->extra_headers) {
     s->formatter->dump_string(extraHeader.first, extraHeader.second);
   }
   if (!s->bucket_name.empty()) // TODO: connect to expose_bucket

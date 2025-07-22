@@ -1125,7 +1125,7 @@ struct req_state : DoutPrefixProvider {
   rgw_err err;
   // A place to hold stuff to be returned to the client
   // This is most likely stuff for error responses, but could be anything.
-  std::vector<std::pair<std::string_view, std::string>> extraHeaders;
+  std::vector<std::pair<std::string_view, std::string>> extra_headers;
   bool expect_cont{false};
   uint64_t obj_size{0};
   bool enable_ops_log;
