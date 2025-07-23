@@ -1209,7 +1209,7 @@ AWSv4ComplMulti::ReceiveChunkResult AWSv4ComplMulti::recv_chunk(
      * won't be triggered for the last, zero-length chunk. Instead, it will
      * be checked in the complete() method.  */
     if (stream_pos >= ChunkMeta::META_MAX_SIZE && is_signature_mismatched()) {
-      throw rgw::io::Exception(ERR_SIGNATURE_NO_MATCH, std::system_category());
+      throw rgw::io::Exception(ERR_AMZ_CONTENT_SHA256_MISMATCH, std::system_category());
     }
 
     /* We don't have metadata for this range. This means a new chunk, so we
@@ -1598,7 +1598,7 @@ bool AWSv4ComplMulti::complete()
     if (expect_trailer_signature() &&
 	(expected_trailer_signature.empty() ||
 	 (calculated_trailer_signature != expected_trailer_signature))) {
-      throw rgw::io::Exception(ERR_SIGNATURE_NO_MATCH, std::system_category());
+      throw rgw::io::Exception(ERR_AMZ_CONTENT_SHA256_MISMATCH, std::system_category());
     }
 
     return true;
