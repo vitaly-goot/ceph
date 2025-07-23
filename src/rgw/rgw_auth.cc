@@ -304,9 +304,13 @@ rgw::auth::Strategy::apply(const DoutPrefixProvider *dpp, const rgw::auth::Strat
        * nullptr inside. */
       ldpp_dout(dpp, 5) << "Failed the auth strategy, reason="
                        << result.get_reason() << dendl;
+
+      s->err.message = result.get_message();
+      for (const auto& extraHeader : result.get_extra_headers()) {
+          s->extra_headers.emplace_back(extraHeader.first, extraHeader.second);
+      }
       return result.get_reason();
     }
-
     try {
       rgw::auth::IdentityApplier::aplptr_t applier = result.get_applier();
       rgw::auth::Completer::cmplptr_t completer = result.get_completer();

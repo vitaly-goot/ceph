@@ -5757,15 +5757,16 @@ AWSSignerV4::prepare(const DoutPrefixProvider *dpp,
   auto cct = dpp->get_cct();
 
   /* Craft canonical request. */
-  auto canonical_req_hash = \
-    rgw::auth::s3::get_v4_canon_req_hash(cct,
-                                         info.method,
-                                         std::move(canonical_uri),
-                                         std::move(canonical_qs),
-                                         std::move(canonical_headers),
-                                         signed_hdrs,
-                                         exp_payload_hash,
-                                         dpp);
+  const auto canonical_req = string_join_reserve("\n",
+    info.method,
+    std::move(canonical_uri),
+    std::move(canonical_qs),
+    std::move(canonical_headers),
+    signed_hdrs,
+    exp_payload_hash);
+
+  auto canonical_req_hash =
+    rgw::auth::s3::get_v4_canon_req_hash(cct, canonical_req, dpp);
 
   auto string_to_sign = \
     rgw::auth::s3::get_v4_string_to_sign(cct,
@@ -5888,15 +5889,17 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
   auto canonical_method = rgw::auth::s3::get_v4_canonical_method(s);
 
   /* Craft canonical request. */
-  auto canonical_req_hash = \
-    rgw::auth::s3::get_v4_canon_req_hash(s->cct,
-                                         std::move(canonical_method),
-                                         std::move(canonical_uri),
-                                         std::move(canonical_qs),
-                                         std::move(*canonical_headers),
-                                         signed_hdrs,
-                                         exp_payload_hash,
-                                         s);
+  const auto canonical_req = string_join_reserve("\n",
+    canonical_method,
+    canonical_uri,
+    canonical_qs,
+    *canonical_headers,
+    signed_hdrs,
+    exp_payload_hash
+  );
+
+  auto canonical_req_hash =
+    rgw::auth::s3::get_v4_canon_req_hash(s->cct, canonical_req, s);
 
   auto string_to_sign = \
     rgw::auth::s3::get_v4_string_to_sign(s->cct,
@@ -5948,7 +5951,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
       session_token,
       std::move(string_to_sign),
       sig_factory,
-      null_completer_factory
+      null_completer_factory,
+      std::move(canonical_req)
     };
   } else {
     /* We're going to handle a signed payload. Be aware that even empty HTTP
@@ -6013,7 +6017,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
         session_token,
         std::move(string_to_sign),
         sig_factory,
-        cmpl_factory
+        cmpl_factory,
+        std::move(canonical_req)
       };
     } else {
       ldpp_dout(s, 10) << "body content detected in multiple chunks" << dendl;
@@ -6068,14 +6073,13 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
 					  flags,
                                           std::placeholders::_1,
                                           std::placeholders::_2);
-      return {
-        access_key_id,
-        client_signature,
-        session_token,
-        std::move(string_to_sign),
-        sig_factory,
-        cmpl_factory
-      };
+      return {access_key_id,
+              client_signature,
+              session_token,
+              std::move(string_to_sign),
+              sig_factory,
+              cmpl_factory,
+              std::move(canonical_req)};
     }
   }
 }
@@ -6241,17 +6245,59 @@ AWSEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s,
   if (auth_data.access_key_id.empty() || auth_data.client_signature.empty()) {
     return result_t::deny(-EINVAL);
   } else {
-    return authenticate(dpp,
-                        auth_data.access_key_id,
-		        auth_data.client_signature,
-			auth_data.session_token,
-			auth_data.string_to_sign,
-                        auth_data.signature_factory,
-			auth_data.completer_factory,
-			s, y);
+    result_t engine_result = authenticate(
+        dpp, auth_data.access_key_id, auth_data.client_signature,
+        auth_data.session_token, auth_data.string_to_sign,
+        auth_data.signature_factory, auth_data.completer_factory, s, y);
+
+    if (engine_result.get_reason() != 0) {
+      FillErrorInfo(auth_data, engine_result);
+    }
+
+    return engine_result;
   }
 }
-
+void AWSEngine::FillErrorInfo(const VersionAbstractor::auth_data_t &auth_data,
+                              result_t &engine_result) const
+{
+  /* Place a message and any extra headers in the result object.
+   * This is done to provide more information to the user about the error.
+   * This information will be moved to req_state when req_state is no longer const
+  */
+  switch (engine_result.get_reason()) 
+  {
+  case -ERR_SIGNATURE_NO_MATCH: {
+    engine_result.set_message("The request signature we calculated does not match the "
+        "signature you provided. Check your key and signing method.");
+    engine_result.clear_extra_headers(6);
+    engine_result.add_extra_header("AWSAccessKeyId", std::string(auth_data.access_key_id));
+    engine_result.add_extra_header("StringToSign", auth_data.string_to_sign);
+    engine_result.add_extra_header("SignatureProvided", std::string(auth_data.client_signature));
+    std::stringstream hexStream;  
+    hexStream << std::hex << std::setfill('0');
+    for (char c : auth_data.string_to_sign) {
+      hexStream << std::setw(2)
+                << static_cast<int>(static_cast<unsigned char>(c)) << " ";
+    }
+    engine_result.add_extra_header("StringToSignBytes", hexStream.str());
+    if (auth_data.canonical_request.size() > 0) {
+      using sanitize = rgw::crypt_sanitize::log_content;
+      std::stringstream canonicalStream;
+      canonicalStream << sanitize{auth_data.canonical_request};
+      engine_result.add_extra_header("CanonicalRequest", canonicalStream.str());
+          
+      hexStream.str(""); // Clear the content of the string buffer
+      for (char c : canonicalStream.str()) {
+        hexStream << std::setw(2)
+                  << static_cast<int>(static_cast<unsigned char>(c)) << " ";
+      }
+      engine_result.add_extra_header("CanonicalRequestBytes", hexStream.str());
+    }
+  } break;
+  default:
+    break;
+  }
+}
 } // namespace rgw::auth::s3
 
 rgw::LDAPHelper* rgw::auth::s3::LDAPEngine::ldh = nullptr;
@@ -6297,7 +6343,8 @@ rgw::auth::s3::LDAPEngine::get_acl_strategy() const
 }
 
 rgw::auth::RemoteApplier::AuthInfo
-rgw::auth::s3::LDAPEngine::get_creds_info(const rgw::RGWToken& token) const noexcept
+rgw::auth::s3::LDAPEngine::get_creds_info(const rgw::RGWToken& token) const
+noexcept
 {
   /* The short form of "using" can't be used here -- we're aliasing a class'
    * member. */
