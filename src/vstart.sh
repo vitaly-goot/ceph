@@ -640,7 +640,7 @@ do_rgw_conf() {
     for n in $(seq 1 $CEPH_NUM_RGW); do
         wconf << EOF
 [client.rgw.${current_port}]
-        rgw frontends = $rgw_frontend port=${current_port}${flight_conf:+,arrow_flight} ssl_port=8001 ssl_certificate=/etc/ssl/certs/rgw.crt ssl_private_key=/etc/ssl/certs/rgw.key
+        rgw frontends = $rgw_frontend port=${current_port}${flight_conf:+,arrow_flight}
         admin socket = ${CEPH_OUT_DIR}/radosgw.${current_port}.asok
         debug rgw_flight = 20
 EOF
@@ -1742,9 +1742,8 @@ do_rgw()
             --pid-file=${CEPH_OUT_DIR}/radosgw.${current_port}.pid \
             --rgw_luarocks_location=${CEPH_OUT_DIR}/luarocks \
             ${RGWDEBUG} \
-            -n ${rgw_name} 
-
-#            "--rgw_frontends=${rgw_frontend} port=${current_port}${CEPH_RGW_HTTPS}${flight_conf:+,arrow_flight} ssl_port=8001 ssl_certificate=/etc/ssl/certs/rgw.crt ssl_key=/etc/ssl/certs/rgw.key"
+            -n ${rgw_name} \
+            "--rgw_frontends=${rgw_frontend} port=${current_port}${CEPH_RGW_HTTPS}${flight_conf:+,arrow_flight}"
 
         i=$(($i + 1))
         [ $i -eq $CEPH_NUM_RGW ] && break
