@@ -451,13 +451,6 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
         results.objs.size(), results.is_truncated, results.next_marker.name, results.next_marker.instance)
                         << dendl;
 
-    if (results.objs.size() == 0) {
-      // We've reached the end of the bucket.
-      ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() EOF items_.size()={}"), items_.size()) << dendl;
-      seen_eof = true;
-      break;
-    }
-
     ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() returned {} items"), results.objs.size())
                         << dendl;
 
@@ -505,6 +498,14 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
       }
 
     } // for each SAL object result
+
+    // If the SAL indicates there are no more results, exit the while loop.
+    if (!results.is_truncated) {
+      // We've reached the end of the bucket.
+      ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() EOF"), items_.size()) << dendl;
+      seen_eof = true;
+      break;
+    }
   } // while items_.size() < max_entries_
 
   // s->bucket->list() can fail. We rely on op_ret being properly set at the
