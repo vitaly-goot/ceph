@@ -446,6 +446,11 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
       break;
     }
 
+    // XXX debug
+    ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() query returned {} objects, is_truncated={}, next_marker[name={}, instance={}]"),
+        results.objs.size(), results.is_truncated, results.next_marker.name, results.next_marker.instance)
+                        << dendl;
+
     if (results.objs.size() == 0) {
       // We've reached the end of the bucket.
       ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() EOF items_.size()={}"), items_.size()) << dendl;
