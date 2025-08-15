@@ -426,7 +426,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
   stats_.entries_max = max_entries_;
 
   // Loop until we've filled the user's requested number of entries, or we hit
-  // EOF.
+  // EOF (i.e. the result of s->bucket->list() was truncated).
   while (items_.size() < max_entries_) {
     rgw::sal::Bucket::ListResults results;
 
@@ -434,6 +434,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
         FMT_STRING("issue bucket list() query query_max={} next=[marker={}, instance={}]"),
         query_max, params.marker.name, params.marker.instance)
                         << dendl;
+
     // Note that rgw::sal::RadosBucket::list() updates params.marker as it
     // goes. This isn't how list_multiparts() works, don't get caught.
     auto ret = s->bucket->list(this, params, query_max, results, y);
@@ -446,22 +447,28 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
       break;
     }
 
-    // XXX debug
     ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() query returned {} objects, is_truncated={}, next_marker[name={}, instance={}]"),
         results.objs.size(), results.is_truncated, results.next_marker.name, results.next_marker.instance)
                         << dendl;
 
-    ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() returned {} items"), results.objs.size())
-                        << dendl;
+    // If the SAL indicates there are no more results (i.e. 'not truncated')
+    // this will be the last iteration, and there's no next marker to set. Set
+    // seen_eof, because 'seen EOF' is mnemonically easier to understand than
+    // '!is_truncated'.
 
-    // Loop over the results of s->bucket->list().
+    if (!results.is_truncated) {
+      seen_eof = true;
+    }
+
+    // Loop over the results of s->bucket->list() until we either fill the
+    // user's maximum request size or get to the end of the bucket.
     for (size_t n = 0; n < results.objs.size(); n++) {
       stats_.sal_seen++;
 
       auto& obj = results.objs[n];
       ldpp_dout(this, 20)
-          << fmt::format(FMT_STRING("obj {}/{}: key={} exists={} current={} delete_marker={}"),
-                 n + 1, results.objs.size(), obj.key.name, obj.exists, obj.is_current(),
+          << fmt::format(FMT_STRING("SAL result obj {}/{}: key='{}' instance='{}' exists={} current={} delete_marker={}"),
+                 n + 1, results.objs.size(), obj.key.name, obj.key.instance, obj.exists, obj.is_current(),
                  obj.is_delete_marker())
           << dendl;
 
@@ -481,31 +488,37 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
           item.set_size(obj.meta.size);
         }
         items_.push_back(item);
+        ldpp_dout(this, 20)
+            << fmt::format(FMT_STRING("added user result item {}: key='{}'"), items_.size(), item.key())
+            << dendl;
         stats_.entries_actual++;
       }
       if (obj.exists) {
         stats_.sal_exists++;
       }
 
-      // Extra action if we've reached the caller's size limit.
+      // If we've filled the user's requested number of entries, we need to
+      // exit the loop. Only set the next marker if there are more results to
+      // come.
       if (items_.size() == max_entries_) {
-        // If we filled items_, set the token for next time. It's ok if it's
-        // actually the end of the list - the next query will just have zero
-        // items.
-        next_marker = rgw_obj_key(results.objs[n].key.name, results.objs[n].key.instance);
-        ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next=[name={},instance={}]"), next_marker.name, next_marker.instance) << dendl;
-        break;
+        // Exit without a marker iff we're hit eof AND we've filled in all the
+        // results from the SAL result. If we've not used all the results from
+        // the SAL result, set the marker even if we've hit eof.
+        if (seen_eof and n == results.objs.size() - 1) {
+          ldpp_dout(this, 20) << fmt::format(FMT_STRING("max_entries reached, seen EOF")) << dendl;
+        } else {
+          next_marker = rgw_obj_key(results.objs[n].key.name, results.objs[n].key.instance);
+          ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next=[name={},instance={}]"), next_marker.name, next_marker.instance) << dendl;
+        }
+        break; // We'll also fail the outer while loop's condition.
       }
-
     } // for each SAL object result
 
-    // If the SAL indicates there are no more results, exit the while loop.
-    if (!results.is_truncated) {
-      // We've reached the end of the bucket.
-      ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() EOF"), items_.size()) << dendl;
-      seen_eof = true;
+    if (seen_eof) {
+      ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() exit on EOF"), items_.size()) << dendl;
       break;
     }
+
   } // while items_.size() < max_entries_
 
   // s->bucket->list() can fail. We rely on op_ret being properly set at the
