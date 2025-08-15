@@ -327,8 +327,6 @@ static std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw
   f.close_section(); // ContinuationToken
   f.flush(bl);
   std::string token = bl.to_str();
-  ldpp_dout(dpp, 20)
-      << fmt::format(FMT_STRING("prepared continuation token: {}"), token) << dendl;
   return token;
 }
 
@@ -363,9 +361,6 @@ static std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProv
 
 bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 {
-  // XXX remove this, it's to make sure the devs are running the right container.
-  ldpp_dout(this, 20) << "XXX storequery debug: ceph version " << CEPH_GIT_NICE_VER << dendl;
-
   // The ListParams persists across multiple requests.
   rgw::sal::Bucket::ListParams params {};
 
@@ -412,7 +407,9 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
                        << dendl;
   }
 
-  bool seen_eof = false;
+  bool seen_eof = false; // Easier to understand than '!results.is_truncated'.
+  bool early_exit = false; // True if we ran out of space in the user list before we ran out of objects.
+
   rgw_obj_key next_marker;
 
   // Reserve space for the maximum number of entries we might return. This is
@@ -427,7 +424,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 
   // Loop until we've filled the user's requested number of entries, or we hit
   // EOF (i.e. the result of s->bucket->list() was truncated).
-  while (items_.size() < max_entries_) {
+  while (!seen_eof && items_.size() < max_entries_) {
     rgw::sal::Bucket::ListResults results;
 
     ldpp_dout(this, 20) << fmt::format(
@@ -439,6 +436,11 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
     // goes. This isn't how list_multiparts() works, don't get caught.
     auto ret = s->bucket->list(this, params, query_max, results, y);
     stats_.sal_queries++;
+
+    // Clear next_marker. It's used outside the loop for the continuation
+    // token, and not for SAL queries. We'll only set it if we decide it's
+    // necessary to expose to the caller.
+    next_marker = rgw_obj_key("");
 
     if (ret < 0) {
       op_ret = ret;
@@ -452,16 +454,21 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
                         << dendl;
 
     // If the SAL indicates there are no more results (i.e. 'not truncated')
-    // this will be the last iteration, and there's no next marker to set. Set
-    // seen_eof, because 'seen EOF' is mnemonically easier to understand than
-    // '!is_truncated'.
+    // we can stop querying for this objectlist command instance. Note that
+    // the user might end up issuing additional queries, as it's possible to
+    // fill the user's items_ array before we copy all the results out.
+    //
+    // It would be simpler if we were to allow the items_ array to be larger
+    // than the user requested, but we'll follow the robustness principle and
+    // not return more results than we were asked for.
+    //
+    // seen_eof is easier to understand than '!is_truncated', to my brain
+    // anyway.
 
-    if (!results.is_truncated) {
-      seen_eof = true;
-    }
+    seen_eof = !results.is_truncated;
 
     // Loop over the results of s->bucket->list() until we either fill the
-    // user's maximum request size or get to the end of the bucket.
+    // user's maximum request size or get to the end of the query results.
     for (size_t n = 0; n < results.objs.size(); n++) {
       stats_.sal_seen++;
 
@@ -472,6 +479,9 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
                  obj.is_delete_marker())
           << dendl;
 
+      if (obj.exists) {
+        stats_.sal_exists++;
+      }
       // We're only really interested in the current (most recent) version of
       // the object.
       if (!obj.is_current()) {
@@ -487,39 +497,33 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
           // Only non-deleted items should have a size.
           item.set_size(obj.meta.size);
         }
+        // This is the *only* place we add to the items_ array.
         items_.push_back(item);
         ldpp_dout(this, 20)
             << fmt::format(FMT_STRING("added user result item {}: key='{}'"), items_.size(), item.key())
             << dendl;
         stats_.entries_actual++;
-      }
-      if (obj.exists) {
-        stats_.sal_exists++;
+
+        // If we've filled the user's requested number of entries, we need to
+        // set the marker properly and exit the item loop.
+        if (items_.size() >= max_entries_) {
+          // Set the marker to exactly where we left off.
+          next_marker = rgw_obj_key(results.objs[n].key.name, results.objs[n].key.instance);
+          early_exit = true;
+          ldpp_dout(this, 20) << fmt::format(FMT_STRING("filled user items array, next_marker=[name={},instance={}]"),
+              next_marker.name, next_marker.instance)
+                              << dendl;
+          break; // We'll also fail the outer while loop's condition.
+        }
       }
 
-      // If we've filled the user's requested number of entries, we need to
-      // exit the loop. Only set the next marker if there are more results to
-      // come.
-      if (items_.size() == max_entries_) {
-        // Exit without a marker iff we're hit eof AND we've filled in all the
-        // results from the SAL result. If we've not used all the results from
-        // the SAL result, set the marker even if we've hit eof.
-        if (seen_eof and n == results.objs.size() - 1) {
-          ldpp_dout(this, 20) << fmt::format(FMT_STRING("max_entries reached, seen EOF")) << dendl;
-        } else {
-          next_marker = rgw_obj_key(results.objs[n].key.name, results.objs[n].key.instance);
-          ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next=[name={},instance={}]"), next_marker.name, next_marker.instance) << dendl;
-        }
-        break; // We'll also fail the outer while loop's condition.
-      }
     } // for each SAL object result
 
-    if (seen_eof) {
-      ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL bucket->list() exit on EOF"), items_.size()) << dendl;
-      break;
-    }
+  } // while !seen_eof && items_.size() < max_entries_
 
-  } // while items_.size() < max_entries_
+  ldpp_dout(this, 10) << fmt::format(FMT_STRING("loop exit: seen_eof={} early_exit={} next_marker=[name={},instance={}]"),
+      seen_eof, early_exit, next_marker.name, next_marker.instance)
+                      << dendl;
 
   // s->bucket->list() can fail. We rely on op_ret being properly set at the
   // point of failure.
@@ -527,7 +531,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
     return false;
   }
 
-  if (!seen_eof && !next_marker.empty()) {
+  if (!next_marker.empty()) {
     // If there are more results, we need to safely encode the continuation
     // marker and return it to the user. This is done by setting
     // return_marker_, which will be dumped in send_response_json().
@@ -551,6 +555,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
       // 4. Our parser code expects valid base64.
       encoded_marker += '=';
     }
+    // Show the un-base64'd marker at l20. Show the base64'd marker at l5.
     ldpp_dout(this, 20) << fmt::format(FMT_STRING("EOF not reached, next_marker {}"), marker_str)
                         << dendl;
     ldpp_dout(this, 5) << fmt::format(FMT_STRING("EOF not reached, continuation token {}"), encoded_marker)
