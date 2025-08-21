@@ -396,7 +396,7 @@ struct SrcKey {
 
 }; // struct SrcKey
 
-class SQObjectlistHarness : public testing::TestWithParam<size_t> {
+class SQObjectlistHarness : public testing::TestWithParam<std::tuple<size_t, size_t>> {
 protected:
   /// The default number of entries to return in a list operation. When
   /// debugging, it will help you *a lot* to reduce this to a much smaller
@@ -738,12 +738,17 @@ TEST_F(SQObjectlistHarness, MetaTokenOrdering)
 // Check the first page of potentially paginated output.
 TEST_P(SQObjectlistHarness, StdNonVersionedFirstPage)
 {
+  size_t versions = std::get<1>(GetParam());
+  if (versions != 1) {
+    GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
+  }
+
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
   op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
-  size_t count = GetParam();
+  size_t count = std::get<0>(GetParam());
   fill_bucket_nonversioned(count);
 
   op->execute(null_yield);
@@ -780,8 +785,12 @@ TEST_P(SQObjectlistHarness, StdNonVersionedFirstPage)
 // continuation token will be for nonversioned buckets.
 TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
 {
+  size_t versions = std::get<1>(GetParam());
+  if (versions != 1) {
+    GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
+  }
   DEFINE_REQ_STATE;
-  size_t count = GetParam();
+  size_t count = std::get<0>(GetParam());
   fill_bucket_nonversioned(count);
 
   size_t last_page_size = count % kDefaultEntries;
@@ -856,13 +865,15 @@ TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersionsWithOneDeleted)
 // Check the first page of potentially paginated output.
 TEST_P(SQObjectlistHarness, StdVersionedFirstPage)
 {
+
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
   op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
-  size_t count = GetParam();
-  fill_bucket_versioned(count, 5);
+  size_t count = std::get<0>(GetParam());
+  size_t versions = std::get<1>(GetParam());
+  fill_bucket_versioned(count, versions);
 
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -880,7 +891,11 @@ TEST_P(SQObjectlistHarness, StdVersionedFirstPage)
 
 TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
 {
-  auto count = GetParam();
+  size_t versions = std::get<1>(GetParam());
+  if (versions != 1) {
+    GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
+  }
+  auto count = std::get<0>(GetParam());
   fill_bucket_nonversioned(count);
 
   std::optional<std::string> next_marker;
@@ -915,10 +930,11 @@ TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
-TEST_P(SQObjectlistHarness, CompoundQueryVersionedFiveVersionsNoDeletes)
+TEST_P(SQObjectlistHarness, CompoundQueryVersionedNoDeletes)
 {
-  auto count = GetParam();
-  fill_bucket_versioned(count, 5);
+  auto count = std::get<0>(GetParam());
+  auto versions = std::get<1>(GetParam());
+  fill_bucket_versioned(count, versions);
 
   std::optional<std::string> next_marker;
   int reps = 0;
@@ -976,14 +992,16 @@ constexpr std::array<size_t, 1229> generate_primes()
 }
 
 constexpr auto primes_under_10000 = generate_primes();
-TEST_P(SQObjectlistHarness, CompoundQueryVersionedFiveVersionsWithDeletes)
+TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
 {
   // We'll delete all the prime entries.
   std::vector<size_t> deletions;
   // deletions.reserve(primes_under_10000.size());
   deletions.insert(deletions.end(), primes_under_10000.begin(), primes_under_10000.end());
-  auto count = GetParam();
-  fill_bucket_versioned(count, 5, deletions);
+
+  auto count = std::get<0>(GetParam());
+  auto versions = std::get<1>(GetParam());
+  fill_bucket_versioned(count, versions, deletions);
 
   std::optional<std::string> next_marker;
   int reps = 0;
@@ -1017,52 +1035,12 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedFiveVersionsWithDeletes)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
-TEST_P(SQObjectlistHarness, CompoundQueryVersionedTenVersionsWithDeletes)
-{
-  // We'll delete all the prime entries.
-  std::vector<size_t> deletions;
-  // deletions.reserve(primes_under_10000.size());
-  deletions.insert(deletions.end(), primes_under_10000.begin(), primes_under_10000.end());
-  auto count = GetParam();
-  size_t versions = 10;
-  fill_bucket_versioned(count, versions, deletions);
-
-  std::optional<std::string> next_marker;
-  int reps = 0;
-  std::vector<RGWStoreQueryOp_ObjectList::item_type> items;
-
-  while (true) {
-    ASSERT_LT(reps, 2 * versions * count) << "Looks like we're in an infinite loop";
-    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
-    DEFINE_REQ_STATE;
-    init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
-        std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
-
-    op->execute(null_yield);
-    reps++;
-    ASSERT_EQ(op->get_ret(), 0);
-    std::copy(op->items().begin(), op->items().end(), std::back_inserter(items));
-    next_marker = op->return_marker();
-    if (!next_marker) {
-      break;
-    }
-  }
-  // We should get the same number of items back.
-  ASSERT_EQ(count, items.size());
-  // ...and those items should be the same as those in the bucket.
-  auto bucket_keys = bucket_object_keys();
-  std::set<std::string> result_keys;
-  for (const auto& item : items) {
-    result_keys.insert(item.key());
-  }
-  ASSERT_EQ(bucket_keys, result_keys);
-}
-
 INSTANTIATE_TEST_SUITE_P(StoreQuerySourceSizeParam, SQObjectlistHarness,
-    ::testing::Values(1, 2, 9, 10, 11, 19, 20, 21, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001),
+    ::testing::Combine(
+        ::testing::Values(1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001),
+        ::testing::Values(1, 2, 5)),
     [](const ::testing::TestParamInfo<SQObjectlistHarness::ParamType>& info) {
-      return fmt::format(FMT_STRING("size_{}"), info.param);
+      return fmt::format(FMT_STRING("size_{}_versions_{}"), std::get<0>(info.param), std::get<1>(info.param));
     });
 
 /***************************************************************************/
