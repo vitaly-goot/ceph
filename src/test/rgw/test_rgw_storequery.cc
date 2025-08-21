@@ -374,7 +374,11 @@ class SrcKey; // Forward declaration.
 
 class SQObjectlistHarness : public testing::TestWithParam<size_t> {
 protected:
-  static constexpr uint64_t kDefaultEntries = 10;
+  /// The default number of entries to return in a list operation. When
+  /// debugging, it will help you *a lot* to reduce this to a much smaller
+  /// number, like 10.
+  static constexpr uint64_t kDefaultEntries = 1000;
+  // static constexpr uint64_t kDefaultEntries = 10;
 
   RGWStoreQueryOp_ObjectList* op = nullptr;
 
@@ -452,9 +456,9 @@ protected:
       // rados will put the current entry first.
       if (del[i]) {
         SrcKey newkey { fmt::format("obj{:04d}", i), "d0001", SrcKey::Flag::VERSIONED | SrcKey::Flag::CURRENT | SrcKey::Flag::DELETE_MARKER };
-        ldpp_dout(dpp, 20) << fmt::format(
-            FMT_STRING("fill_bucket_versioned() adding delete marker key: {}"), newkey.to_string())
-                           << dendl;
+        // ldpp_dout(dpp, 20) << fmt::format(
+        //     FMT_STRING("fill_bucket_versioned() adding delete marker key: {}"), newkey.to_string())
+        //                    << dendl;
         src.push_back(newkey);
       }
       for (int v = 0; v < versions_per_item; v++) {
@@ -468,9 +472,9 @@ protected:
         // This uses the full constructor (name, instance, flags).
         using f = SrcKey::Flag;
         SrcKey newkey { fmt::format("obj{:04d}", i), fmt::format("v{:04d}", v), f::VERSIONED | (current ? f::CURRENT : 0) | f::EXISTS };
-        ldpp_dout(dpp, 20) << fmt::format(
-            FMT_STRING("fill_bucket_versioned() adding key: {}"), newkey.to_string())
-                           << dendl;
+        // ldpp_dout(dpp, 20) << fmt::format(
+        //     FMT_STRING("fill_bucket_versioned() adding key: {}"), newkey.to_string())
+        //                    << dendl;
         src.push_back(newkey);
       }
     }
@@ -921,8 +925,48 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedFiveVersionsWithDeletes)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
+TEST_P(SQObjectlistHarness, CompoundQueryVersionedManyVersionsWithDeletes)
+{
+  // We'll delete all the prime entries.
+  std::vector<size_t> deletions = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
+  auto count = GetParam();
+  size_t versions = 20;
+  fill_bucket_versioned(count, versions, deletions);
+
+  std::optional<std::string> next_marker;
+  int reps = 0;
+  std::vector<RGWStoreQueryOp_ObjectList::item_type> items;
+
+  while (true) {
+    ASSERT_LT(reps, 2 * versions * count) << "Looks like we're in an infinite loop";
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
+    DEFINE_REQ_STATE;
+    init_op(&s, kDefaultEntries, next_marker);
+    op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+        std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
+
+    op->execute(null_yield);
+    reps++;
+    ASSERT_EQ(op->get_ret(), 0);
+    std::copy(op->items().begin(), op->items().end(), std::back_inserter(items));
+    next_marker = op->return_marker();
+    if (!next_marker) {
+      break;
+    }
+  }
+  // We should get the same number of items back.
+  ASSERT_EQ(count, items.size());
+  // ...and those items should be the same as those in the bucket.
+  auto bucket_keys = bucket_object_keys();
+  std::set<std::string> result_keys;
+  for (const auto& item : items) {
+    result_keys.insert(item.key());
+  }
+  ASSERT_EQ(bucket_keys, result_keys);
+}
+
 INSTANTIATE_TEST_SUITE_P(StoreQuerySourceSizeParam, SQObjectlistHarness,
-    ::testing::Values(1, 2, 9, 10, 11, 19, 20, 21, 99, 100, 101, 999, 1000, 1001),
+    ::testing::Values(1, 2, 9, 10, 11, 19, 20, 21, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001),
     [](const ::testing::TestParamInfo<SQObjectlistHarness::ParamType>& info) {
       return fmt::format(FMT_STRING("size_{}"), info.param);
     });
