@@ -24,11 +24,15 @@
 #include "rgw/rgw_sal.h"
 #include "rgw_auth_registry.h"
 
+#include "test_rgw_storequery_util.h"
+
 namespace {
 
 using namespace std::string_literals;
 
 using namespace rgw;
+
+using namespace storequery_util;
 
 class StoreQueryHeaderParserTest : public ::testing::Test {
 protected:
@@ -252,150 +256,6 @@ public:
   }
 };
 
-// Minimally model an entry in a bucket index. There's a lot we don't care
-// about, but we do care about the key's name, instance, and versioning.
-struct SrcKey {
-  std::string name = "";
-  std::string instance = "";
-  bool versioned = false;
-  bool exists = false;
-  bool current = false;
-  bool delete_marker = false;
-
-  enum Flag {
-    /// The VERSIONED flag must be present for the CURRENT flag to take
-    /// effect, namely for rgw_bucket_dir_entry.is_versioned() to operate.
-    VERSIONED = 1 << 0,
-    EXISTS = 1 << 1,
-    CURRENT = 1 << 2,
-    DELETE_MARKER = 1 << 3
-  };
-
-  /// Construct a nonversioned object, which exists and is current.
-  SrcKey(const std::string& name)
-      : name(name)
-      , versioned(false)
-      , exists(true)
-      , current(true)
-  {
-  }
-  /// Construct a versioned object, which exists and is current, but is not a
-  /// delete marker.
-  SrcKey(const std::string& name, const std::string& instance)
-      : name(name)
-      , instance(instance)
-      , versioned(true)
-      , exists(true)
-      , current(true)
-  {
-  }
-  /// Construct a potentially versioned object, setting the versioned, exists,
-  /// current and delete_marker flags specifically.
-  SrcKey(const std::string& name, const std::string& instance, int flags)
-      : name(name)
-      , instance(instance)
-  {
-    versioned = (flags & VERSIONED) != 0;
-    exists = (flags & EXISTS) != 0;
-    current = (flags & CURRENT) != 0;
-    delete_marker = (flags & DELETE_MARKER) != 0;
-  }
-
-  // Default auto-generated constructors are all fine.
-
-  // Create a new delete marker suitable for the top of the version stack,
-  // i.e. current, !exists, delete_marker.
-  SrcKey new_delete_marker(const std::string& name, const std::string& instance)
-  {
-    return SrcKey(name, instance, Flag::VERSIONED | Flag::CURRENT | Flag::DELETE_MARKER);
-  }
-
-  /// Mimic the behaviour of rgw_bucket_dir_entry.is_current().
-  bool is_current() const
-  {
-    return (!versioned) || (versioned && current && !exists && !delete_marker);
-  }
-
-  rgw_bucket_dir_entry to_dir_entry() const
-  {
-    rgw_bucket_dir_entry entry;
-    entry.key = cls_rgw_obj_key(name, instance);
-    entry.exists = exists;
-
-    uint16_t flags = 0;
-    if (versioned) {
-      flags |= rgw_bucket_dir_entry::FLAG_VER;
-    }
-    if (current) {
-      flags |= rgw_bucket_dir_entry::FLAG_CURRENT;
-    }
-    if (delete_marker) {
-      flags |= rgw_bucket_dir_entry::FLAG_DELETE_MARKER;
-    }
-    entry.flags = flags;
-    return entry;
-  }
-
-  rgw_obj_key to_marker() const
-  {
-    return rgw_obj_key(name, instance);
-  }
-
-  std::strong_ordering operator<=>(const SrcKey& other) const
-  {
-    if (auto cmp = name <=> other.name; cmp != 0) {
-      return cmp;
-    }
-    return instance <=> other.instance;
-  }
-
-  bool operator==(const SrcKey& other) const
-  {
-    return name == other.name
-        && instance == other.instance
-        && versioned == other.versioned
-        && exists == other.exists
-        && current == other.current
-        && delete_marker == other.delete_marker;
-  }
-
-  // bool operator!=(const SrcKey& other) const
-  // {
-  //   return !(*this == other);
-  // }
-
-  // bool operator<(const SrcKey& other) const
-  // {
-  //   if (name < other.name) {
-  //     return true;
-  //   }
-  //   if (name > other.name) {
-  //     return false;
-  //   }
-  //   if (instance < other.instance) {
-  //     return true;
-  //   }
-  //   if (instance > other.instance) {
-  //     return false;
-  //   }
-  //   // If we get here, the names and instances are equal.
-  //   return false; // No need to compare versioned, exists, current, delete_marker.
-  // }
-
-  std::string to_string() const
-  {
-    return fmt::format(FMT_STRING("SrcKey(name={}, instance={}, versioned={}, exists={}, current={}, delete_marker={})"),
-        name, instance, versioned, exists, current, delete_marker);
-  }
-
-  friend std::ostream& operator<<(std::ostream& os, const SrcKey& key)
-  {
-    os << key.to_string();
-    return os;
-  }
-
-}; // struct SrcKey
-
 class SQObjectlistHarness : public testing::TestWithParam<std::tuple<size_t, size_t>> {
 protected:
   /// The default number of entries to return in a list operation. When
@@ -417,7 +277,7 @@ protected:
   using SALBucket = rgw::sal::Bucket;
 
 public:
-  std::vector<SrcKey> src_bucket_;
+  BucketDirSim sim_;
 
 protected:
   void SetUp() override
@@ -446,222 +306,25 @@ protected:
     op->set_req_state(s_);
     // By default, have the list function throw an exception. That way,
     // forgetting to set the list function should be hard to do.
-    op->set_list_function(std::bind(&SQObjectlistHarness::list_always_throw, this,
+    op->set_list_function(std::bind(&BucketDirSim::list_always_throw, sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
     op->init(nullptr, s_, nullptr);
     ldpp_dout(dpp, 1) << "op configured" << dendl;
-  }
-
-  void fill_bucket_nonversioned(size_t count)
-  {
-    std::vector<SrcKey> src;
-    src.reserve(count);
-    for (int i = 0; i < count; ++i) {
-      // This uses the single-string (nonversioned object) constructor.
-      src.emplace_back(fmt::format("obj{:04d}", i));
-    }
-    move_bucket(std::move(src));
-  }
-
-  void fill_bucket_versioned(size_t count, size_t versions_per_item, std::vector<size_t> deletions = {})
-  {
-    std::vector<bool> del(count);
-    assert(del.size() == count);
-    for (auto index : deletions) {
-      // Allow for a fixed array of deletions that might be larger than count.
-      if (index < del.size()) {
-        del[index] = true;
-      }
-    }
-
-    std::vector<SrcKey> src;
-    src.reserve(count * versions_per_item);
-    for (int i = 0; i < count; i++) {
-      // rados will put the current entry first.
-      if (del[i]) {
-        SrcKey newkey { fmt::format("obj{:04d}", i), "d0001", SrcKey::Flag::VERSIONED | SrcKey::Flag::CURRENT | SrcKey::Flag::DELETE_MARKER };
-        // ldpp_dout(dpp, 20) << fmt::format(
-        //     FMT_STRING("fill_bucket_versioned() adding delete marker key: {}"), newkey.to_string())
-        //                    << dendl;
-        src.push_back(newkey);
-      }
-      for (int v = 0; v < versions_per_item; v++) {
-        bool current = false;
-        if (del[i]) {
-          current = false;
-        } else {
-          // Current entry goes first.
-          current = (v == 0);
-        }
-        // This uses the full constructor (name, instance, flags).
-        using f = SrcKey::Flag;
-        SrcKey newkey { fmt::format("obj{:04d}", i), fmt::format("v{:04d}", v), f::VERSIONED | (current ? f::CURRENT : 0) | f::EXISTS };
-        // ldpp_dout(dpp, 20) << fmt::format(
-        //     FMT_STRING("fill_bucket_versioned() adding key: {}"), newkey.to_string())
-        //                    << dendl;
-        src.push_back(newkey);
-      }
-    }
-    move_bucket(std::move(src));
-  }
-
-  std::set<std::string> bucket_object_keys()
-  {
-    std::set<string> res;
-    for (const auto& key : src_bucket_) {
-      res.insert(key.name);
-    }
-    return res;
   }
 
   // Quickly initialise the source bucket from an existing vector, destroying
   // the original vector.
   void move_bucket(std::vector<SrcKey>&& keys)
   {
-    src_bucket_ = std::move(keys);
+    sim_.set_bucket(std::move(keys));
   }
 
   // Allow tests to index the source bucket.
   const std::vector<SrcKey>& src_bucket() const
   {
-    return src_bucket_;
+    return sim_.get_bucket();
   }
 
-public:
-  /// List implementation that always throws an exception.
-  int list_always_throw(const DoutPrefixProvider* dpp, SALBucket::ListParams&, int, SALBucket::ListResults& results, optional_yield y)
-  {
-    clear_results(results);
-    throw std::runtime_error("list_throw");
-  }
-
-  /// List implementation that always returns -ERR_INTERNAL_ERROR.
-  int list_always_fail(const DoutPrefixProvider* dpp, SALBucket::ListParams&, int, SALBucket::ListResults& results, optional_yield y)
-  {
-    clear_results(results);
-    return -ERR_INTERNAL_ERROR;
-  }
-
-  /**
-   * @brief List implementation that always returns an empty list and EoL.
-   *
-   * 'Empty' means the items() list is empty. EoL means that 'is_truncated' is
-   * set in \p results.
-   *
-   * @param dpp     DoutPrefixProvider for logging.
-   * @param param   Parameters to the list function.
-   * @param results InOut: Results from the simulated list function.
-   * @param y       Optional yield object.
-   * @return int    The error code. Zero means success, <0 means failure with
-   * a meaningful code.
-   */
-  int list_always_empty(const DoutPrefixProvider* dpp, SALBucket::ListParams& param, int, SALBucket::ListResults& results, optional_yield y)
-  {
-    clear_results(results);
-    results.is_truncated = false;
-    return 0; // Success.
-  }
-
-  /**
-   * @brief Mimic the standard SAL list operation.
-   *
-   * Take the src_bucket_ array and page it out to the results object as
-   * list() would.
-   *
-   * @param dpp The DoutPrefixProvider for logging.
-   * @param param Parameters to the list function.
-   * @param results InOut: Results from the simulated list function.
-   * @param y       Optional yield object.
-   * @return int    The error code. Zero means success, <0 means failure with
-   * a meaningful code.
-   */
-  int list_standard(const DoutPrefixProvider* dpp, SALBucket::ListParams& param, int, SALBucket::ListResults& results, optional_yield y)
-  {
-    clear_results(results);
-
-    auto& objs = results.objs;
-
-    size_t start_index = 0;
-    if (!param.marker.empty()) {
-      bool seen_marker = false;
-
-      // Create a search key for comparison. We'll start in lexicographical
-      // order, which is how rgw::sal::Bucket::list() appears to work.
-
-      SrcKey search = SrcKey(param.marker.name, param.marker.instance);
-
-      // If there's a marker, scan the bucket for the marker. Note we don't
-      // include the last item, a token pointing at the last item doesn't make
-      // sense (we shouldn't have returned it, it's the EOF).
-      for (size_t n = 0; n < src_bucket_.size() - 1; ++n) {
-        SrcKey entry = src_bucket_[n];
-        if (search <= entry) {
-
-          // It matters if we matched exactly. If we did, we want to start at
-          // the following item, otherwise start at the existing item.
-          if (search.name == entry.name && search.instance == entry.instance) {
-            start_index = n + 1;
-          } else {
-            start_index = n;
-          }
-          seen_marker = true;
-          break;
-        }
-      }
-      if (!seen_marker) {
-        ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("marker[name={},instance={}] not found in bucket"), param.marker.name, param.marker.instance) << dendl;
-        results.is_truncated = true;
-        return -ENOENT; // XXX XXX what does RGW do with marker-not-found?
-      }
-    }
-    ldpp_dout(dpp, 20) << fmt::format(
-        FMT_STRING("list_standard() marker=[name={},instance={}] start_index={}"),
-        param.marker.name, param.marker.instance, start_index)
-                       << dendl;
-
-    int max_entries = op->max_entries();
-    bool seen_eof = false;
-
-    size_t n = start_index;
-    for (; objs.size() < max_entries && n < src_bucket_.size(); n++) {
-      auto src_obj = src_bucket_[n];
-      auto entry = src_obj.to_dir_entry();
-      objs.push_back(entry);
-      // Just keep this as a running item, to simplify bookkeeping.
-      results.next_marker = src_obj.to_marker();
-      // Likewise update the params, as the API expects.
-      param.marker = results.next_marker;
-    }
-    ldpp_dout(dpp, 5) << fmt::format(
-        FMT_STRING("list_standard() loop exit n={} objs.size={} marker=[name={},instance={}]"),
-        n, objs.size(), param.marker.name, param.marker.instance)
-                      << dendl;
-    assert(objs.size() <= max_entries);
-    if (n == src_bucket_.size()) {
-      seen_eof = true;
-      // In this case, we don't want a marker set.
-      results.next_marker = rgw_obj_key();
-    }
-    // is_truncated means there are more results available.
-    results.is_truncated = !seen_eof;
-
-    return 0; // Success.
-  }
-
-protected:
-  /**
-   * @brief Clear the results of a bucket list operation. Expected to be
-   * called by list implementations to set \p results to sane default values.
-   *
-   * @param results The results Object to clear.
-   */
-  void clear_results(SALBucket::ListResults& results)
-  {
-    results.objs.clear();
-    results.common_prefixes.clear();
-    results.next_marker = rgw_obj_key();
-    results.is_truncated = false;
-  }
 }; // class StoreQueryObjectListHarness
 
 TEST_F(SQObjectlistHarness, MetaHarnessDefaults)
@@ -676,7 +339,7 @@ TEST_F(SQObjectlistHarness, MetaAlwaysFail)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_always_fail, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_always_fail, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), -ERR_INTERNAL_ERROR);
@@ -688,7 +351,7 @@ TEST_F(SQObjectlistHarness, MetaAlwaysEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_always_empty, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_always_empty, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -699,7 +362,7 @@ TEST_F(SQObjectlistHarness, MetaStdEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -710,7 +373,7 @@ TEST_F(SQObjectlistHarness, MetaStdEmpty)
 TEST_F(SQObjectlistHarness, MetaTokenOrdering)
 {
   DEFINE_REQ_STATE;
-  fill_bucket_nonversioned(10);
+  sim_.fill_bucket_nonversioned(10);
 
   SrcKey search("obj0002x");
   SrcKey prev("obj0001");
@@ -725,7 +388,7 @@ TEST_F(SQObjectlistHarness, MetaTokenOrdering)
   ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("continuation token: {}"), token) << dendl;
 
   init_op(&s, kDefaultEntries, token);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   op->execute(null_yield);
@@ -745,11 +408,11 @@ TEST_P(SQObjectlistHarness, StdNonVersionedFirstPage)
 
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   size_t count = std::get<0>(GetParam());
-  fill_bucket_nonversioned(count);
+  sim_.fill_bucket_nonversioned(count);
 
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -791,7 +454,7 @@ TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
   }
   DEFINE_REQ_STATE;
   size_t count = std::get<0>(GetParam());
-  fill_bucket_nonversioned(count);
+  sim_.fill_bucket_nonversioned(count);
 
   size_t last_page_size = count % kDefaultEntries;
   size_t last_page_index = (count / kDefaultEntries) * kDefaultEntries;
@@ -805,13 +468,13 @@ TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
     ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("for count={}, last_page_index={}"), count, last_page_index) << dendl;
     return;
   }
-  auto marker_src_key = src_bucket_[last_page_index - 1];
+  auto marker_src_key = sim_.get_bucket()[last_page_index - 1];
   auto marker_obj_key = marker_src_key.to_marker();
   auto token = prepare_continuation_token(dpp, marker_obj_key);
   auto token_b64 = to_base64(token);
 
   init_op(&s, kDefaultEntries, token_b64);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   op->execute(null_yield);
@@ -824,7 +487,7 @@ TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
   // We expect EOF, it's the last page.
   ASSERT_TRUE(op->seen_eof());
   // First item should be as expected.
-  auto first_item = src_bucket_[last_page_index];
+  auto first_item = sim_.get_bucket()[last_page_index];
   ASSERT_EQ(op->items()[0].key(), first_item.to_marker());
 
   // Check for exact-page-boundary special case.
@@ -837,11 +500,11 @@ TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
 TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersions)
 {
   // One item with five versions, only the last item will be current.
-  fill_bucket_versioned(1, 5);
+  sim_.fill_bucket_versioned(1, 5);
 
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -851,11 +514,11 @@ TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersions)
 TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersionsWithOneDeleted)
 {
   // One item with five versions, only the last item will be current.
-  fill_bucket_versioned(1, 5, { 0 });
+  sim_.fill_bucket_versioned(1, 5, { 0 });
 
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -868,12 +531,12 @@ TEST_P(SQObjectlistHarness, StdVersionedFirstPage)
 
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   size_t count = std::get<0>(GetParam());
   size_t versions = std::get<1>(GetParam());
-  fill_bucket_versioned(count, versions);
+  sim_.fill_bucket_versioned(count, versions);
 
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -896,7 +559,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
     GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
   }
   auto count = std::get<0>(GetParam());
-  fill_bucket_nonversioned(count);
+  sim_.fill_bucket_nonversioned(count);
 
   std::optional<std::string> next_marker;
   int reps = 0;
@@ -907,7 +570,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
     ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
     DEFINE_REQ_STATE;
     init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+    op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
     op->execute(null_yield);
@@ -922,7 +585,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
   // We should get the same number of items back.
   ASSERT_EQ(count, items.size());
   // ...and those items should be the same as those in the bucket.
-  auto bucket_keys = bucket_object_keys();
+  auto bucket_keys = sim_.bucket_object_keys();
   std::set<std::string> result_keys;
   for (const auto& item : items) {
     result_keys.insert(item.key());
@@ -934,7 +597,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedNoDeletes)
 {
   auto count = std::get<0>(GetParam());
   auto versions = std::get<1>(GetParam());
-  fill_bucket_versioned(count, versions);
+  sim_.fill_bucket_versioned(count, versions);
 
   std::optional<std::string> next_marker;
   int reps = 0;
@@ -945,7 +608,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedNoDeletes)
     ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
     DEFINE_REQ_STATE;
     init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+    op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
     op->execute(null_yield);
@@ -960,7 +623,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedNoDeletes)
   // We should get the same number of items back.
   ASSERT_EQ(count, items.size());
   // ...and those items should be the same as those in the bucket.
-  auto bucket_keys = bucket_object_keys();
+  auto bucket_keys = sim_.bucket_object_keys();
   std::set<std::string> result_keys;
   for (const auto& item : items) {
     result_keys.insert(item.key());
@@ -1001,7 +664,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
 
   auto count = std::get<0>(GetParam());
   auto versions = std::get<1>(GetParam());
-  fill_bucket_versioned(count, versions, deletions);
+  sim_.fill_bucket_versioned(count, versions, deletions);
 
   std::optional<std::string> next_marker;
   int reps = 0;
@@ -1012,7 +675,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
     ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
     DEFINE_REQ_STATE;
     init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+    op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
     op->execute(null_yield);
@@ -1027,7 +690,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
   // We should get the same number of items back.
   ASSERT_EQ(count, items.size());
   // ...and those items should be the same as those in the bucket.
-  auto bucket_keys = bucket_object_keys();
+  auto bucket_keys = sim_.bucket_object_keys();
   std::set<std::string> result_keys;
   for (const auto& item : items) {
     result_keys.insert(item.key());
