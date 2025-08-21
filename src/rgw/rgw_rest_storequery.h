@@ -610,8 +610,11 @@ protected:
     }
   }; // struct RGWStoreQueryOp_ObjectList::Stats
 
+public:
   /**
    * @brief A single item in the list of objects returned by the query.
+   *
+   * Public mostly so unit tests can see what is being retrieved.
    */
   class Item {
   private:
@@ -637,13 +640,22 @@ protected:
     void dump(Formatter* f) const;
   }; // RGWStoreQueryListItem
 
-private:
+public:
+  // This is the signature of rgw::sal::Bucket::list(), which we'll override
+  // for testing.
+  using list_func = std::function<int(const DoutPrefixProvider*, rgw::sal::Bucket::ListParams&, int, rgw::sal::Bucket::ListResults&, optional_yield)>;
   using item_type = Item;
 
+private:
   uint64_t max_entries_;
   std::optional<std::string> marker_;
   std::optional<std::string> return_marker_;
   std::vector<item_type> items_;
+  bool seen_eof_ = false; /// True if the current query was not truncated, i.e. there are no more object keys.
+
+  // Optional override of the bucket list SAL function. Intended for unit
+  // tests.
+  std::optional<list_func> list_function_;
 
   Stats stats_;
 
@@ -661,6 +673,27 @@ public:
   RGWStoreQueryOp_ObjectList& operator=(RGWStoreQueryOp_ObjectList&&) = delete;
 
   static constexpr uint64_t LIST_QUERY_SIZE_HARD_LIMIT = 10000;
+
+  // TESTING ONLY: Set the req_state.
+  void set_req_state(req_state* new_s)
+  {
+    s = new_s;
+  }
+
+  // TESTING ONLY: Override of the bucket list SAL function.
+  void set_list_function(list_func f)
+  {
+    list_function_ = f;
+  }
+  // TESTING ONLY: Clear the bucket list function override.
+  void clear_list_function() { list_function_.reset(); }
+
+  // TESTING ONLY: Return a reference to the list of items.
+  const std::vector<item_type>& items() const { return items_; }
+
+  // TESTING ONLY: Return true if the query returned EOF (i.e.
+  // 'is_truncated==false).
+  bool seen_eof() const { return seen_eof_; }
 
   /**
    * @brief execute() for RGWStoreQueryOp_ObjectList (StoreQuery objectlist).

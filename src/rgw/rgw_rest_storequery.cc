@@ -407,7 +407,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
                        << dendl;
   }
 
-  bool seen_eof = false; // Easier to understand than '!results.is_truncated'.
+  seen_eof_ = false; // Reset this for the next query.
   bool early_exit = false; // True if we ran out of space in the user list before we ran out of objects.
 
   rgw_obj_key next_marker;
@@ -424,7 +424,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 
   // Loop until we've filled the user's requested number of entries, or we hit
   // EOF (i.e. the result of s->bucket->list() was truncated).
-  while (!seen_eof && items_.size() < max_entries_) {
+  while (!seen_eof_ && items_.size() < max_entries_) {
     rgw::sal::Bucket::ListResults results;
 
     ldpp_dout(this, 20) << fmt::format(
@@ -434,7 +434,15 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 
     // Note that rgw::sal::RadosBucket::list() updates params.marker as it
     // goes. This isn't how list_multiparts() works, don't get caught.
-    auto ret = s->bucket->list(this, params, query_max, results, y);
+
+    int ret;
+    if (list_function_) {
+      // TESTING ONLY! Use the overridden list function if it exists.
+      ret = (*list_function_)(this, params, query_max, results, y);
+    } else {
+      // Use the default bucket list function.
+      ret = s->bucket->list(this, params, query_max, results, y);
+    }
     stats_.sal_queries++;
 
     // Clear next_marker. It's used outside the loop for the continuation
@@ -465,11 +473,12 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
     // seen_eof is easier to understand than '!is_truncated', to my brain
     // anyway.
 
-    seen_eof = !results.is_truncated;
+    seen_eof_ = !results.is_truncated;
 
     // Loop over the results of s->bucket->list() until we either fill the
     // user's maximum request size or get to the end of the query results.
     for (size_t n = 0; n < results.objs.size(); n++) {
+      bool last_item = (n == results.objs.size() - 1);
       stats_.sal_seen++;
 
       auto& obj = results.objs[n];
@@ -507,22 +516,37 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
         // If we've filled the user's requested number of entries, we need to
         // set the marker properly and exit the item loop.
         if (items_.size() >= max_entries_) {
-          // Set the marker to exactly where we left off.
-          next_marker = rgw_obj_key(results.objs[n].key.name, results.objs[n].key.instance);
-          early_exit = true;
-          ldpp_dout(this, 20) << fmt::format(FMT_STRING("filled user items array, next_marker=[name={},instance={}]"),
-              next_marker.name, next_marker.instance)
-                              << dendl;
+          if (last_item && seen_eof_) {
+            // In the special case where we've filled the user structure with
+            // the last item in the query, AND we've seen EOF, then we don't
+            // need to set a marker.
+            ldpp_dout(this, 20) << fmt::format(FMT_STRING("filled user items array and at EOF, no marker set"))
+                                << dendl;
+          } else {
+            // Set the marker to exactly where we left off.
+            next_marker = rgw_obj_key(results.objs[n].key.name, results.objs[n].key.instance);
+            early_exit = true;
+            ldpp_dout(this, 20) << fmt::format(FMT_STRING("filled user items array, next_marker=[name={},instance={}]"),
+                next_marker.name, next_marker.instance)
+                                << dendl;
+          }
           break; // We'll also fail the outer while loop's condition.
         }
       }
 
     } // for each SAL object result
 
+    // Special case: If the query results in EOF and has no items (e.g. an
+    // empty bucket), we still need to break out of the for loop. Setting
+    // seen_eof will break out of the while loop naturally.
+    if (seen_eof_) {
+      break;
+    }
+
   } // while !seen_eof && items_.size() < max_entries_
 
   ldpp_dout(this, 10) << fmt::format(FMT_STRING("loop exit: seen_eof={} early_exit={} next_marker=[name={},instance={}]"),
-      seen_eof, early_exit, next_marker.name, next_marker.instance)
+      seen_eof_, early_exit, next_marker.name, next_marker.instance)
                       << dendl;
 
   // s->bucket->list() can fail. We rely on op_ret being properly set at the
