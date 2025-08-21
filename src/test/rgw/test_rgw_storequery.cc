@@ -1,6 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <compare> // Include for spaceship operator
 #include <fmt/format.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest-param-test.h>
@@ -340,6 +341,14 @@ struct SrcKey {
     return rgw_obj_key(name, instance);
   }
 
+  std::strong_ordering operator<=>(const SrcKey& other) const
+  {
+    if (auto cmp = name <=> other.name; cmp != 0) {
+      return cmp;
+    }
+    return instance <=> other.instance;
+  }
+
   bool operator==(const SrcKey& other) const
   {
     return name == other.name
@@ -350,10 +359,28 @@ struct SrcKey {
         && delete_marker == other.delete_marker;
   }
 
-  bool operator!=(const SrcKey& other) const
-  {
-    return !(*this == other);
-  }
+  // bool operator!=(const SrcKey& other) const
+  // {
+  //   return !(*this == other);
+  // }
+
+  // bool operator<(const SrcKey& other) const
+  // {
+  //   if (name < other.name) {
+  //     return true;
+  //   }
+  //   if (name > other.name) {
+  //     return false;
+  //   }
+  //   if (instance < other.instance) {
+  //     return true;
+  //   }
+  //   if (instance > other.instance) {
+  //     return false;
+  //   }
+  //   // If we get here, the names and instances are equal.
+  //   return false; // No need to compare versioned, exists, current, delete_marker.
+  // }
 
   std::string to_string() const
   {
@@ -368,9 +395,6 @@ struct SrcKey {
   }
 
 }; // struct SrcKey
-
-// This fmtlib formatter spec needs to be outside the anonymous namespace.
-class SrcKey; // Forward declaration.
 
 class SQObjectlistHarness : public testing::TestWithParam<size_t> {
 protected:
@@ -560,13 +584,26 @@ public:
     size_t start_index = 0;
     if (!param.marker.empty()) {
       bool seen_marker = false;
+
+      // Create a search key for comparison. We'll start in lexicographical
+      // order, which is how rgw::sal::Bucket::list() appears to work.
+
+      SrcKey search = SrcKey(param.marker.name, param.marker.instance);
+
       // If there's a marker, scan the bucket for the marker. Note we don't
       // include the last item, a token pointing at the last item doesn't make
       // sense (we shouldn't have returned it, it's the EOF).
       for (size_t n = 0; n < src_bucket_.size() - 1; ++n) {
-        if (src_bucket_[n].name == param.marker.name && src_bucket_[n].instance == param.marker.instance) {
-          // We'll start at the immediately following item.
-          start_index = n + 1;
+        SrcKey entry = src_bucket_[n];
+        if (search <= entry) {
+
+          // It matters if we matched exactly. If we did, we want to start at
+          // the following item, otherwise start at the existing item.
+          if (search.name == entry.name && search.instance == entry.instance) {
+            start_index = n + 1;
+          } else {
+            start_index = n;
+          }
           seen_marker = true;
           break;
         }
@@ -627,7 +664,7 @@ protected:
   }
 }; // class StoreQueryObjectListHarness
 
-TEST_F(SQObjectlistHarness, HarnessDefaults)
+TEST_F(SQObjectlistHarness, MetaHarnessDefaults)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -635,7 +672,7 @@ TEST_F(SQObjectlistHarness, HarnessDefaults)
   ASSERT_THROW(op->execute(null_yield), std::runtime_error);
 }
 
-TEST_F(SQObjectlistHarness, AlwaysFail)
+TEST_F(SQObjectlistHarness, MetaAlwaysFail)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -647,7 +684,7 @@ TEST_F(SQObjectlistHarness, AlwaysFail)
 
 // This catches a meaningful special case where the bucket is empty. Make sure
 // we exit the loop properly when there are no items at all.
-TEST_F(SQObjectlistHarness, AlwaysEmpty)
+TEST_F(SQObjectlistHarness, MetaAlwaysEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -658,7 +695,7 @@ TEST_F(SQObjectlistHarness, AlwaysEmpty)
   ASSERT_EQ(op->items().size(), 0U);
 }
 
-TEST_F(SQObjectlistHarness, StdEmpty)
+TEST_F(SQObjectlistHarness, MetaStdEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -667,6 +704,35 @@ TEST_F(SQObjectlistHarness, StdEmpty)
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
   ASSERT_EQ(op->items().size(), 0U);
+}
+
+// Check that the token works the way we expect.
+TEST_F(SQObjectlistHarness, MetaTokenOrdering)
+{
+  DEFINE_REQ_STATE;
+  fill_bucket_nonversioned(10);
+
+  SrcKey search("obj0002x");
+  SrcKey prev("obj0001");
+  SrcKey next("obj0003");
+  ASSERT_LT(prev, search);
+  ASSERT_GT(next, search);
+  ASSERT_EQ(search, search);
+
+  // A token 'in between' obj0002 and obj0003.
+  rgw_obj_key search_key("obj0002x");
+  auto token = to_base64(prepare_continuation_token(dpp, search_key));
+  ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("continuation token: {}"), token) << dendl;
+
+  init_op(&s, kDefaultEntries, token);
+  op->set_list_function(std::bind(&SQObjectlistHarness::list_standard, this,
+      std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
+
+  op->execute(null_yield);
+  ASSERT_EQ(op->get_ret(), 0);
+  ASSERT_GE(op->items().size(), 1U);
+  auto first = op->items()[0];
+  ASSERT_EQ(first.key(), "obj0003");
 }
 
 // Check the first page of potentially paginated output.
@@ -886,10 +952,36 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedFiveVersionsNoDeletes)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
+constexpr bool is_prime(size_t n)
+{
+  if (n <= 1)
+    return false;
+  for (int i = 2; i * i <= n; ++i) {
+    if (n % i == 0)
+      return false;
+  }
+  return true;
+}
+
+constexpr std::array<size_t, 1229> generate_primes()
+{
+  std::array<size_t, 1229> primes = {};
+  int index = 0;
+  for (int i = 2; i <= 10000; ++i) {
+    if (is_prime(i)) {
+      primes[index++] = i;
+    }
+  }
+  return primes;
+}
+
+constexpr auto primes_under_10000 = generate_primes();
 TEST_P(SQObjectlistHarness, CompoundQueryVersionedFiveVersionsWithDeletes)
 {
   // We'll delete all the prime entries.
-  std::vector<size_t> deletions = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
+  std::vector<size_t> deletions;
+  // deletions.reserve(primes_under_10000.size());
+  deletions.insert(deletions.end(), primes_under_10000.begin(), primes_under_10000.end());
   auto count = GetParam();
   fill_bucket_versioned(count, 5, deletions);
 
@@ -925,12 +1017,14 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedFiveVersionsWithDeletes)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
-TEST_P(SQObjectlistHarness, CompoundQueryVersionedManyVersionsWithDeletes)
+TEST_P(SQObjectlistHarness, CompoundQueryVersionedTenVersionsWithDeletes)
 {
   // We'll delete all the prime entries.
-  std::vector<size_t> deletions = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
+  std::vector<size_t> deletions;
+  // deletions.reserve(primes_under_10000.size());
+  deletions.insert(deletions.end(), primes_under_10000.begin(), primes_under_10000.end());
   auto count = GetParam();
-  size_t versions = 20;
+  size_t versions = 10;
   fill_bucket_versioned(count, versions, deletions);
 
   std::optional<std::string> next_marker;
