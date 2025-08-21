@@ -317,7 +317,7 @@ void RGWStoreQueryOp_ObjectStatus::send_response_json()
 
 // RGWStoreQueryOp_ObjectList
 
-static std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key)
+std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key)
 {
   bufferlist bl;
   ceph::JSONFormatter f;
@@ -330,7 +330,7 @@ static std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw
   return token;
 }
 
-static std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProvider* dpp, const std::string& token)
+std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProvider* dpp, const std::string& token)
 {
   if (token[0] != '{') {
     // Assume we're given just a name, not a JSON object containing the

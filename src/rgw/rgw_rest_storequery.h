@@ -737,6 +737,9 @@ public:
 
 }; // RGWStoreQueryOp_ObjectList
 
+std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key);
+std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
+
 /**
  * @brief StoreQuery MPUploadList command implementation.
  *
