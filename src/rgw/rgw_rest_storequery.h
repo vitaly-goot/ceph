@@ -750,7 +750,36 @@ public:
   /// with return_marker() which is the optional marker for the next query.
   std::optional<std::string> marker() const { return marker_; }
 
+  /**
+   * @brief Create a continuation token, a JSON object used to implement
+   * pagination.
+   *
+   * The continuation token is a JSON object that includes the necessary
+   * information to resume a list query from a specific point. It's included
+   * as the NextToken field in the objectlist response, and its presence
+   * indicates that there are more results available.
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param key The rgw_obj_key to include in the token.
+   * @return std::string The created continuation token.
+   */
   static std::string create_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key);
+
+  /**
+   * @brief Read a JSON continuation token, returning an optional key used to
+   * start a list query.
+   *
+   * Without a continuation token, an objectlist query starts from the
+   * beginning. The contents of the token are used to 'prime' the SAL request
+   * so it restarts at the exact point a previous query left off. It has
+   * enough information to work consistently with versioned buckets as well as
+   * nonversioned; the object name alone is not enough in a versioned bucket.
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param token The JSON continuation token returned from a previous
+   * objectlist command.
+   * @return std::optional<rgw_obj_key> The optional rgw_obj_key.
+   */
   static std::optional<rgw_obj_key> read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
 
 }; // RGWStoreQueryOp_ObjectList
