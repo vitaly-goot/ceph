@@ -264,7 +264,7 @@ protected:
   static constexpr uint64_t kDefaultEntries = 1000;
   // static constexpr uint64_t kDefaultEntries = 10;
 
-  RGWStoreQueryOp_ObjectList* op = nullptr;
+  RGWStoreQueryOp_ObjectList_Unittest* op = nullptr;
 
 protected:
   req_state* s_;
@@ -302,11 +302,11 @@ protected:
   {
     s_ = s;
     s_->cio = &cio_;
-    op = new RGWStoreQueryOp_ObjectList(max_entries, marker);
+    op = new RGWStoreQueryOp_ObjectList_Unittest(max_entries, marker);
     op->set_req_state(s_);
     // By default, have the list function throw an exception. That way,
     // forgetting to set the list function should be hard to do.
-    op->set_list_function(std::bind(&BucketDirSim::list_always_throw, sim_,
+    op->set_list_function(std::bind(&BucketDirSim::list_always_throw, &sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
     op->init(nullptr, s_, nullptr);
     ldpp_dout(dpp, 1) << "op configured" << dendl;
@@ -339,7 +339,7 @@ TEST_F(SQObjectlistHarness, MetaAlwaysFail)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&BucketDirSim::list_always_fail, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_always_fail, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), -ERR_INTERNAL_ERROR);
@@ -351,7 +351,7 @@ TEST_F(SQObjectlistHarness, MetaAlwaysEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&BucketDirSim::list_always_empty, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_always_empty, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -362,7 +362,7 @@ TEST_F(SQObjectlistHarness, MetaStdEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -384,11 +384,11 @@ TEST_F(SQObjectlistHarness, MetaTokenOrdering)
 
   // A token 'in between' obj0002 and obj0003.
   rgw_obj_key search_key("obj0002x");
-  auto token = to_base64(prepare_continuation_token(dpp, search_key));
+  auto token = to_base64(RGWStoreQueryOp_ObjectList::create_continuation_token(dpp, search_key));
   ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("continuation token: {}"), token) << dendl;
 
   init_op(&s, kDefaultEntries, token);
-  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   op->execute(null_yield);
@@ -406,13 +406,13 @@ TEST_P(SQObjectlistHarness, StdNonVersionedFirstPage)
     GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
   }
 
-  DEFINE_REQ_STATE;
-  init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
-      std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
-
   size_t count = std::get<0>(GetParam());
   sim_.fill_bucket_nonversioned(count);
+
+  DEFINE_REQ_STATE;
+  init_op(&s, kDefaultEntries, std::nullopt);
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
+      std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -437,7 +437,7 @@ TEST_P(SQObjectlistHarness, StdNonVersionedFirstPage)
     if (opt_token.has_value()) {
       // If this base64 decode throws, the test will fail.
       auto token_json = from_base64(*opt_token);
-      auto opt_token_marker = unpack_continuation_token(dpp, token_json);
+      auto opt_token_marker = RGWStoreQueryOp_ObjectList::read_continuation_token(dpp, token_json);
       ASSERT_TRUE(opt_token_marker != std::nullopt);
       ASSERT_EQ(last.key(), opt_token_marker->name);
     }
@@ -452,7 +452,6 @@ TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
   if (versions != 1) {
     GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
   }
-  DEFINE_REQ_STATE;
   size_t count = std::get<0>(GetParam());
   sim_.fill_bucket_nonversioned(count);
 
@@ -470,11 +469,12 @@ TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
   }
   auto marker_src_key = sim_.get_bucket()[last_page_index - 1];
   auto marker_obj_key = marker_src_key.to_marker();
-  auto token = prepare_continuation_token(dpp, marker_obj_key);
+  auto token = RGWStoreQueryOp_ObjectList::create_continuation_token(dpp, marker_obj_key);
   auto token_b64 = to_base64(token);
 
+  DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, token_b64);
-  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   op->execute(null_yield);
@@ -504,7 +504,7 @@ TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersions)
 
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -518,7 +518,7 @@ TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersionsWithOneDeleted)
 
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
   op->execute(null_yield);
   ASSERT_EQ(op->get_ret(), 0);
@@ -528,10 +528,9 @@ TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersionsWithOneDeleted)
 // Check the first page of potentially paginated output.
 TEST_P(SQObjectlistHarness, StdVersionedFirstPage)
 {
-
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
-  op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+  op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
       std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
   size_t count = std::get<0>(GetParam());
@@ -552,6 +551,8 @@ TEST_P(SQObjectlistHarness, StdVersionedFirstPage)
   // the nonversioned tests are missing here.
 }
 
+// Test that a sequence of calls to objectlist (including in most cases
+// pagination) results in the proper list of keys. First for a nonversioned bucket.
 TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
 {
   size_t versions = std::get<1>(GetParam());
@@ -570,7 +571,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
     ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
     DEFINE_REQ_STATE;
     init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+    op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
     op->execute(null_yield);
@@ -593,6 +594,8 @@ TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
+// Test that a sequence of calls to objectlist (including in most cases
+// pagination) results in the proper list of keys. Versioned bucket this time.
 TEST_P(SQObjectlistHarness, CompoundQueryVersionedNoDeletes)
 {
   auto count = std::get<0>(GetParam());
@@ -608,7 +611,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedNoDeletes)
     ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
     DEFINE_REQ_STATE;
     init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+    op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
     op->execute(null_yield);
@@ -654,6 +657,9 @@ constexpr std::array<size_t, 1229> generate_primes()
   return primes;
 }
 
+// Test that a sequence of calls to objectlist (including in most cases
+// pagination) results in the proper list of keys. This time a versioned
+// bucket with a number of keys deleted.
 constexpr auto primes_under_10000 = generate_primes();
 TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
 {
@@ -675,7 +681,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
     ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
     DEFINE_REQ_STATE;
     init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&BucketDirSim::list_standard, sim_,
+    op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
         std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 
     op->execute(null_yield);

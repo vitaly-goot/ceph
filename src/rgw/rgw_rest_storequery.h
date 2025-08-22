@@ -650,14 +650,18 @@ private:
   uint64_t max_entries_;
   std::optional<std::string> marker_;
   std::optional<std::string> return_marker_;
+
+  Stats stats_;
+
+protected:
+  // Fields we want the unit test subclass to be able to
+  // access.
   std::vector<item_type> items_;
   bool seen_eof_ = false; /// True if the current query was not truncated, i.e. there are no more object keys.
 
   // Optional override of the bucket list SAL function. Intended for unit
   // tests.
   std::optional<list_func> list_function_;
-
-  Stats stats_;
 
 public:
   RGWStoreQueryOp_ObjectList(uint64_t max_entries, std::optional<std::string> marker)
@@ -673,27 +677,6 @@ public:
   RGWStoreQueryOp_ObjectList& operator=(RGWStoreQueryOp_ObjectList&&) = delete;
 
   static constexpr uint64_t LIST_QUERY_SIZE_HARD_LIMIT = 10000;
-
-  // TESTING ONLY: Set the req_state.
-  void set_req_state(req_state* new_s)
-  {
-    s = new_s;
-  }
-
-  // TESTING ONLY: Override of the bucket list SAL function.
-  void set_list_function(list_func f)
-  {
-    list_function_ = f;
-  }
-  // TESTING ONLY: Clear the bucket list function override.
-  void clear_list_function() { list_function_.reset(); }
-
-  // TESTING ONLY: Return a reference to the list of items.
-  const std::vector<item_type>& items() const { return items_; }
-
-  // TESTING ONLY: Return true if the query returned EOF (i.e.
-  // 'is_truncated==false).
-  bool seen_eof() const { return seen_eof_; }
 
   /**
    * @brief execute() for RGWStoreQueryOp_ObjectList (StoreQuery objectlist).
@@ -768,10 +751,52 @@ public:
   /// with return_marker() which is the optional marker for the next query.
   std::optional<std::string> marker() const { return marker_; }
 
+  static std::string create_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key);
+  static std::optional<rgw_obj_key> read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
+
 }; // RGWStoreQueryOp_ObjectList
 
-std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key);
-std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
+/**
+ * @brief Special unit test version of RGWStoreQueryOp_Objectlist, that
+ * exposes methods to allow a test harness to operate.
+ *
+ * The main purpose of this class is to provide public accessors to protected
+ * fields of parent classes. Mostly the parent in question is
+ * RGWStoreQueryOp_Objectlist, but there's also a means to set the req_state
+ * pointer `s` for harness purposes.
+ *
+ * Note that all the actual code being tested is in the superclass. All we're
+ * doing is providing public access, rather then messing around with
+ * FRIEND_TEST().
+ */
+class RGWStoreQueryOp_ObjectList_Unittest : public RGWStoreQueryOp_ObjectList {
+
+public:
+  RGWStoreQueryOp_ObjectList_Unittest(uint64_t max_entries, std::optional<std::string> marker)
+      : RGWStoreQueryOp_ObjectList(max_entries, marker)
+  {
+  }
+
+  /// Set the req_state.
+  void set_req_state(req_state* new_s)
+  {
+    s = new_s;
+  }
+
+  /// Override of the bucket list SAL function.
+  void set_list_function(list_func f)
+  {
+    list_function_ = f;
+  }
+  /// Clear the bucket list function override.
+  void clear_list_function() { list_function_.reset(); }
+
+  /// Return a reference to the list of items.
+  const std::vector<item_type>& items() const { return items_; }
+
+  /// Return true if the query returned EOF (i.e. 'is_truncated==false).
+  bool seen_eof() const { return seen_eof_; }
+}; // RGWStoreQueryOp_ObjectList_Unittest
 
 /**
  * @brief StoreQuery MPUploadList command implementation.

@@ -317,7 +317,7 @@ void RGWStoreQueryOp_ObjectStatus::send_response_json()
 
 // RGWStoreQueryOp_ObjectList
 
-std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key)
+std::string RGWStoreQueryOp_ObjectList::create_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key)
 {
   bufferlist bl;
   ceph::JSONFormatter f;
@@ -330,7 +330,7 @@ std::string prepare_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_ke
   return token;
 }
 
-std::optional<rgw_obj_key> unpack_continuation_token(const DoutPrefixProvider* dpp, const std::string& token)
+std::optional<rgw_obj_key> RGWStoreQueryOp_ObjectList::read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token)
 {
   if (token[0] != '{') {
     // Assume we're given just a name, not a JSON object containing the
@@ -377,7 +377,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
       op_ret = -EINVAL;
       return false;
     }
-    std::optional<rgw_obj_key> marker_key = unpack_continuation_token(this, init_marker);
+    std::optional<rgw_obj_key> marker_key = read_continuation_token(this, init_marker);
     if (!marker_key) {
       ldpp_dout(this, 0) << fmt::format(FMT_STRING("failed to unpack continuation token: '{}'"), init_marker)
                          << dendl;
@@ -564,7 +564,7 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
     // will insert line breaks, it's actually a template and the default line
     // wrap width is std::numeric_limits<int>::max().
 
-    std::string marker_str = prepare_continuation_token(this, next_marker);
+    std::string marker_str = RGWStoreQueryOp_ObjectList::create_continuation_token(this, next_marker);
     std::string encoded_marker;
     try {
       encoded_marker = to_base64(marker_str);
