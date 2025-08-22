@@ -12,7 +12,6 @@
 #include <stdexcept>
 #include <string>
 
-#include "ceph_ver.h"
 #include "cls/rgw/cls_rgw_types.h"
 #include "common/async/yield_context.h"
 #include "common/dout.h"

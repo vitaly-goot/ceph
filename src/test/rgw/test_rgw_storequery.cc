@@ -1,14 +1,12 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include <compare> // Include for spaceship operator
 #include <fmt/format.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
 #include <initializer_list>
 
-#include "cls/rgw/cls_rgw_types.h"
 #include "common/async/yield_context.h"
 #include "common/ceph_argparse.h"
 #include "common/dout.h"

@@ -3,7 +3,6 @@
 #pragma once
 
 #include <fmt/printf.h>
-#include <memory>
 #include <sys/types.h>
 #include <unistd.h>
 
