@@ -638,16 +638,62 @@ void RGWStoreQueryOp_ObjectList::Item::dump(Formatter* f) const
 
 // RGWStoreQueryOp_MPUploadList
 
+std::string RGWStoreQueryOp_MPUploadList::create_continuation_token(const DoutPrefixProvider* dpp, const std::string& marker, std::unique_ptr<rgw::sal::MultipartUpload> const& upload)
+{
+  bufferlist bl;
+  ceph::JSONFormatter f;
+  f.open_object_section("ContinuationToken");
+  f.dump_string("marker", marker);
+  f.dump_string("key", upload->get_key());
+  f.dump_string("uploadId", upload->get_upload_id());
+  f.close_section(); // ContinuationToken
+  f.flush(bl);
+  std::string token = bl.to_str();
+  return token;
+}
+
+std::optional<std::string> RGWStoreQueryOp_MPUploadList::read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token)
+{
+  if (token[0] != '{') {
+    // Assume we're given just a name, not a JSON object containing the
+    // instance.
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("unpacked legacy continuation token: marker='{}'"), token)
+                       << dendl;
+    return token;
+  }
+  rapidjson::Document doc;
+  doc.Parse(token.c_str());
+  if (doc.HasParseError()) {
+    ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("failed to parse continuation token: {}"), rapidjson::GetParseError_En(doc.GetParseError()))
+                      << dendl;
+    return std::nullopt;
+  }
+  if (!doc.IsObject() || !doc.HasMember("marker") || !doc["marker"].IsString()
+      || !doc.HasMember("key") || !doc["key"].IsString()
+      || !doc.HasMember("uploadId") || !doc["uploadId"].IsString()) {
+    ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("invalid continuation token format: {}"), token)
+                      << dendl;
+    return std::nullopt;
+  }
+  std::string marker = doc["marker"].GetString();
+  ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("unpacked continuation token: marker='{}'"), marker)
+                     << dendl;
+  return marker;
+}
+
 bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
 {
   std::vector<std::unique_ptr<rgw::sal::MultipartUpload>> uploads {};
 
   std::string marker;
+  unset_return_marker(); // We'll set the continuation token iff it's needed.
 
+  // If present, extract the marker string from the JSON continuation token.
   if (marker_.has_value()) {
+    std::string marker_json;
     try {
-      marker = from_base64(*marker_);
-      ldpp_dout(this, 10) << fmt::format(FMT_STRING("continuation token '{}' decoded as {}"), *marker_, marker)
+      marker_json = from_base64(*marker_);
+      ldpp_dout(this, 10) << fmt::format(FMT_STRING("continuation token '{}' decoded as {}"), *marker_, marker_json)
                           << dendl;
     } catch (std::exception& e) {
       // We can't catch boost::archive::archive_exception specifically, it
@@ -657,6 +703,16 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
       op_ret = -EINVAL;
       return false;
     }
+    std::optional<std::string> opt_marker = read_continuation_token(this, marker_json);
+    if (!opt_marker.has_value()) {
+      ldpp_dout(this, 0) << fmt::format(FMT_STRING("failed to read continuation token from JSON: {}"), marker_json)
+                         << dendl;
+      op_ret = -EINVAL;
+      return false;
+    }
+    ldpp_dout(this, 10) << fmt::format(FMT_STRING("unpacked continuation token: marker='{}'"), *opt_marker)
+                        << dendl;
+    marker = *opt_marker;
   }
 
   bool is_truncated; // Must be present, pointer to this is unconditionally
@@ -669,7 +725,9 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
   }
 
   bool seen_eof = false;
-  std::string next_marker;
+
+  // This will be set if we want to set a continuation token.
+  std::optional<std::string> next_marker;
 
   // Reserve space for the maximum number of entries we might return. This is
   // a compromise - we could reallocate as we issue queries against the
@@ -679,7 +737,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
   // /insanely/ high), and reserve it exactly once.
   items_.reserve(max_entries_);
 
-  while (items_.size() < max_entries_) {
+  while (!seen_eof && items_.size() < max_entries_) {
     // Re-initialise this every run. We can only see if the query is complete
     // across multiple list_multiparts() by checking if this is empty.
     // However, nothing in list_multiparts() clears it.
@@ -704,40 +762,60 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
       break;
     }
 
-    if (uploads.size() == 0) {
-      ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL list_multiparts() EOF items_.size()={}"), items_.size())
-                          << dendl;
-      seen_eof = true;
-      break;
-    }
+    ldpp_dout(this, 20) << fmt::format(FMT_STRING("SAL list_multiparts() uploads.size()={} is_truncated={}"), uploads.size(), is_truncated)
+                        << dendl;
 
-    for (auto const& upload : uploads) {
+    // As with objectlist, I find '!is_truncated' confusing to reason with,
+    // whereas a bool 'seen_eof' is more intuitive.
+    seen_eof = !is_truncated;
+
+    // for (auto const& upload : uploads) {
+    for (size_t n = 0; n < uploads.size(); n++) {
+      bool last_item = (n == uploads.size() - 1);
+
+      auto& upload = uploads[n];
+
       auto& key = upload->get_key();
       auto& id = upload->get_upload_id();
+
       ldpp_dout(this, 20)
           << fmt::format(FMT_STRING("obj: key={} upload_id={}"), key, id)
           << dendl;
 
       item_type item(key, id);
+
+      // This is the *only* place we add to the items_ array.
       items_.push_back(item);
 
-      // Extra action if we've reached the caller's size limit.
+      // Extra actions if we've reached the caller's size limit.
       if (items_.size() == max_entries_) {
-        // If we filled items_ set the token for next time. It's ok if it's
-        // actually the end of the list - the next query will just have zero
-        // items.
-        next_marker = marker;
-        ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next={}"), next_marker) << dendl;
-        break;
+        if (last_item && seen_eof) {
+          // In the special case where we've filled the user structure with
+          // the last item in the query, AND we've seen EOF, then we don't
+          // need to set a marker.
+          ldpp_dout(this, 20) << fmt::format(FMT_STRING("filled user items array and at EOF, no marker set"))
+                              << dendl;
+        } else {
+          // We filled the user items list but there are more entries. Set the
+          // marker to where we left off (NOT where the SAL query left off)
+          // and exit the loop.
+          next_marker = create_continuation_token(this, marker, upload);
+          ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next={}"), *next_marker) << dendl;
+          break;
+        }
       }
-    }
+    } // for each upload result
   }
+
+  ldpp_dout(this, 10) << fmt::format(FMT_STRING("loop exit: seen_eof={} next_marker={} items_.size={}"),
+      seen_eof, next_marker.has_value() ? *next_marker : "<none>", items_.size())
+                      << dendl;
 
   if (op_ret < 0) {
     return false;
   }
 
-  if (!seen_eof && !next_marker.empty()) {
+  if (next_marker.has_value()) {
     // If there are more results, we need to safely encode the continuation
     // marker and return it to the user. This is done by setting
     // return_marker_, which will be dumped in send_response_json().
@@ -747,14 +825,14 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
     // wrap width is std::numeric_limits<int>::max().
     std::string encoded_marker;
     try {
-      encoded_marker = to_base64(next_marker);
+      encoded_marker = to_base64(*next_marker);
     } catch (std::exception& e) {
       ldpp_dout(this, 0) << fmt::format(FMT_STRING("failed to encode continuation token: '{}'"), e.what())
                          << dendl;
       op_ret = -EINVAL;
       return false;
     }
-    ldpp_dout(this, 20) << fmt::format(FMT_STRING("EOF not reached, next_marker {}"), marker)
+    ldpp_dout(this, 20) << fmt::format(FMT_STRING("EOF not reached, next_marker {}"), *next_marker)
                         << dendl;
     ldpp_dout(this, 5) << fmt::format(FMT_STRING("EOF not reached, continuation token {}"), encoded_marker)
                        << dendl;
@@ -791,7 +869,7 @@ void RGWStoreQueryOp_MPUploadList::Item::dump(Formatter* f) const
 {
   f->open_object_section("Object");
   f->dump_string("key", to_base64(key_));
-  f->dump_string("upload_id", to_base64(upload_id_));
+  f->dump_string("uploadId", to_base64(upload_id_));
   f->close_section(); // Object
 }
 

@@ -970,6 +970,35 @@ public:
   /// std::nullopt if none is set.
   std::optional<std::string> return_marker() const { return return_marker_; }
 
+  /**
+   * @brief Create a continuation token object
+   *
+   * We're storing the contents of the multipart upload object just for
+   * information purposes, it might be useful for the R-S devs to have this
+   * broken out already. The think we really need is the marker returned by
+   * list_mulitparts() which is a single string.
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param marker The continuation token marker returned by list_multiparts().
+   * @param upload Pointer to the multipart upload object.
+   * @return std::string The JSON object representating the continuation
+   * token. Will need to be base64 encoded before transmission.
+   */
+  static std::string create_continuation_token(const DoutPrefixProvider* dpp, const std::string& marker, std::unique_ptr<rgw::sal::MultipartUpload> const& upload);
+
+  /**
+   * @brief Read a continuation token JSON object
+   *
+   * We totally ignore the non-marker parts of the token JSON here. We just
+   * want the marker.
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param token The continuation token string, *after* base64 decoding.
+   * @return std::optional<std::string> If a value is present, it is the
+   * marker to pass to list_multiparts(). If std::nullopt, decoding failed.
+   */
+  static std::optional<std::string> read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
+
 }; // RGWStoreQueryOp_MPUploadList
 
 } // namespace rgw
