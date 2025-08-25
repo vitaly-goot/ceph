@@ -3786,7 +3786,7 @@ static int usage_iterate_range_by_time(cls_method_context_t hctx, uint64_t start
 
   ceph_assert(truncated != nullptr);
 
-  usage_record_prefix_by_time(end, end_key);
+  usage_record_prefix_by_time(end_epoch, end_key);
 
   if (key_iter.empty()) {
     usage_record_prefix_by_time(start_epoch, start_key);
