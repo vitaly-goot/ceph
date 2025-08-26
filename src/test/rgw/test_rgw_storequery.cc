@@ -6,6 +6,7 @@
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
 #include <initializer_list>
+#include <stdexcept>
 
 #include "common/async/yield_context.h"
 #include "common/ceph_argparse.h"
@@ -702,12 +703,231 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
-INSTANTIATE_TEST_SUITE_P(StoreQuerySourceSizeParam, SQObjectlistHarness,
+INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParam, SQObjectlistHarness,
     ::testing::Combine(
         ::testing::Values(1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001),
         ::testing::Values(1, 2, 5)),
     [](const ::testing::TestParamInfo<SQObjectlistHarness::ParamType>& info) {
       return fmt::format(FMT_STRING("size_{}_versions_{}"), std::get<0>(info.param), std::get<1>(info.param));
+    });
+
+/***************************************************************************/
+
+/* mpuploadlist test harness */
+
+// Use DEFINE_REQ_STATE and BasicClient from the objectlist harness.
+
+class SQMpuploadlistHarness : public testing::TestWithParam<std::tuple<size_t, size_t>> {
+protected:
+  /// The default number of entries to return in a list operation. When
+  /// debugging, it will help you *a lot* to reduce this to a much smaller
+  /// number, like 10.
+  static constexpr uint64_t kDefaultEntries = 1000;
+  // static constexpr uint64_t kDefaultEntries = 10;
+
+  RGWStoreQueryOp_MPUploadList_Unittest* op = nullptr;
+
+protected:
+  req_state* s_;
+  TestClient cio_;
+
+  std::shared_ptr<DoutPrefix> dpp_;
+  // It just looks weird to not have 'dpp' as the pointer.
+  DoutPrefixProvider* dpp;
+
+  using SALBucket = rgw::sal::Bucket;
+
+public:
+  MpuBucketDirSim sim_;
+
+protected:
+  void SetUp() override
+  {
+    dpp_ = std::make_shared<DoutPrefix>(g_ceph_context, ceph_subsys_rgw, "unittest ");
+    dpp = dpp_.get();
+    ldpp_dout(dpp, 1) << "SetUp()" << dendl;
+  }
+
+  void TearDown() override
+  {
+    ldpp_dout(dpp, 1) << "TearDown()" << dendl;
+    if (op) {
+      delete op;
+      op = nullptr;
+    }
+    dpp_.reset();
+    s_ = nullptr;
+  }
+
+  void init_op(req_state* s, uint64_t max_entries, std::optional<std::string> marker)
+  {
+    s_ = s;
+    s_->cio = &cio_;
+    op = new RGWStoreQueryOp_MPUploadList_Unittest(max_entries, marker);
+    op->set_req_state(s_);
+    // By default, have the list function throw an exception. That way,
+    // forgetting to set the list function should be hard to do.
+    op->set_list_multiparts_function(std::bind(&MpuBucketDirSim::list_multiparts_always_throw, &sim_,
+        std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
+        std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
+        std::placeholders::_7, std::placeholders::_8));
+    op->init(nullptr, s_, nullptr);
+    ldpp_dout(dpp, 1) << "op configured" << dendl;
+  }
+
+  // Quickly initialise the source bucket from an existing vector, destroying
+  // the original vector.
+  void move_bucket(std::vector<MpuSrcKey>&& keys)
+  {
+    sim_.set_bucket(std::move(keys));
+  }
+
+  // Allow tests to index the source bucket.
+  const std::vector<MpuSrcKey>& src_bucket() const
+  {
+    return sim_.get_bucket();
+  }
+
+}; // class StoreQueryObjectListHarness
+
+TEST_F(SQMpuploadlistHarness, MetaHarnessDefaults)
+{
+  DEFINE_REQ_STATE;
+  init_op(&s, kDefaultEntries, std::nullopt);
+
+  // Run the operation.
+  ASSERT_THROW(op->execute(null_yield), std::runtime_error);
+}
+
+TEST_F(SQMpuploadlistHarness, MetaHarnessAlwaysFail)
+{
+  DEFINE_REQ_STATE;
+  init_op(&s, kDefaultEntries, std::nullopt);
+  op->set_list_multiparts_function(std::bind(&MpuBucketDirSim::list_multiparts_always_fail, &sim_,
+      std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
+      std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
+      std::placeholders::_7, std::placeholders::_8));
+  op->execute(null_yield);
+  ASSERT_EQ(op->get_ret(), -ERR_INTERNAL_ERROR);
+}
+
+TEST_F(SQMpuploadlistHarness, MetaStdEmpty)
+{
+  DEFINE_REQ_STATE;
+  init_op(&s, kDefaultEntries, std::nullopt);
+  op->set_list_multiparts_function(std::bind(&MpuBucketDirSim::list_multiparts_standard, &sim_,
+      std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
+      std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
+      std::placeholders::_7, std::placeholders::_8));
+  op->execute(null_yield);
+  ASSERT_EQ(op->get_ret(), 0);
+  ASSERT_EQ(op->items().size(), 0U);
+}
+
+// Check the first page of potentially paginated output. Allows for multiple
+// uploads on the same key.
+TEST_P(SQMpuploadlistHarness, StdNonVersionedFirstPage)
+{
+  size_t uploads_per_key = std::get<1>(GetParam());
+
+  size_t count = std::get<0>(GetParam());
+  sim_.fill_bucket(count, uploads_per_key);
+
+  DEFINE_REQ_STATE;
+  init_op(&s, kDefaultEntries, std::nullopt);
+  op->set_list_multiparts_function(std::bind(&MpuBucketDirSim::list_multiparts_standard, &sim_,
+      std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
+      std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
+      std::placeholders::_7, std::placeholders::_8));
+  op->execute(null_yield);
+  ASSERT_EQ(op->get_ret(), 0);
+  // We should never return more results than the max.
+  ASSERT_LE(op->items().size(), kDefaultEntries);
+  // If we requested <= kDefaultItems entries, we should match exactly and we
+  // should see the EOF flag.
+  // This catches important special-case handling of the marker. If we're on
+  // an exact page boundary we don't set the marker.
+  if (count * uploads_per_key <= kDefaultEntries) {
+    ASSERT_EQ(op->items().size(), std::min(count * uploads_per_key, kDefaultEntries));
+    ASSERT_TRUE(op->seen_eof());
+    ASSERT_TRUE(op->return_marker() == std::nullopt);
+
+  } else {
+    // If there were more than kDefaultItems entries, we shouldn't see EOF.
+    ASSERT_FALSE(op->seen_eof());
+    auto last = op->items()[op->items().size() - 1];
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("last item: key={}"), last.key()) << dendl;
+    auto opt_token = op->return_marker();
+    ASSERT_TRUE(opt_token != std::nullopt);
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("continuation token: {}"), *opt_token) << dendl;
+
+    if (opt_token.has_value()) {
+      // If this base64 decode throws, the test will fail.
+      auto token_json = from_base64(*opt_token);
+      auto opt_token_marker = RGWStoreQueryOp_MPUploadList::read_continuation_token(dpp, token_json);
+      ASSERT_TRUE(opt_token_marker != std::nullopt);
+      ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("continuation token: {}"), *opt_token_marker) << dendl;
+    }
+  }
+}
+
+// Test that a sequence of calls to mpuploadlist (including in most cases
+// pagination) results in the proper list of keys. Allows for multiple uploads
+// on the same key.
+TEST_P(SQMpuploadlistHarness, CompoundQueryVersioned)
+{
+  auto count = std::get<0>(GetParam());
+  auto uploads_per_version = std::get<1>(GetParam());
+  sim_.fill_bucket(count, uploads_per_version);
+
+  std::optional<std::string> next_marker;
+  int reps = 0;
+  std::vector<RGWStoreQueryOp_MPUploadList::item_type> items;
+
+  while (true) {
+    ASSERT_LT(reps, 10 * kDefaultEntries * count) << "Looks like we're in an infinite loop";
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
+    DEFINE_REQ_STATE;
+    init_op(&s, kDefaultEntries, next_marker);
+    op->set_list_multiparts_function(std::bind(&MpuBucketDirSim::list_multiparts_standard, &sim_,
+        std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
+        std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
+        std::placeholders::_7, std::placeholders::_8));
+
+    op->execute(null_yield);
+    reps++;
+    ASSERT_EQ(op->get_ret(), 0);
+    std::copy(op->items().begin(), op->items().end(), std::back_inserter(items));
+    next_marker = op->return_marker();
+    if (!next_marker) {
+      break;
+    }
+  }
+  // We should get the same number of items back.
+  ASSERT_EQ(count * uploads_per_version, items.size());
+  // ...and those items should be the same as those in the bucket.
+  auto bucket_keys = sim_.bucket_object_keys();
+  std::set<std::string> result_keys;
+  for (const auto& item : items) {
+    result_keys.insert(item.key());
+  }
+  ASSERT_EQ(bucket_keys, result_keys);
+
+  // Same again, but with markers == <key>.<upload_id>.meta.
+  auto bucket_markers = sim_.bucket_object_markers();
+  std::set<std::string> result_markers;
+  for (const auto& item : items) {
+    result_markers.insert(item.make_marker());
+  }
+  ASSERT_EQ(bucket_markers, result_markers);
+}
+
+INSTANTIATE_TEST_SUITE_P(SQMpuloadlistUploadsSizeParam, SQMpuploadlistHarness,
+    ::testing::Combine(
+        ::testing::Values(1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001),
+        ::testing::Values(1, 2, 5)),
+    [](const ::testing::TestParamInfo<SQMpuploadlistHarness::ParamType>& info) {
+      return fmt::format(FMT_STRING("size_{}_uploads_{}"), std::get<0>(info.param), std::get<1>(info.param));
     });
 
 /***************************************************************************/

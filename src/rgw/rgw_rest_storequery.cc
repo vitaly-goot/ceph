@@ -717,7 +717,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
                        << dendl;
   }
 
-  bool seen_eof = false;
+  seen_eof_ = false;
 
   // This will be set if we want to set a continuation token.
   std::optional<std::string> next_marker;
@@ -730,7 +730,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
   // /insanely/ high), and reserve it exactly once.
   items_.reserve(max_entries_);
 
-  while (!seen_eof && items_.size() < max_entries_) {
+  while (!seen_eof_ && items_.size() < max_entries_) {
     // Re-initialise this every run. We can only see if the query is complete
     // across multiple list_multiparts() by checking if this is empty.
     // However, nothing in list_multiparts() clears it.
@@ -746,7 +746,12 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
     //   doesn't do a nullptr check.
     // - Don't make any assumptions about how many records will be returned,
     //   except that it will be <= query_max.
-    auto ret = s->bucket->list_multiparts(this, "", marker, "", query_max, uploads, nullptr, &is_truncated);
+    int ret;
+    if (list_multiparts_function_) {
+      ret = (*list_multiparts_function_)(this, "", marker, "", query_max, uploads, nullptr, &is_truncated);
+    } else {
+      ret = s->bucket->list_multiparts(this, "", marker, "", query_max, uploads, nullptr, &is_truncated);
+    }
 
     if (ret < 0) {
       ldpp_dout(this, 0) << "list_multiparts() failed with code " << ret
@@ -760,7 +765,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
 
     // As with objectlist, I find '!is_truncated' confusing to reason with,
     // whereas a bool 'seen_eof' is more intuitive.
-    seen_eof = !is_truncated;
+    seen_eof_ = !is_truncated;
 
     // for (auto const& upload : uploads) {
     for (size_t n = 0; n < uploads.size(); n++) {
@@ -779,10 +784,12 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
 
       // This is the *only* place we add to the items_ array.
       items_.push_back(item);
+      ldpp_dout(this, 20) << fmt::format(FMT_STRING("added user result item {}: key='{}' upload_id='{}'"), items_.size(), item.key(), item.upload_id())
+                          << dendl;
 
       // Extra actions if we've reached the caller's size limit.
       if (items_.size() == max_entries_) {
-        if (last_item && seen_eof) {
+        if (last_item && seen_eof_) {
           // In the special case where we've filled the user structure with
           // the last item in the query, AND we've seen EOF, then we don't
           // need to set a marker.
@@ -801,7 +808,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
   }
 
   ldpp_dout(this, 10) << fmt::format(FMT_STRING("loop exit: seen_eof={} next_marker={} items_.size={}"),
-      seen_eof, next_marker.has_value() ? *next_marker : "<none>", items_.size())
+      seen_eof_, next_marker.has_value() ? *next_marker : "<none>", items_.size())
                       << dendl;
 
   if (op_ret < 0) {

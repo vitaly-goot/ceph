@@ -805,7 +805,7 @@ public:
   {
   }
 
-  /// Set the req_state.
+  /// Set the req_state. This is a protected member of RGWOp.
   void set_req_state(req_state* new_s)
   {
     s = new_s;
@@ -881,16 +881,40 @@ protected:
     const std::string& key() const noexcept { return key_; }
     const std::string& upload_id() const noexcept { return upload_id_; }
 
+    /// Return a marker in the same form as the Rados SAL returns, i.e.
+    /// '<key>.<upload_id>.meta'.
+    std::string make_marker() const { return fmt::format(FMT_STRING("{}.{}.meta"), key_, upload_id_); }
+
     void dump(Formatter* f) const;
   }; // Item
 
-private:
+public:
+  // This is the signature of rgw::sal::Bucket::list_multiparts(), which we'll override
+  // for testing.
+  using list_func = std::function<int(const DoutPrefixProvider*,
+      const std::string&,
+      std::string&,
+      const std::string&,
+      const int&,
+      std::vector<std::unique_ptr<rgw::sal::MultipartUpload>>&,
+      std::map<std::string, bool>*,
+      bool*)>;
   using item_type = Item;
 
+private:
   uint64_t max_entries_;
   std::optional<std::string> marker_;
   std::optional<std::string> return_marker_;
+
+protected:
+  // Fields we want the unit test subclass to be able to
+  // access.
   std::vector<item_type> items_;
+  bool seen_eof_ = false; /// True if the current query was not truncated, i.e. there are no more object keys.
+
+  // Optional override of the bucket list SAL function. Intended for unit
+  // tests.
+  std::optional<list_func> list_multiparts_function_;
 
 public:
   RGWStoreQueryOp_MPUploadList(uint64_t max_entries, std::optional<std::string> marker)
@@ -1000,5 +1024,47 @@ public:
   static std::optional<std::string> read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
 
 }; // RGWStoreQueryOp_MPUploadList
+
+/**
+ * @brief Special unit test version of RGWStoreQueryOp_MPUploadList, that
+ * exposes methods to allow a test harness to operate.
+ *
+ * The main purpose of this class is to provide public accessors to protected
+ * fields of parent classes. Mostly the parent in question is
+ * RGWStoreQueryOp_MPUploadList, but there's also a means to set the req_state
+ * pointer `s` for harness purposes.
+ *
+ * Note that all the actual code being tested is in the superclass. All we're
+ * doing is providing public access, rather then messing around with
+ * FRIEND_TEST().
+ */
+class RGWStoreQueryOp_MPUploadList_Unittest : public RGWStoreQueryOp_MPUploadList {
+
+public:
+  RGWStoreQueryOp_MPUploadList_Unittest(uint64_t max_entries, std::optional<std::string> marker)
+      : RGWStoreQueryOp_MPUploadList(max_entries, marker)
+  {
+  }
+
+  /// Set the req_state. This is a protected member of RGWOp.
+  void set_req_state(req_state* new_s)
+  {
+    s = new_s;
+  }
+
+  /// Override of the bucket list SAL function.
+  void set_list_multiparts_function(list_func f)
+  {
+    list_multiparts_function_ = f;
+  }
+  /// Clear the bucket list function override.
+  void clear_list_multiparts_function() { list_multiparts_function_.reset(); }
+
+  /// Return a reference to the list of items.
+  const std::vector<item_type>& items() const { return items_; }
+
+  /// Return true if the query returned EOF (i.e. 'is_truncated==false).
+  bool seen_eof() const { return seen_eof_; }
+}; // RGWStoreQueryOp_ObjectList_Unittest
 
 } // namespace rgw
