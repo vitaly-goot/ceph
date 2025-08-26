@@ -535,13 +535,6 @@ bool RGWStoreQueryOp_ObjectList::execute_query(optional_yield y)
 
     } // for each SAL object result
 
-    // Special case: If the query results in EOF and has no items (e.g. an
-    // empty bucket), we still need to break out of the for loop. Setting
-    // seen_eof will break out of the while loop naturally.
-    if (seen_eof_) {
-      break;
-    }
-
   } // while !seen_eof && items_.size() < max_entries_
 
   ldpp_dout(this, 10) << fmt::format(FMT_STRING("loop exit: seen_eof={} early_exit={} next_marker=[name={},instance={}]"),
