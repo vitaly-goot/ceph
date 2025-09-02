@@ -869,7 +869,7 @@ void RGWStoreQueryOp_MPUploadList::Item::dump(Formatter* f) const
 {
   f->open_object_section("Object");
   f->dump_string("key", to_base64(key_));
-  f->dump_string("uploadId", to_base64(upload_id_));
+  f->dump_string("upload_id", to_base64(upload_id_));
   f->close_section(); // Object
 }
 
