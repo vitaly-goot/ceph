@@ -374,15 +374,15 @@ TEST_F(SQObjectlistHarness, MetaTokenOrdering)
   DEFINE_REQ_STATE;
   sim_.fill_bucket_nonversioned(10);
 
-  SrcKey search("obj0002x");
-  SrcKey prev("obj0001");
-  SrcKey next("obj0003");
+  SrcKey search("obj000002x");
+  SrcKey prev("obj000001");
+  SrcKey next("obj000003");
   ASSERT_LT(prev, search);
   ASSERT_GT(next, search);
   ASSERT_EQ(search, search);
 
-  // A token 'in between' obj0002 and obj0003.
-  rgw_obj_key search_key("obj0002x");
+  // A token 'in between' obj000002 and obj000003.
+  rgw_obj_key search_key("obj000002x");
   auto token = to_base64(RGWStoreQueryOp_ObjectList::create_continuation_token(dpp, search_key));
   ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("continuation token: {}"), token) << dendl;
 
@@ -394,7 +394,7 @@ TEST_F(SQObjectlistHarness, MetaTokenOrdering)
   ASSERT_EQ(op->get_ret(), 0);
   ASSERT_GE(op->items().size(), 1U);
   auto first = op->items()[0];
-  ASSERT_EQ(first.key(), "obj0003");
+  ASSERT_EQ(first.key(), "obj000003");
 }
 
 // Check the first page of potentially paginated output.
