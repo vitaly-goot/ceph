@@ -255,6 +255,10 @@ public:
   }
 };
 
+/**
+ * @brief Common code for the versioned and nonversioned test harnesses for
+ * objectlist.
+ */
 class SQObjectListHarnessBase {
 protected:
   /// The default number of entries to return in a list operation. When
@@ -308,30 +312,13 @@ protected:
 
 }; // class StoreQueryObjectListHarness
 
+/**
+ * @brief Nonversioned harness, parameterised solely by bucket size.
+ *
+ * It's still using std::tuple<> simply to minimise the diff to the versioned
+ * harness, and maybe to make it easier to extend later.
+ */
 class SQObjectlistHarnessNonversioned : public SQObjectListHarnessBase, public testing::TestWithParam<std::tuple<size_t>> {
-
-protected:
-  void SetUp() override
-  {
-    dpp_ = std::make_shared<DoutPrefix>(g_ceph_context, ceph_subsys_rgw, "unittest ");
-    dpp = dpp_.get();
-    ldpp_dout(dpp, 1) << "SetUp()" << dendl;
-  }
-
-  void TearDown() override
-  {
-    ldpp_dout(dpp, 1) << "TearDown()" << dendl;
-    if (op) {
-      delete op;
-      op = nullptr;
-    }
-    dpp_.reset();
-    s_ = nullptr;
-  }
-
-}; // class StoreQueryObjectListHarness
-
-class SQObjectlistHarnessVersioned : public SQObjectListHarnessBase, public testing::TestWithParam<std::tuple<size_t, size_t>> {
 
 protected:
   void SetUp() override
@@ -515,6 +502,79 @@ TEST_P(SQObjectlistHarnessNonversioned, StdNonVersionedLastPage)
   }
 }
 
+// Test that a sequence of calls to objectlist (including in most cases
+// pagination) results in the proper list of keys. First for a nonversioned bucket.
+TEST_P(SQObjectlistHarnessNonversioned, CompoundQueryNonversioned)
+{
+  auto count = std::get<0>(GetParam());
+  sim_.fill_bucket_nonversioned(count);
+
+  std::optional<std::string> next_marker;
+  int reps = 0;
+  std::vector<RGWStoreQueryOp_ObjectList::item_type> items;
+
+  while (true) {
+    ASSERT_LT(reps, 10 * kDefaultEntries * count) << "Looks like we're in an infinite loop";
+    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
+    DEFINE_REQ_STATE;
+    init_op(&s, kDefaultEntries, next_marker);
+    op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
+        std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
+
+    op->execute(null_yield);
+    reps++;
+    ASSERT_EQ(op->get_ret(), 0);
+    std::copy(op->items().begin(), op->items().end(), std::back_inserter(items));
+    next_marker = op->return_marker();
+    if (!next_marker) {
+      break;
+    }
+  }
+  // We should get the same number of items back.
+  ASSERT_EQ(count, items.size());
+  // ...and those items should be the same as those in the bucket.
+  auto bucket_keys = sim_.bucket_object_keys();
+  std::set<std::string> result_keys;
+  for (const auto& item : items) {
+    result_keys.insert(item.key());
+  }
+  ASSERT_EQ(bucket_keys, result_keys);
+}
+
+INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParamNonversioned, SQObjectlistHarnessNonversioned,
+    ::testing::Combine(
+        ::testing::Values(1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001)),
+    [](const ::testing::TestParamInfo<SQObjectlistHarnessNonversioned::ParamType>& info) {
+      return fmt::format(FMT_STRING("size_{}"), std::get<0>(info.param));
+    });
+
+/**
+ * @brief Versioned harness, parameterised by bucket size and number of
+ * versions of each object to test.
+ */
+class SQObjectlistHarnessVersioned : public SQObjectListHarnessBase, public testing::TestWithParam<std::tuple<size_t, size_t>> {
+
+protected:
+  void SetUp() override
+  {
+    dpp_ = std::make_shared<DoutPrefix>(g_ceph_context, ceph_subsys_rgw, "unittest ");
+    dpp = dpp_.get();
+    ldpp_dout(dpp, 1) << "SetUp()" << dendl;
+  }
+
+  void TearDown() override
+  {
+    ldpp_dout(dpp, 1) << "TearDown()" << dendl;
+    if (op) {
+      delete op;
+      op = nullptr;
+    }
+    dpp_.reset();
+    s_ = nullptr;
+  }
+
+}; // class StoreQueryObjectListHarness
+
 TEST_F(SQObjectlistHarnessVersioned, StdVersionedOneItemFiveVersions)
 {
   // One item with five versions, only the last item will be current.
@@ -567,45 +627,6 @@ TEST_P(SQObjectlistHarnessVersioned, StdVersionedFirstPage)
   //
   // This is by way of explaining why a bunch of additional assertions from
   // the nonversioned tests are missing here.
-}
-
-// Test that a sequence of calls to objectlist (including in most cases
-// pagination) results in the proper list of keys. First for a nonversioned bucket.
-TEST_P(SQObjectlistHarnessNonversioned, CompoundQueryNonversioned)
-{
-  auto count = std::get<0>(GetParam());
-  sim_.fill_bucket_nonversioned(count);
-
-  std::optional<std::string> next_marker;
-  int reps = 0;
-  std::vector<RGWStoreQueryOp_ObjectList::item_type> items;
-
-  while (true) {
-    ASSERT_LT(reps, 10 * kDefaultEntries * count) << "Looks like we're in an infinite loop";
-    ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("MultiQuery iteration {} with next_marker={}"), reps, next_marker.value_or("null")) << dendl;
-    DEFINE_REQ_STATE;
-    init_op(&s, kDefaultEntries, next_marker);
-    op->set_list_function(std::bind(&BucketDirSim::list_standard, &sim_,
-        std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
-
-    op->execute(null_yield);
-    reps++;
-    ASSERT_EQ(op->get_ret(), 0);
-    std::copy(op->items().begin(), op->items().end(), std::back_inserter(items));
-    next_marker = op->return_marker();
-    if (!next_marker) {
-      break;
-    }
-  }
-  // We should get the same number of items back.
-  ASSERT_EQ(count, items.size());
-  // ...and those items should be the same as those in the bucket.
-  auto bucket_keys = sim_.bucket_object_keys();
-  std::set<std::string> result_keys;
-  for (const auto& item : items) {
-    result_keys.insert(item.key());
-  }
-  ASSERT_EQ(bucket_keys, result_keys);
 }
 
 // Test that a sequence of calls to objectlist (including in most cases
@@ -717,13 +738,6 @@ TEST_P(SQObjectlistHarnessVersioned, CompoundQueryVersionedWithDeletes)
   }
   ASSERT_EQ(bucket_keys, result_keys);
 }
-
-INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParamNonversioned, SQObjectlistHarnessNonversioned,
-    ::testing::Combine(
-        ::testing::Values(1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001)),
-    [](const ::testing::TestParamInfo<SQObjectlistHarnessNonversioned::ParamType>& info) {
-      return fmt::format(FMT_STRING("size_{}"), std::get<0>(info.param));
-    });
 
 INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParamVersioned, SQObjectlistHarnessVersioned,
     ::testing::Combine(
@@ -848,7 +862,7 @@ TEST_F(SQMpuploadlistHarness, MetaStdEmpty)
 
 // Check the first page of potentially paginated output. Allows for multiple
 // uploads on the same key.
-TEST_P(SQMpuploadlistHarness, StdNonVersionedFirstPage)
+TEST_P(SQMpuploadlistHarness, StdFirstPage)
 {
   size_t uploads_per_key = std::get<1>(GetParam());
 
@@ -896,7 +910,7 @@ TEST_P(SQMpuploadlistHarness, StdNonVersionedFirstPage)
 // Test that a sequence of calls to mpuploadlist (including in most cases
 // pagination) results in the proper list of keys. Allows for multiple uploads
 // on the same key.
-TEST_P(SQMpuploadlistHarness, CompoundQueryVersioned)
+TEST_P(SQMpuploadlistHarness, CompoundQuery)
 {
   auto count = std::get<0>(GetParam());
   auto uploads_per_version = std::get<1>(GetParam());
