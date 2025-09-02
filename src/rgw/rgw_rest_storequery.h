@@ -759,6 +759,18 @@ public:
    * as the NextToken field in the objectlist response, and its presence
    * indicates that there are more results available.
    *
+   * We're not base64-encoding the key here. This may seem inconsistent, but
+   * testing shows that we don't need to - the token as a whole is
+   * base64-encoded when embedded in the HTTP response, and we can show that
+   * the pair of create_continuation_token() / read_continuation_token() are
+   * able to successfully read object keys even if they have 'problem'
+   * characters in them. (Unit test
+   * SQObjectlistContinuationTokenTests.CreateKeyContainsProblemCharacters at
+   * the time of writing.)
+   *
+   * In retrospect, given the test above's seeming robustness it might not
+   * have been necessary to encode for the main output either. It's done now.
+   *
    * @param dpp The DoutPrefixProvider instance.
    * @param key The rgw_obj_key to include in the token.
    * @return std::string The created continuation token.
@@ -774,6 +786,9 @@ public:
    * so it restarts at the exact point a previous query left off. It has
    * enough information to work consistently with versioned buckets as well as
    * nonversioned; the object name alone is not enough in a versioned bucket.
+   *
+   * See the note on the lack of base64 encoding in the documentation for
+   * RGWStoreQueryOp_ObjectList::create_continuation_token().
    *
    * @param dpp The DoutPrefixProvider instance.
    * @param token The JSON continuation token returned from a previous
@@ -1002,6 +1017,9 @@ public:
    * broken out already. The think we really need is the marker returned by
    * list_mulitparts() which is a single string.
    *
+   * See the note on the lack of base64 encoding in the documentation for
+   * RGWStoreQueryOp_ObjectList::create_continuation_token().
+   *
    * @param dpp The DoutPrefixProvider instance.
    * @param marker The continuation token marker returned by list_multiparts().
    * @param upload Pointer to the multipart upload object.
@@ -1015,6 +1033,9 @@ public:
    *
    * We totally ignore the non-marker parts of the token JSON here. We just
    * want the marker.
+   *
+   * See the note on the lack of base64 encoding in the documentation for
+   * RGWStoreQueryOp_ObjectList::create_continuation_token().
    *
    * @param dpp The DoutPrefixProvider instance.
    * @param token The continuation token string, *after* base64 decoding.

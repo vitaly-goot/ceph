@@ -6,6 +6,7 @@
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
 #include <initializer_list>
+#include <rapidjson/document.h>
 #include <stdexcept>
 
 #include "common/async/yield_context.h"
@@ -225,7 +226,7 @@ TEST_F(StoreQueryHeaderParserTest, MPUploadListFail)
 
 /***************************************************************************/
 
-/* objectlist test harness */
+/* objectlist continuation token tests. */
 
 // Stole this from test_rgw_lua.cc. Set up a req_state s for testing.
 #define DEFINE_REQ_STATE \
@@ -254,6 +255,138 @@ public:
     return 0;
   }
 };
+
+class SQObjectlistContinuationTokenTests : public testing::Test {
+
+protected:
+  std::unique_ptr<RGWStoreQueryOp_ObjectList_Unittest> op_;
+  TestClient cio_;
+  struct req_state* s_;
+  DoutPrefixProvider* dpp_;
+
+  void SetUp() override
+  {
+  }
+
+  void init_op(struct req_state* s)
+  {
+    s_ = s;
+    s_->cio = &cio_;
+    // The constructor parameters don't matter for this test.
+    op_ = std::make_unique<RGWStoreQueryOp_ObjectList_Unittest>(100, std::nullopt);
+    op_->set_req_state(s_);
+    dpp_ = op_.get();
+  }
+
+  /* Manually parse the JSON. I know this is (at the time of test writing)
+   * very similar code to op->parse_continuation_token(), but I think we can
+   * be reasonably confident that rapidjson works.
+   */
+  void manual_parse_check(const std::string& token, const rgw_obj_key& key)
+  {
+    rapidjson::Document doc;
+    doc.Parse(token.c_str());
+    ASSERT_FALSE(doc.HasParseError());
+    ASSERT_TRUE(doc.IsObject());
+    ASSERT_TRUE(doc.HasMember("key"));
+    ASSERT_TRUE(doc["key"].IsString());
+    ASSERT_STREQ(doc["key"].GetString(), key.name.c_str());
+    ASSERT_TRUE(doc.HasMember("instance"));
+    ASSERT_TRUE(doc["instance"].IsString());
+    ASSERT_STREQ(doc["instance"].GetString(), key.get_instance().c_str());
+  }
+
+}; // class SQObjectlistContinuationTokenTests
+
+TEST_F(SQObjectlistContinuationTokenTests, RoundTripVersionedPedantic)
+{
+  DEFINE_REQ_STATE;
+  init_op(&s);
+  ASSERT_TRUE(op_ != nullptr);
+
+  // Create a valid, straightforward (versioned) key.
+  rgw_obj_key key("foo", "bar");
+  auto created = op_->create_continuation_token(dpp_, key);
+  ASSERT_FALSE(created.empty());
+
+  manual_parse_check(created, key);
+
+  // Now try to read it back in.
+  auto received = op_->read_continuation_token(dpp_, created);
+  ASSERT_NE(received, std::nullopt);
+  ASSERT_STREQ(received->name.c_str(), key.name.c_str());
+  ASSERT_STREQ(received->get_instance().c_str(), key.get_instance().c_str());
+}
+
+TEST_F(SQObjectlistContinuationTokenTests, RoundTripNonVersionedPedantic)
+{
+  DEFINE_REQ_STATE;
+  init_op(&s);
+  ASSERT_NE(op_, nullptr);
+
+  rgw_obj_key key("foo");
+  auto created = op_->create_continuation_token(dpp_, key);
+  ASSERT_FALSE(created.empty());
+
+  manual_parse_check(created, key);
+
+  auto received = op_->read_continuation_token(dpp_, created);
+  ASSERT_NE(received, std::nullopt);
+  ASSERT_STREQ(received->name.c_str(), key.name.c_str());
+  ASSERT_STREQ(received->get_instance().c_str(), key.get_instance().c_str());
+}
+
+// Throw various legal object key name codings at the encoder and parser.
+TEST_F(SQObjectlistContinuationTokenTests, CreateKeyContainsProblemCharacters)
+{
+  DEFINE_REQ_STATE;
+  init_op(&s);
+  ASSERT_NE(op_, nullptr);
+
+  struct test {
+    const std::string object_key_name;
+    const std::string description;
+  };
+
+  const std::vector<test> bad_key = {
+    { "foo\",bar", "embedded double quote" },
+    { "foo\\,bar", "escaped backslash" },
+    { "foo\n,bar", "control character" },
+    { "foo\x7f,bar", "DEL control character" },
+    { "foo\x80,bar", "byte >127 (0x80)" },
+    { "foo\U0001F600,bar", "emoji character" },
+    // Start picking bad UTF-8 sequences from
+    //   https://www.w3.org/2001/06/utf-8-wrong/UTF-8-test.html
+    { "\u00FE", "bad UTF-8 (0xfe)" },
+    { "foo\xfe,bar", "bad UTF-8 (0xfe) encoded as \\x" },
+    { "\u00FF", "bad UTF-8 (0xff)" },
+    { "foo\xff,bar", "bad UTF-8 (0xff) encoded as \\x" },
+    { "\u{fffe}", "bad UTF-8 (0xFFFE)" },
+    { "\x{ff}\x{fe}", "bad UTF-8 (0xFFFE) encoded as \\x" }
+
+  };
+
+  for (const auto& t : bad_key) {
+    auto [object_key_name, desc] = t;
+    SCOPED_TRACE(desc);
+    // Illegal in-string quote.
+    rgw_obj_key key(object_key_name);
+    auto created = op_->create_continuation_token(dpp_, key);
+    ASSERT_FALSE(created.empty());
+    // ldpp_dout(dpp_, 20) << fmt::format(FMT_STRING("for test '{}' created token: {}"), desc, created) << dendl;
+
+    manual_parse_check(created, key);
+
+    auto received = op_->read_continuation_token(dpp_, created);
+    ASSERT_NE(received, std::nullopt);
+    ASSERT_STREQ(received->name.c_str(), key.name.c_str());
+    ASSERT_STREQ(received->get_instance().c_str(), key.get_instance().c_str());
+  }
+}
+
+/***************************************************************************/
+
+/* objectlist test harness. */
 
 /**
  * @brief Common code for the versioned and nonversioned test harnesses for
@@ -749,7 +882,7 @@ INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParamVersioned, SQObjectlistHarne
 
 /***************************************************************************/
 
-/* mpuploadlist test harness */
+/* mpuploadlist test harness. */
 
 // Use DEFINE_REQ_STATE and BasicClient from the objectlist harness.
 
