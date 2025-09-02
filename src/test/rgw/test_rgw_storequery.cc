@@ -255,7 +255,7 @@ public:
   }
 };
 
-class SQObjectlistHarness : public testing::TestWithParam<std::tuple<size_t, size_t>> {
+class SQObjectListHarnessBase {
 protected:
   /// The default number of entries to return in a list operation. When
   /// debugging, it will help you *a lot* to reduce this to a much smaller
@@ -279,24 +279,6 @@ public:
   BucketDirSim sim_;
 
 protected:
-  void SetUp() override
-  {
-    dpp_ = std::make_shared<DoutPrefix>(g_ceph_context, ceph_subsys_rgw, "unittest ");
-    dpp = dpp_.get();
-    ldpp_dout(dpp, 1) << "SetUp()" << dendl;
-  }
-
-  void TearDown() override
-  {
-    ldpp_dout(dpp, 1) << "TearDown()" << dendl;
-    if (op) {
-      delete op;
-      op = nullptr;
-    }
-    dpp_.reset();
-    s_ = nullptr;
-  }
-
   void init_op(req_state* s, uint64_t max_entries, std::optional<std::string> marker)
   {
     s_ = s;
@@ -326,7 +308,53 @@ protected:
 
 }; // class StoreQueryObjectListHarness
 
-TEST_F(SQObjectlistHarness, MetaHarnessDefaults)
+class SQObjectlistHarnessNonversioned : public SQObjectListHarnessBase, public testing::TestWithParam<std::tuple<size_t>> {
+
+protected:
+  void SetUp() override
+  {
+    dpp_ = std::make_shared<DoutPrefix>(g_ceph_context, ceph_subsys_rgw, "unittest ");
+    dpp = dpp_.get();
+    ldpp_dout(dpp, 1) << "SetUp()" << dendl;
+  }
+
+  void TearDown() override
+  {
+    ldpp_dout(dpp, 1) << "TearDown()" << dendl;
+    if (op) {
+      delete op;
+      op = nullptr;
+    }
+    dpp_.reset();
+    s_ = nullptr;
+  }
+
+}; // class StoreQueryObjectListHarness
+
+class SQObjectlistHarnessVersioned : public SQObjectListHarnessBase, public testing::TestWithParam<std::tuple<size_t, size_t>> {
+
+protected:
+  void SetUp() override
+  {
+    dpp_ = std::make_shared<DoutPrefix>(g_ceph_context, ceph_subsys_rgw, "unittest ");
+    dpp = dpp_.get();
+    ldpp_dout(dpp, 1) << "SetUp()" << dendl;
+  }
+
+  void TearDown() override
+  {
+    ldpp_dout(dpp, 1) << "TearDown()" << dendl;
+    if (op) {
+      delete op;
+      op = nullptr;
+    }
+    dpp_.reset();
+    s_ = nullptr;
+  }
+
+}; // class StoreQueryObjectListHarness
+
+TEST_F(SQObjectlistHarnessNonversioned, MetaHarnessDefaults)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -334,7 +362,7 @@ TEST_F(SQObjectlistHarness, MetaHarnessDefaults)
   ASSERT_THROW(op->execute(null_yield), std::runtime_error);
 }
 
-TEST_F(SQObjectlistHarness, MetaAlwaysFail)
+TEST_F(SQObjectlistHarnessNonversioned, MetaAlwaysFail)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -346,7 +374,7 @@ TEST_F(SQObjectlistHarness, MetaAlwaysFail)
 
 // This catches a meaningful special case where the bucket is empty. Make sure
 // we exit the loop properly when there are no items at all.
-TEST_F(SQObjectlistHarness, MetaAlwaysEmpty)
+TEST_F(SQObjectlistHarnessNonversioned, MetaAlwaysEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -357,7 +385,7 @@ TEST_F(SQObjectlistHarness, MetaAlwaysEmpty)
   ASSERT_EQ(op->items().size(), 0U);
 }
 
-TEST_F(SQObjectlistHarness, MetaStdEmpty)
+TEST_F(SQObjectlistHarnessNonversioned, MetaStdEmpty)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -369,7 +397,7 @@ TEST_F(SQObjectlistHarness, MetaStdEmpty)
 }
 
 // Check that the token works the way we expect.
-TEST_F(SQObjectlistHarness, MetaTokenOrdering)
+TEST_F(SQObjectlistHarnessNonversioned, MetaTokenOrdering)
 {
   DEFINE_REQ_STATE;
   sim_.fill_bucket_nonversioned(10);
@@ -398,13 +426,8 @@ TEST_F(SQObjectlistHarness, MetaTokenOrdering)
 }
 
 // Check the first page of potentially paginated output.
-TEST_P(SQObjectlistHarness, StdNonVersionedFirstPage)
+TEST_P(SQObjectlistHarnessNonversioned, StdNonVersionedFirstPage)
 {
-  size_t versions = std::get<1>(GetParam());
-  if (versions != 1) {
-    GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
-  }
-
   size_t count = std::get<0>(GetParam());
   sim_.fill_bucket_nonversioned(count);
 
@@ -445,12 +468,8 @@ TEST_P(SQObjectlistHarness, StdNonVersionedFirstPage)
 
 // Check the last page of paginated output. It's easy to predict what the
 // continuation token will be for nonversioned buckets.
-TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
+TEST_P(SQObjectlistHarnessNonversioned, StdNonVersionedLastPage)
 {
-  size_t versions = std::get<1>(GetParam());
-  if (versions != 1) {
-    GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
-  }
   size_t count = std::get<0>(GetParam());
   sim_.fill_bucket_nonversioned(count);
 
@@ -496,7 +515,7 @@ TEST_P(SQObjectlistHarness, StdNonVersionedLastPage)
   }
 }
 
-TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersions)
+TEST_F(SQObjectlistHarnessVersioned, StdVersionedOneItemFiveVersions)
 {
   // One item with five versions, only the last item will be current.
   sim_.fill_bucket_versioned(1, 5);
@@ -510,7 +529,7 @@ TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersions)
   ASSERT_EQ(op->items().size(), 1U);
 }
 
-TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersionsWithOneDeleted)
+TEST_F(SQObjectlistHarnessVersioned, StdVersionedOneItemFiveVersionsWithOneDeleted)
 {
   // One item with five versions, only the last item will be current.
   sim_.fill_bucket_versioned(1, 5, { 0 });
@@ -525,7 +544,7 @@ TEST_F(SQObjectlistHarness, StdVersionedOneItemFiveVersionsWithOneDeleted)
 }
 
 // Check the first page of potentially paginated output.
-TEST_P(SQObjectlistHarness, StdVersionedFirstPage)
+TEST_P(SQObjectlistHarnessVersioned, StdVersionedFirstPage)
 {
   DEFINE_REQ_STATE;
   init_op(&s, kDefaultEntries, std::nullopt);
@@ -552,12 +571,8 @@ TEST_P(SQObjectlistHarness, StdVersionedFirstPage)
 
 // Test that a sequence of calls to objectlist (including in most cases
 // pagination) results in the proper list of keys. First for a nonversioned bucket.
-TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
+TEST_P(SQObjectlistHarnessNonversioned, CompoundQueryNonversioned)
 {
-  size_t versions = std::get<1>(GetParam());
-  if (versions != 1) {
-    GTEST_SKIP_("versions != 1 not relevant for nonversioned test");
-  }
   auto count = std::get<0>(GetParam());
   sim_.fill_bucket_nonversioned(count);
 
@@ -595,7 +610,7 @@ TEST_P(SQObjectlistHarness, CompoundQueryNonversioned)
 
 // Test that a sequence of calls to objectlist (including in most cases
 // pagination) results in the proper list of keys. Versioned bucket this time.
-TEST_P(SQObjectlistHarness, CompoundQueryVersionedNoDeletes)
+TEST_P(SQObjectlistHarnessVersioned, CompoundQueryVersionedNoDeletes)
 {
   auto count = std::get<0>(GetParam());
   auto versions = std::get<1>(GetParam());
@@ -660,7 +675,7 @@ constexpr std::array<size_t, 1229> generate_primes()
 // pagination) results in the proper list of keys. This time a versioned
 // bucket with a number of keys deleted.
 constexpr auto primes_under_10000 = generate_primes();
-TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
+TEST_P(SQObjectlistHarnessVersioned, CompoundQueryVersionedWithDeletes)
 {
   // We'll delete all the prime entries.
   std::vector<size_t> deletions;
@@ -703,11 +718,18 @@ TEST_P(SQObjectlistHarness, CompoundQueryVersionedWithDeletes)
   ASSERT_EQ(bucket_keys, result_keys);
 }
 
-INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParam, SQObjectlistHarness,
+INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParamNonversioned, SQObjectlistHarnessNonversioned,
+    ::testing::Combine(
+        ::testing::Values(1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001)),
+    [](const ::testing::TestParamInfo<SQObjectlistHarnessNonversioned::ParamType>& info) {
+      return fmt::format(FMT_STRING("size_{}"), std::get<0>(info.param));
+    });
+
+INSTANTIATE_TEST_SUITE_P(SQObjectlistSourceSizeParamVersioned, SQObjectlistHarnessVersioned,
     ::testing::Combine(
         ::testing::Values(1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 1001, 1999, 2000, 2001, 9999, 10000, 10001),
         ::testing::Values(1, 2, 5)),
-    [](const ::testing::TestParamInfo<SQObjectlistHarness::ParamType>& info) {
+    [](const ::testing::TestParamInfo<SQObjectlistHarnessVersioned::ParamType>& info) {
       return fmt::format(FMT_STRING("size_{}_versions_{}"), std::get<0>(info.param), std::get<1>(info.param));
     });
 
