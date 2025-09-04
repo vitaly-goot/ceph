@@ -15,6 +15,8 @@
 #include "rgw_zone.h"
 #include "rgw_rados.h"
 
+#include "rgw_log_akamai.h"
+
 #include "services/svc_zone.h"
 
 #include <chrono>
@@ -226,8 +228,11 @@ static void log_usage(req_state *s, const string& op_name)
   string p = payer.to_str();
   rgw_usage_log_entry entry(u, p, bucket_name);
 
-  uint64_t bytes_sent = ACCOUNTING_IO(s)->get_bytes_sent();
-  uint64_t bytes_received = ACCOUNTING_IO(s)->get_bytes_received();
+  auto bypass_flags = rgw::akamai::query_usage_bypass(s);
+  uint64_t bytes_sent
+      = (bypass_flags & rgw::akamai::kUsageBypassEgressFlag) ? 0 : ACCOUNTING_IO(s)->get_bytes_sent();
+  uint64_t bytes_received
+      = (bypass_flags & rgw::akamai::kUsageBypassIngressFlag) ? 0 : ACCOUNTING_IO(s)->get_bytes_received();
 
   rgw_usage_data data(bytes_sent, bytes_received);
 
