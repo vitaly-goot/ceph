@@ -43,11 +43,10 @@ bypass_flag_t query_usage_bypass(const struct req_state* s)
 {
   assert(s != nullptr);
   assert(s->info.env != nullptr);
-  auto hdr = fetch_bypass_header(s);
-  if (!hdr) {
+  if (s->cct->_conf->rgw_akamai_enable_usage_stats_bypass == false) {
     return 0;
   }
-  auto flags = parse_bypass_header(s, *hdr);
+  auto flags = parse_bypass_header(s);
   return flags.value_or(0);
 }
 
@@ -77,7 +76,7 @@ static std::unordered_map<std::string, bypass_option> bypass_options = {
   { "no-ingress", { kUsageBypassIngressFlag } },
 };
 
-std::optional<bypass_flag_t> parse_bypass_header(const struct req_state* s, std::string_view header_value)
+std::optional<bypass_flag_t> parse_bypass_header(const struct req_state* s)
 {
   auto opt_hdr = fetch_bypass_header(s);
   if (!opt_hdr.has_value()) {

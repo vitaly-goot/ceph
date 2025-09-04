@@ -4273,3 +4273,16 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_akamai_enable_usage_stats_bypass
+  type: bool
+  level: advanced
+  desc: Enable Akamai-specific usage stats bypass
+  long_desc: When enabled, RGW will bypass usage stats updates for requests
+    containing the Akamai-specific header "x-rgw-akamai-usage-stats-bypass",
+    with a comma-separated list of values from  'no-egress' and 'no-ingress'.
+    This is to prevent gen2 overbilling customers when copying between backend
+    clusters. It is disabled by default so the header won't affect gen1.
+  default: false
+  services:
+  - rgw
+  with_legacy: true

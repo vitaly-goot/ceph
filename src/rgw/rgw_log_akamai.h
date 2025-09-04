@@ -28,8 +28,10 @@ static constexpr bypass_flag_t kUsageBypassAllFlags = kUsageBypassEgressFlag | k
 // This is the top-level API we're expecting to use in production code.
 
 /**
- * @brief Returns true if the request has an HTTP header indicating that
- * egress usage logging should be bypassed.
+ * @brief If the bypass feature is enabled, return true if the request has an
+ * HTTP header indicating that egress usage logging should be bypassed.
+ *
+ * Calls query_usage_bypass() internally, so follows the same rules.
  *
  * @param s The current request.
  * @return true Egress logging should be bypassed.
@@ -38,8 +40,10 @@ static constexpr bypass_flag_t kUsageBypassAllFlags = kUsageBypassEgressFlag | k
 bool query_usage_bypass_for_egress(const struct req_state* s);
 
 /**
- * @brief Returns true if the request has an HTTP header indicating that
- * ingress usage logging should be bypassed.
+ * @brief If the bypass feature is enabled, return true if the request has an
+ * HTTP header indicating that ingress usage logging should be bypassed.
+ *
+ * Calls query_usage_bypass() internally, so follows the same rules.
  *
  * @param s The current request.
  * @return true Ingress logging should be bypassed.
@@ -48,8 +52,13 @@ bool query_usage_bypass_for_egress(const struct req_state* s);
 bool query_usage_bypass_for_ingress(const struct req_state* s);
 
 /**
- * @brief Returns the usage bypass flags for the request. If no header is
- * present or there was an problem parsing it, return 0.
+ * @brief If the bypass feature is enabled, returns the usage bypass flags for
+ * the request. If no header is present or there was an problem parsing it,
+ * return
+ * 0.
+ *
+ * If the configuration option rgw_akamai_enable_usage_stats_bypass is false
+ * (the default), always return 0.
  *
  * @param s The current request.
  * @return bypass_flag_t The usage bypass flags.
@@ -69,17 +78,13 @@ bypass_flag_t query_usage_bypass(const struct req_state* s);
 std::optional<std::string_view> fetch_bypass_header(const struct req_state* s);
 
 /**
- * @brief Given request \p s and a header value, parse the header value and
- * return the corresponding bypass flags.
- *
- * \p s is just in the API for logging purposes, as it's a DoutPrefixProvider
- * a caller is likely to have. It's not currently used.
+ * @brief Given request \p s, fetch and parse the header value and return the
+ * corresponding bypass flags.
  *
  * @param s The current request.
- * @param header_value The value of the bypass header.
  * @return std::optional<bypass_flag_t> The parsed bypass flags, or
  * std::nullopt if the header value is invalid.
  */
-std::optional<bypass_flag_t> parse_bypass_header([[maybe_unused]] const struct req_state* s, std::string_view header_value);
+std::optional<bypass_flag_t> parse_bypass_header(const struct req_state* s);
 
 } // namespace rgw::akamai
