@@ -8528,6 +8528,13 @@ next:
 	      "%a, %d %b %Y %T %Z", std::gmtime(&t))) {
 	  formatter->dump_string("started", exp_buf);
 	}
+        // heartbeat/mod_time human readable time
+        time_t mt = time_t(entry->get_mod_time());
+        if (std::strftime(exp_buf, sizeof(exp_buf), "%a, %d %b %Y %T %Z", std::gmtime(&mt))) {
+          formatter->dump_string("mod_time", exp_buf);
+        }
+        // instance (may be empty for legacy entries)
+        formatter->dump_string("instance", entry->get_instance());
         string lc_status = LC_STATUS[entry->get_status()];
         formatter->dump_string("status", lc_status);
         formatter->close_section(); // objs

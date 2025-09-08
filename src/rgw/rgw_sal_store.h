@@ -335,10 +335,18 @@ public:
     std::string oid;
     uint64_t start_time{0};
     uint32_t status{0};
+    uint64_t mod_time{0};
+    std::string instance;
 
     StoreLCEntry() = default;
     StoreLCEntry(std::string& _bucket, uint64_t _time, uint32_t _status) : bucket(_bucket), start_time(_time), status(_status) {}
     StoreLCEntry(std::string& _bucket, std::string _oid, uint64_t _time, uint32_t _status) : bucket(_bucket), oid(_oid), start_time(_time), status(_status) {}
+    StoreLCEntry(std::string& _bucket, uint64_t _time, uint32_t _status,
+                 uint64_t _mod_time, std::string _instance)
+      : bucket(_bucket), start_time(_time), status(_status), mod_time(_mod_time), instance(std::move(_instance)) {}
+    StoreLCEntry(std::string& _bucket, std::string _oid, uint64_t _time, uint32_t _status,
+                 uint64_t _mod_time, std::string _instance)
+      : bucket(_bucket), oid(std::move(_oid)), start_time(_time), status(_status), mod_time(_mod_time), instance(std::move(_instance)) {}
     StoreLCEntry(const StoreLCEntry& _e) = default;
 
     StoreLCEntry& operator=(LCEntry& _e) {
@@ -346,7 +354,8 @@ public:
       oid = _e.get_oid();
       start_time = _e.get_start_time();
       status = _e.get_status();
-
+      mod_time = _e.get_mod_time();
+      instance = _e.get_instance();
       return *this;
     }
 
@@ -358,8 +367,12 @@ public:
     virtual void set_start_time(uint64_t _time) override { start_time = _time; }
     virtual uint32_t get_status() override { return status; }
     virtual void set_status(uint32_t _status) override { status = _status; }
+    virtual uint64_t get_mod_time() override { return mod_time; }
+    virtual void set_mod_time(uint64_t t) override { mod_time = t; }
+    virtual std::string& get_instance() override { return instance; }
+    virtual void set_instance(const std::string& s) override { instance = s; }
     virtual void print(std::ostream& out) const override {
-      out << bucket << ":" << oid << ":" << start_time << ":" << status;
+      out << bucket << ":" << oid << ":" << start_time << ":" << status << ":" << mod_time << ":" << instance;
     }
   };
 

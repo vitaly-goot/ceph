@@ -1350,8 +1350,11 @@ public:
     virtual void set_start_time(uint64_t) = 0;
     virtual uint32_t get_status() = 0;
     virtual void set_status(uint32_t) = 0;
-
-    /** Print the entry to @a out */
+  virtual uint64_t get_mod_time() = 0;
+  virtual void set_mod_time(uint64_t) = 0;
+  virtual std::string& get_instance() = 0;
+  virtual void set_instance(const std::string&) = 0;
+  /** Print the entry to @a out */
     virtual void print(std::ostream& out) const = 0;
 
     friend inline std::ostream& operator<<(std::ostream& out, const LCEntry& e) {

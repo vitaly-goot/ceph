@@ -4024,6 +4024,13 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgwlc_auto_session_clear_on_mtime
+  type: bool
+  level: advanced
+  desc: Use lc entry mod_time heartbeat to decide active vs stale session (60 minute threshold)
+  default: false
+  services:
+  - rgw
 - name: rgwlc_skip_bucket_step
   type: bool
   level: advanced
