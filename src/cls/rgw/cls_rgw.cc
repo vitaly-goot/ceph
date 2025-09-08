@@ -3658,7 +3658,7 @@ static int rgw_user_usage_log_add(cls_method_context_t hctx, bufferlist *in, buf
 
 static int usage_handle_range(cls_method_context_t hctx, uint64_t start_epoch, uint64_t end_epoch,
                               const string& start_key, const string& end_key, const string& user_key,
-                              const string& bucket, string& key_iter, uint32_t max_entries, bool *truncated,
+                              const string& bucket, string& key_iter, uint32_t max_entries, bool& truncated,
                               int (*cb)(cls_method_context_t, const string&, rgw_usage_log_entry&, void *),
                               void *param)
 {
@@ -3673,7 +3673,7 @@ static int usage_handle_range(cls_method_context_t hctx, uint64_t start_epoch, u
   if (ret < 0)
     return ret;
 
-  *truncated = truncated_status;
+  truncated = truncated_status;
 
   for (auto log : usage_logs) {
     const string& key = log.first;
@@ -3682,13 +3682,13 @@ static int usage_handle_range(cls_method_context_t hctx, uint64_t start_epoch, u
     key_iter = key;
     if (!by_user && key.compare(end_key) >= 0) {
       CLS_LOG(20, "usage_handle_range reached key=%s, done", key.c_str());
-      *truncated = false;
+      truncated = false;
       break;
     }
 
     if (by_user && key.compare(0, user_key.size(), user_key) != 0) {
       CLS_LOG(20, "usage_handle_range reached key=%s, done", key.c_str());
-      *truncated = false;
+      truncated = false;
       break;
     }
 
@@ -3704,7 +3704,7 @@ static int usage_handle_range(cls_method_context_t hctx, uint64_t start_epoch, u
 
     /* keys are sorted by epoch, so once we're past end we're done */
     if (e.epoch >= end_epoch) {
-      *truncated = false;
+      truncated = false;
       break;
     }
 
@@ -3720,7 +3720,7 @@ static int usage_handle_range(cls_method_context_t hctx, uint64_t start_epoch, u
 
 static int usage_iterate_range_by_user(cls_method_context_t hctx, uint64_t start_epoch, uint64_t end_epoch,
                             const string& user, const string& bucket, string& key_iter, uint32_t max_entries,
-                            bool *truncated, int (*cb)(cls_method_context_t, const string&, rgw_usage_log_entry&, void *),
+                            bool& truncated, int (*cb)(cls_method_context_t, const string&, rgw_usage_log_entry&, void *),
                             void *param)
 {
   ceph_assert(!user.empty());
@@ -3748,7 +3748,7 @@ static int usage_iterate_range_by_user(cls_method_context_t hctx, uint64_t start
       return ret;
     }
 
-    if (*truncated) {
+    if (truncated) {
       key_iter = old_key_iter;
       return 0;
     } else {
@@ -3776,15 +3776,13 @@ static int usage_iterate_range_by_user(cls_method_context_t hctx, uint64_t start
 }
 
 static int usage_iterate_range_by_time(cls_method_context_t hctx, uint64_t start_epoch, uint64_t end_epoch,
-                            const string& bucket, string& key_iter, uint32_t max_entries, bool *truncated,
+                            const string& bucket, string& key_iter, uint32_t max_entries, bool& truncated,
                             int (*cb)(cls_method_context_t, const string&, rgw_usage_log_entry&, void *),
                             void *param)
 {
   CLS_LOG(10, "entered %s", __func__);
 
   string start_key, end_key;
-
-  ceph_assert(truncated != nullptr);
 
   usage_record_prefix_by_time(end_epoch, end_key);
 
@@ -3799,7 +3797,7 @@ static int usage_iterate_range_by_time(cls_method_context_t hctx, uint64_t start
 }
 
 static int usage_iterate_range(cls_method_context_t hctx, uint64_t start_epoch, uint64_t end_epoch, const string& user,
-                            const string& bucket, string& key_iter, uint32_t max_entries, bool *truncated,
+                            const string& bucket, string& key_iter, uint32_t max_entries, bool& truncated,
                             int (*cb)(cls_method_context_t, const string&, rgw_usage_log_entry&, void *),
                             void *param)
 {
@@ -3848,7 +3846,7 @@ int rgw_user_usage_log_read(cls_method_context_t hctx, bufferlist *in, bufferlis
 #define MAX_ENTRIES 1000
   uint32_t max_entries = (op.max_entries ? op.max_entries : MAX_ENTRIES);
 
-  int ret = usage_iterate_range(hctx, op.start_epoch, op.end_epoch, op.owner, op.bucket, iter, max_entries, &ret_info.truncated, usage_log_read_cb, (void *)usage);
+  int ret = usage_iterate_range(hctx, op.start_epoch, op.end_epoch, op.owner, op.bucket, iter, max_entries, ret_info.truncated, usage_log_read_cb, (void *)usage);
   if (ret < 0)
     return ret;
 
@@ -3918,7 +3916,7 @@ int rgw_user_usage_log_trim(cls_method_context_t hctx, bufferlist *in, bufferlis
   usage_trim_param trim_param{false, conf->rgw_usage_log_key_transition};
 
 #define MAX_USAGE_TRIM_ENTRIES 1000
-  ret = usage_iterate_range(hctx, op.start_epoch, op.end_epoch, op.user, op.bucket, iter, MAX_USAGE_TRIM_ENTRIES, &more, usage_log_trim_cb, (void *)&trim_param);
+  ret = usage_iterate_range(hctx, op.start_epoch, op.end_epoch, op.user, op.bucket, iter, MAX_USAGE_TRIM_ENTRIES, more, usage_log_trim_cb, (void *)&trim_param);
 
   if (ret < 0)
     return ret;
