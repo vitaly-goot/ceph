@@ -408,7 +408,7 @@ TEST(mempool, check_shard_select)
 {
   const size_t samples = mempool::get_num_shards() * 30;
   std::unique_ptr<std::atomic_int[]> shards =
-      std::make_unique<std::atomic_int[]>(mempool::get_num_shards())
+      std::make_unique<std::atomic_int[]>(mempool::get_num_shards());
   std::vector<std::thread> workers;
   for (size_t i = 0; i < samples; i++) {
     workers.push_back(

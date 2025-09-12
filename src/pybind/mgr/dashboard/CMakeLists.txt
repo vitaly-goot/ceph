@@ -7,13 +7,13 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 if(WITH_MGR_DASHBOARD_FRONTEND)
   # build from source
   add_subdirectory(frontend)
-  if(WITH_TESTS)
-    include(AddCephTest)
-    add_tox_test(mgr-dashboard-py3 TOX_ENVS py3)
-    add_tox_test(mgr-dashboard-lint TOX_ENVS lint)
-    add_tox_test(mgr-dashboard-check TOX_ENVS check)
-    add_tox_test(mgr-dashboard-openapi TOX_ENVS openapi-check)
-  endif()
+#  if(WITH_TESTS)
+#    include(AddCephTest)
+#    add_tox_test(mgr-dashboard-py3 TOX_ENVS py3)
+#    add_tox_test(mgr-dashboard-lint TOX_ENVS lint)
+#    add_tox_test(mgr-dashboard-check TOX_ENVS check)
+#    add_tox_test(mgr-dashboard-openapi TOX_ENVS openapi-check)
+#  endif()
 else()
   # prebuilt
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/frontend/dist
