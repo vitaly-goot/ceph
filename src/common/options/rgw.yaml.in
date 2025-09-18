@@ -4273,3 +4273,15 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_storequery_objectlist_sort
+  type: bool
+  level: advanced
+  desc: Sort object list in storequery
+  long_desc: If true, the object list in storequery will be sorted by object
+    key name. A sorted query has quite different characteristics on the
+    backend, and the proper mode to use should be determined by testing at
+    scale and not by guesswork.
+  default: false
+  services:
+  - rgw
+  with_legacy: true

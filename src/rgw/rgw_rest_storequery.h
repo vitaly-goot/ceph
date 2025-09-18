@@ -3,7 +3,6 @@
 #pragma once
 
 #include <fmt/printf.h>
-#include <memory>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -610,8 +609,11 @@ protected:
     }
   }; // struct RGWStoreQueryOp_ObjectList::Stats
 
+public:
   /**
    * @brief A single item in the list of objects returned by the query.
+   *
+   * Public mostly so unit tests can see what is being retrieved.
    */
   class Item {
   private:
@@ -637,15 +639,28 @@ protected:
     void dump(Formatter* f) const;
   }; // RGWStoreQueryListItem
 
-private:
+public:
+  // This is the signature of rgw::sal::Bucket::list(), which we'll override
+  // for testing.
+  using list_func = std::function<int(const DoutPrefixProvider*, rgw::sal::Bucket::ListParams&, int, rgw::sal::Bucket::ListResults&, optional_yield)>;
   using item_type = Item;
 
+private:
   uint64_t max_entries_;
   std::optional<std::string> marker_;
   std::optional<std::string> return_marker_;
-  std::vector<item_type> items_;
 
   Stats stats_;
+
+protected:
+  // Fields we want the unit test subclass to be able to
+  // access.
+  std::vector<item_type> items_;
+  bool seen_eof_ = false; /// True if the current query was not truncated, i.e. there are no more object keys.
+
+  // Optional override of the bucket list SAL function. Intended for unit
+  // tests.
+  std::optional<list_func> list_function_;
 
 public:
   RGWStoreQueryOp_ObjectList(uint64_t max_entries, std::optional<std::string> marker)
@@ -735,7 +750,96 @@ public:
   /// with return_marker() which is the optional marker for the next query.
   std::optional<std::string> marker() const { return marker_; }
 
+  /**
+   * @brief Create a continuation token, a JSON object used to implement
+   * pagination.
+   *
+   * The continuation token is a JSON object that includes the necessary
+   * information to resume a list query from a specific point. It's included
+   * as the NextToken field in the objectlist response, and its presence
+   * indicates that there are more results available.
+   *
+   * We're not base64-encoding the key here. This may seem inconsistent, but
+   * testing shows that we don't need to - the token as a whole is
+   * base64-encoded when embedded in the HTTP response, and we can show that
+   * the pair of create_continuation_token() / read_continuation_token() are
+   * able to successfully read object keys even if they have 'problem'
+   * characters in them. (Unit test
+   * SQObjectlistContinuationTokenTests.CreateKeyContainsProblemCharacters at
+   * the time of writing.)
+   *
+   * In retrospect, given the test above's seeming robustness it might not
+   * have been necessary to encode for the main output either. It's done now.
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param key The rgw_obj_key to include in the token.
+   * @return std::string The created continuation token.
+   */
+  static std::string create_continuation_token(const DoutPrefixProvider* dpp, rgw_obj_key& key);
+
+  /**
+   * @brief Read a JSON continuation token, returning an optional key used to
+   * start a list query.
+   *
+   * Without a continuation token, an objectlist query starts from the
+   * beginning. The contents of the token are used to 'prime' the SAL request
+   * so it restarts at the exact point a previous query left off. It has
+   * enough information to work consistently with versioned buckets as well as
+   * nonversioned; the object name alone is not enough in a versioned bucket.
+   *
+   * See the note on the lack of base64 encoding in the documentation for
+   * RGWStoreQueryOp_ObjectList::create_continuation_token().
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param token The JSON continuation token returned from a previous
+   * objectlist command.
+   * @return std::optional<rgw_obj_key> The optional rgw_obj_key.
+   */
+  static std::optional<rgw_obj_key> read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
+
 }; // RGWStoreQueryOp_ObjectList
+
+/**
+ * @brief Special unit test version of RGWStoreQueryOp_Objectlist, that
+ * exposes methods to allow a test harness to operate.
+ *
+ * The main purpose of this class is to provide public accessors to protected
+ * fields of parent classes. Mostly the parent in question is
+ * RGWStoreQueryOp_Objectlist, but there's also a means to set the req_state
+ * pointer `s` for harness purposes.
+ *
+ * Note that all the actual code being tested is in the superclass. All we're
+ * doing is providing public access, rather then messing around with
+ * FRIEND_TEST().
+ */
+class RGWStoreQueryOp_ObjectList_Unittest : public RGWStoreQueryOp_ObjectList {
+
+public:
+  RGWStoreQueryOp_ObjectList_Unittest(uint64_t max_entries, std::optional<std::string> marker)
+      : RGWStoreQueryOp_ObjectList(max_entries, marker)
+  {
+  }
+
+  /// Set the req_state. This is a protected member of RGWOp.
+  void set_req_state(req_state* new_s)
+  {
+    s = new_s;
+  }
+
+  /// Override of the bucket list SAL function.
+  void set_list_function(list_func f)
+  {
+    list_function_ = f;
+  }
+  /// Clear the bucket list function override.
+  void clear_list_function() { list_function_.reset(); }
+
+  /// Return a reference to the list of items.
+  const std::vector<item_type>& items() const { return items_; }
+
+  /// Return true if the query returned EOF (i.e. 'is_truncated==false).
+  bool seen_eof() const { return seen_eof_; }
+}; // RGWStoreQueryOp_ObjectList_Unittest
 
 /**
  * @brief StoreQuery MPUploadList command implementation.
@@ -792,16 +896,40 @@ protected:
     const std::string& key() const noexcept { return key_; }
     const std::string& upload_id() const noexcept { return upload_id_; }
 
+    /// Return a marker in the same form as the Rados SAL returns, i.e.
+    /// '<key>.<upload_id>.meta'.
+    std::string make_marker() const { return fmt::format(FMT_STRING("{}.{}.meta"), key_, upload_id_); }
+
     void dump(Formatter* f) const;
   }; // Item
 
-private:
+public:
+  // This is the signature of rgw::sal::Bucket::list_multiparts(), which we'll override
+  // for testing.
+  using list_func = std::function<int(const DoutPrefixProvider*,
+      const std::string&,
+      std::string&,
+      const std::string&,
+      const int&,
+      std::vector<std::unique_ptr<rgw::sal::MultipartUpload>>&,
+      std::map<std::string, bool>*,
+      bool*)>;
   using item_type = Item;
 
+private:
   uint64_t max_entries_;
   std::optional<std::string> marker_;
   std::optional<std::string> return_marker_;
+
+protected:
+  // Fields we want the unit test subclass to be able to
+  // access.
   std::vector<item_type> items_;
+  bool seen_eof_ = false; /// True if the current query was not truncated, i.e. there are no more object keys.
+
+  // Optional override of the bucket list SAL function. Intended for unit
+  // tests.
+  std::optional<list_func> list_multiparts_function_;
 
 public:
   RGWStoreQueryOp_MPUploadList(uint64_t max_entries, std::optional<std::string> marker)
@@ -881,6 +1009,83 @@ public:
   /// std::nullopt if none is set.
   std::optional<std::string> return_marker() const { return return_marker_; }
 
+  /**
+   * @brief Create a continuation token object
+   *
+   * We're storing the contents of the multipart upload object just for
+   * information purposes, it might be useful for the R-S devs to have this
+   * broken out already. The think we really need is the marker returned by
+   * list_mulitparts() which is a single string.
+   *
+   * See the note on the lack of base64 encoding in the documentation for
+   * RGWStoreQueryOp_ObjectList::create_continuation_token().
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param marker The continuation token marker returned by list_multiparts().
+   * @param upload Pointer to the multipart upload object.
+   * @return std::string The JSON object representating the continuation
+   * token. Will need to be base64 encoded before transmission.
+   */
+  static std::string create_continuation_token(const DoutPrefixProvider* dpp, const std::string& marker, std::unique_ptr<rgw::sal::MultipartUpload> const& upload);
+
+  /**
+   * @brief Read a continuation token JSON object
+   *
+   * We totally ignore the non-marker parts of the token JSON here. We just
+   * want the marker.
+   *
+   * See the note on the lack of base64 encoding in the documentation for
+   * RGWStoreQueryOp_ObjectList::create_continuation_token().
+   *
+   * @param dpp The DoutPrefixProvider instance.
+   * @param token The continuation token string, *after* base64 decoding.
+   * @return std::optional<std::string> If a value is present, it is the
+   * marker to pass to list_multiparts(). If std::nullopt, decoding failed.
+   */
+  static std::optional<std::string> read_continuation_token(const DoutPrefixProvider* dpp, const std::string& token);
+
 }; // RGWStoreQueryOp_MPUploadList
+
+/**
+ * @brief Special unit test version of RGWStoreQueryOp_MPUploadList, that
+ * exposes methods to allow a test harness to operate.
+ *
+ * The main purpose of this class is to provide public accessors to protected
+ * fields of parent classes. Mostly the parent in question is
+ * RGWStoreQueryOp_MPUploadList, but there's also a means to set the req_state
+ * pointer `s` for harness purposes.
+ *
+ * Note that all the actual code being tested is in the superclass. All we're
+ * doing is providing public access, rather then messing around with
+ * FRIEND_TEST().
+ */
+class RGWStoreQueryOp_MPUploadList_Unittest : public RGWStoreQueryOp_MPUploadList {
+
+public:
+  RGWStoreQueryOp_MPUploadList_Unittest(uint64_t max_entries, std::optional<std::string> marker)
+      : RGWStoreQueryOp_MPUploadList(max_entries, marker)
+  {
+  }
+
+  /// Set the req_state. This is a protected member of RGWOp.
+  void set_req_state(req_state* new_s)
+  {
+    s = new_s;
+  }
+
+  /// Override of the bucket list SAL function.
+  void set_list_multiparts_function(list_func f)
+  {
+    list_multiparts_function_ = f;
+  }
+  /// Clear the bucket list function override.
+  void clear_list_multiparts_function() { list_multiparts_function_.reset(); }
+
+  /// Return a reference to the list of items.
+  const std::vector<item_type>& items() const { return items_; }
+
+  /// Return true if the query returned EOF (i.e. 'is_truncated==false).
+  bool seen_eof() const { return seen_eof_; }
+}; // RGWStoreQueryOp_ObjectList_Unittest
 
 } // namespace rgw
