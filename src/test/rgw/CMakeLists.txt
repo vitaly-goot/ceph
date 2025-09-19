@@ -334,3 +334,12 @@ target_link_libraries(unittest_rgw_ubns
   ${UNITTEST_LIBS}
   ${rgw_libs}
 )
+
+# unittest_rgw_log_akamai
+add_executable(unittest_rgw_log_akamai test_rgw_log_akamai.cc)
+add_ceph_unittest(unittest_rgw_log_akamai)
+target_include_directories(unittest_rgw_log_akamai
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  # SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/store/rados"
+)
+target_link_libraries(unittest_rgw_log_akamai ${rgw_libs})
