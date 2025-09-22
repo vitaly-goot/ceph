@@ -4288,6 +4288,7 @@ options:
   - rgw
   see_also:
   - rgw_enable_usage_log
+  with_legacy: true
 - name: rgw_storequery_objectlist_sort
   type: bool
   level: advanced
