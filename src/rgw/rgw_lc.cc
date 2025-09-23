@@ -1705,6 +1705,8 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
   return 0;
 
 }
+static inline void get_lc_oid(CephContext *cct,
+			      const std::string& shard_id, string *oid);
 
 int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
 			     time_t stop_at, bool once)
@@ -1843,12 +1845,13 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     LCOpRule orule(oenv);
     orule.build(); // why can't ctor do it?
     rgw_bucket_dir_entry* o{nullptr};
+    time_t next_mtime_update = time(nullptr) + 60; // heartbeat every minute
     for (auto offset = 0; ol.get_obj(this, &o /* , fetch_barrier */); ++offset, ol.next()) {
       orule.update();
       std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
       bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
-      int shard_id = multi_shard_list ? ol.get_shard_id() : -1;
-      worker->workpool->enqueue(WorkItem{t1}, shard_id);
+      int msl_index = multi_shard_list ? ol.get_shard_id() : -1;
+      worker->workpool->enqueue(WorkItem{t1}, msl_index);
       if ((offset % 100) == 0) {
 	if (worker_should_stop(stop_at, once)) {
 	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
@@ -1856,6 +1859,41 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
 			     << dendl;
 	  return 0;
 	}
+      }
+
+      // periodic mod_time heartbeat update
+      auto now_ts = time(nullptr);
+      if (now_ts >= next_mtime_update) {
+        std::string lc_oid;
+        get_lc_oid(cct, shard_id, &lc_oid); // shard_id holds bucket key (tenant:name:marker)
+        std::unique_ptr<rgw::sal::LCSerializer> serializer =
+          sal_lc->get_serializer(lc_index_lock_name, lc_oid, cookie);
+        utime_t dur(cct->_conf->rgw_lc_lock_max_time, 0);
+        int lr = serializer->try_lock(this, dur, null_yield);
+        if (lr >= 0) {
+          std::unique_lock<rgw::sal::LCSerializer> lk(*serializer.get(), std::adopt_lock);
+          std::unique_ptr<rgw::sal::Lifecycle::LCEntry> cur_entry;
+          if (sal_lc->get_entry(lc_oid, shard_id, &cur_entry) >= 0) {
+            cur_entry->set_mod_time(now_ts);
+            cur_entry->set_instance(cct->_conf->name.to_str());
+            ret = sal_lc->set_entry(lc_oid, *cur_entry);
+            next_mtime_update = now_ts + 60;
+            if(ret < 0) {
+              ldpp_dout(this, 0) << __func__ << "(): failed to set entry " << cur_entry << " on "
+                                 << lc_oid << " " << shard_id << " " << cct->_conf->name.to_str() << " " << now_ts << dendl;
+            }
+            else {
+              ldpp_dout(this, 10) << __func__ << "(): updated mod_time for lc entry " << cur_entry << " lc_oid "
+                                  << lc_oid << " shard_id " << shard_id << " cct->_conf->name.to_str() " 
+                                  << cct->_conf->name.to_str() << " now_ts " << now_ts << dendl;
+            }
+          }
+        }
+        if (lr == -EBUSY || lr == -EEXIST) {
+          ldpp_dout(this, 5) << __func__ << "(): failed to acquire lock to update mod_time for lc entry " << lc_oid << ", will retry next time" << dendl;
+        } else if (lr < 0) {
+          ldpp_dout(this, 0) << __func__ << "(): failed to acquire lock to update mod_time for lc entry " << lc_oid << ": " << cpp_strerror(lr) << dendl;
+        }
       }
     }
     worker->workpool->drain();
@@ -2058,16 +2096,26 @@ int RGWLC::process(LCWorker* worker,
   return 0;
 }
 
-bool RGWLC::expired_session(time_t started)
+bool RGWLC::expired_session(time_t started, uint64_t mod_time)
 {
   if (! cct->_conf->rgwlc_auto_session_clear) {
     return false;
   }
 
+  bool use_mtime = cct->_conf.get_val<bool>("rgwlc_auto_session_clear_on_mtime");
+  auto now = time(0);
+  if (use_mtime && mod_time != 0) {
+    // expire if last mod_time heartbeat older than 60 minutes
+    if (mod_time + 60 * 60 < (uint64_t)now) {
+      ldpp_dout(this, 16) << "RGWLC::expired_session(mtime) stale: started=" << started
+               << " mod_time=" << mod_time << " now=" << now << dendl;
+      return true;
+    }
+    // treat as active regardless of start_time interval if heartbeat fresh
+    return false;
+  }
   time_t interval = (cct->_conf->rgw_lc_debug_interval > 0)
     ? cct->_conf->rgw_lc_debug_interval : secs_in_a_day;
-
-  auto now = time(nullptr);
 
   ldpp_dout(this, 16) << "RGWLC::expired_session"
 	   << " started: " << started
@@ -2120,9 +2168,10 @@ int RGWLC::process_bucket(int index, int max_lock_secs, LCWorker* worker,
   ret = sal_lc->get_entry(obj_names[index], bucket_entry_marker, &entry);
   if (ret >= 0) {
     if (entry->get_status() == lc_processing) {
-      if (expired_session(entry->get_start_time())) {
+  if (expired_session(entry->get_start_time(), entry->get_mod_time())) {
 	ldpp_dout(this, 5) << "RGWLC::process_bucket(): STALE lc session found for: " << entry
 			   << " index: " << index << " worker ix: " << worker->ix
+                           << " obj_name[index] " << obj_names[index] << " bucket_entry_marker " << bucket_entry_marker
 			   << " (clearing)"
 			   << dendl;
       } else {
@@ -2130,6 +2179,7 @@ int RGWLC::process_bucket(int index, int max_lock_secs, LCWorker* worker,
 			   << entry
 			   << " index: " << index
 			   << " worker ix: " << worker->ix
+                           << " obj_name[index] " << obj_names[index] << " bucket_entry_marker " << bucket_entry_marker
 			   << dendl;
 	return ret;
       }
@@ -2143,19 +2193,24 @@ int RGWLC::process_bucket(int index, int max_lock_secs, LCWorker* worker,
 
   ldpp_dout(this, 5) << "RGWLC::process_bucket(): START entry 1: " << entry
 		     << " index: " << index << " worker ix: " << worker->ix
+                     << " obj_name[index] " << obj_names[index] << " bucket_entry_marker " << bucket_entry_marker
 		     << dendl;
 
   entry->set_status(lc_processing);
+  entry->set_mod_time(ceph_clock_now());
+  entry->set_instance(cct->_conf->name.to_str());
   ret = sal_lc->set_entry(obj_names[index], *entry);
   if (ret < 0) {
     ldpp_dout(this, 0) << "RGWLC::process_bucket() failed to set obj entry "
 		       << obj_names[index] << entry->get_bucket() << entry->get_status()
+                       << " obj_name[index] " << obj_names[index] << " bucket_entry_marker " << bucket_entry_marker
 		       << dendl;
     return ret;
   }
 
   ldpp_dout(this, 5) << "RGWLC::process_bucket(): START entry 2: " << entry
 		     << " index: " << index << " worker ix: " << worker->ix
+                     << " obj_name[index] " << obj_names[index] << " bucket_entry_marker " << bucket_entry_marker
 		     << dendl;
 
   lock.unlock();
@@ -2347,7 +2402,7 @@ int RGWLC::process(int index, int max_lock_secs, LCWorker* worker,
 
     if (entry && !entry->get_bucket().empty()) {
       if (entry->get_status() == lc_processing) {
-        if (expired_session(entry->get_start_time())) {
+        if (expired_session(entry->get_start_time(), entry->get_mod_time())) {
           ldpp_dout(this, 5)
               << "RGWLC::process(): STALE lc session found for: " << entry
               << " index: " << index << " worker ix: " << worker->ix
@@ -2423,6 +2478,8 @@ int RGWLC::process(int index, int max_lock_secs, LCWorker* worker,
 
     entry->set_status(lc_processing);
     entry->set_start_time(now);
+    entry->set_mod_time(now);
+    entry->set_instance(cct->_conf->name.to_str());
 
     ret = sal_lc->set_entry(lc_shard, *entry);
     if (ret < 0) {

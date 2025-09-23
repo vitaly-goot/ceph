@@ -851,6 +851,8 @@ void cls_rgw_lc_entry::dump(Formatter *f) const
   encode_json("bucket", bucket, f);
   encode_json("start_time", start_time, f);
   encode_json("status", status, f);
+  encode_json("mod_time", mod_time, f);
+  encode_json("instance", instance, f);
 }
 
 void cls_rgw_lc_entry::generate_test_instances(list<cls_rgw_lc_entry*>& o)
@@ -859,6 +861,8 @@ void cls_rgw_lc_entry::generate_test_instances(list<cls_rgw_lc_entry*>& o)
   s->bucket = "bucket";
   s->start_time = 10;
   s->status = 1;
+  s->mod_time = 10;
+  s->instance = "rgw.test.1";
   o.push_back(s);
   o.push_back(new cls_rgw_lc_entry);
 }

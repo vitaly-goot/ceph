@@ -9,6 +9,85 @@
 #include <vector>
 #include <stdexcept>
 
+using ceph::bufferlist;
+
+TEST(TestLCSchema, LCEntryEncodeDecodeWithModTimeAndInstance)
+{
+   cls_rgw_lc_entry in("bucketA", 111, 2, 999, "rgw.instance.a");
+   bufferlist bl;
+   encode(in, bl);
+   auto it = bl.cbegin();
+   cls_rgw_lc_entry out;
+   decode(out, it);
+   ASSERT_EQ(out.bucket, in.bucket);
+   ASSERT_EQ(out.start_time, in.start_time);
+   ASSERT_EQ(out.status, in.status);
+   ASSERT_EQ(out.mod_time, in.mod_time);
+   ASSERT_EQ(out.instance, in.instance);
+}
+
+TEST(TestLCSchema, LCEntryBackwardCompatDefaultsInstance)
+{
+   // Simulate older (v2) buffer without instance by encoding then truncating instance field.
+   cls_rgw_lc_entry v2("bucketB", 222, 1, 12345, "legacy_ignored");
+   bufferlist bl;
+   encode(v2, bl);
+   // Re-decode normally (current code will read instance). For a strict v2 simulation we'd need
+   // a handcrafted buffer without the instance; here we just assert non-empty works first.
+   auto it = bl.cbegin();
+   cls_rgw_lc_entry out_full;
+   decode(out_full, it);
+   ASSERT_EQ(out_full.instance, std::string("legacy_ignored"));
+
+   // Now craft a true v2 style encoding manually (version=2) without instance
+   bufferlist bl_v2;
+   {
+     ENCODE_START(2, 1, bl_v2);
+     encode(v2.bucket, bl_v2);
+     encode(v2.start_time, bl_v2);
+     encode(v2.status, bl_v2);
+     encode(v2.mod_time, bl_v2);
+     ENCODE_FINISH(bl_v2);
+   }
+   auto it2 = bl_v2.cbegin();
+   cls_rgw_lc_entry out_v2;
+   decode(out_v2, it2);
+   ASSERT_EQ(out_v2.bucket, v2.bucket);
+   ASSERT_EQ(out_v2.start_time, v2.start_time);
+   ASSERT_EQ(out_v2.status, v2.status);
+   ASSERT_EQ(out_v2.mod_time, v2.mod_time);
+   ASSERT_TRUE(out_v2.instance.empty()); // instance defaulted
+}
+
+// Helper subclass to expose expired_session for testing without full RGWLC setup
+class TestableRGWLC : public RGWLC {
+public:
+   void init_ctx(CephContext* cct, rgw::sal::Driver* driver=nullptr) { initialize(cct, driver); }
+   bool call_expired(time_t started, uint64_t mod_time) { return expired_session(started, mod_time); }
+};
+
+TEST(TestLCSession, ExpiredAfterSixtyMinutesWithModTime)
+{
+   // setup minimal CephContext
+   auto cct = (new CephContext(CEPH_ENTITY_TYPE_ANY))->get();
+   cct->_conf->set_value("rgwlc_auto_session_clear", "true");
+   cct->_conf->set_value("rgwlc_auto_session_clear_on_mtime", "true");
+
+   TestableRGWLC lc;
+   lc.initialize(cct, nullptr);
+
+   auto now = time(nullptr);
+   // mod_time just under 60 minutes ago -> not expired
+   ASSERT_FALSE(lc.expired_session(now - 4000, now - (60*60 - 10)));
+   // mod_time exactly 60 minutes ago -> expired
+   ASSERT_TRUE(lc.expired_session(now - 4000, now - 60*60));
+   // mod_time far in the past -> expired
+   ASSERT_TRUE(lc.expired_session(now - 4000, now - 2*60*60));
+
+   lc.finalize();
+   cct->put();
+}
+
 static const char* xmldoc_1 =
 R"(<Filter>
    <And>

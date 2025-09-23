@@ -1295,28 +1295,40 @@ struct cls_rgw_lc_entry {
   std::string bucket;
   uint64_t start_time; // if in_progress
   uint32_t status;
+  uint64_t mod_time; // last heartbeat/update time (epoch seconds)
+  std::string instance; // rgw daemon instance name handling this entry
 
   cls_rgw_lc_entry()
-    : start_time(0), status(0) {}
+    : start_time(0), status(0), mod_time(0) {}
 
   cls_rgw_lc_entry(const cls_rgw_lc_entry& rhs) = default;
 
-  cls_rgw_lc_entry(const std::string& b, uint64_t t, uint32_t s)
-    : bucket(b), start_time(t), status(s) {};
+  cls_rgw_lc_entry(const std::string& b, uint64_t t, uint32_t s, uint64_t m = 0,
+                   const std::string& inst = {})
+    : bucket(b), start_time(t), status(s), mod_time(m), instance(inst) {};
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(bucket, bl);
     encode(start_time, bl);
     encode(status, bl);
+    encode(mod_time, bl);
+    encode(instance, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(bucket, bl);
     decode(start_time, bl);
     decode(status, bl);
+    if (struct_v >= 2) {
+      decode(mod_time, bl);
+      decode(instance, bl);
+    } else {
+      mod_time = 0;
+      instance.clear();
+    }
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;

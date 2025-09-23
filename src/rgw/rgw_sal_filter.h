@@ -842,6 +842,10 @@ public:
     virtual void set_start_time(uint64_t t) override { next->set_start_time(t); }
     virtual uint32_t get_status() override { return next->get_status(); }
     virtual void set_status(uint32_t s) override { next->set_status(s); }
+    virtual uint64_t get_mod_time() override { return next->get_mod_time(); }
+    virtual void set_mod_time(uint64_t t) override { next->set_mod_time(t); }
+    virtual std::string& get_instance() override { return next->get_instance(); }
+    virtual void set_instance(const std::string& s) override { next->set_instance(s); }
     virtual void print(std::ostream& out) const override { return next->print(out); }
   };
 
