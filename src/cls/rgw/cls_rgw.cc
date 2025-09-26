@@ -3546,7 +3546,7 @@ static void usage_record_prefix_by_user_old(const string& user, uint64_t epoch, 
 static void usage_record_prefix_by_user(const string& user, uint64_t epoch, string& key)
 {
   usage_record_prefix_by_user_old(user, epoch, key);
-  if (user.at(0) == '0') {
+  if (user.starts_with('0')) {
     // Use ~ prefix for name_by_user records that have keys that could potentially
     // put them among name_by_time records.
     key.insert(0, 1, '~');
@@ -3570,7 +3570,7 @@ static void usage_record_name_by_user_old(const string& user, uint64_t epoch, co
 static void usage_record_name_by_user(const string& user, uint64_t epoch, const string& bucket, string& key)
 {
   usage_record_name_by_user_old(user, epoch, bucket, key);
-  if (user.at(0) == '0') {
+  if (user.starts_with('0')) {
     // Use ~ prefix for name_by_user records that have keys that could potentially
     // put them among name_by_time records.
     key.insert(0, 1, '~');
@@ -3646,7 +3646,7 @@ static int rgw_user_usage_log_add(cls_method_context_t hctx, bufferlist *in, buf
     if (ret < 0)
       return ret;
 
-    if (key_transition && puser->to_str().at(0) == '0') {
+    if (key_transition && puser->to_str().starts_with('0')) {
       string key_by_user_old;
       usage_record_name_by_user_old(puser->to_str(), entry.epoch, entry.bucket, key_by_user_old);
       (void)cls_cxx_map_remove_key(hctx, key_by_user_old);
@@ -3729,8 +3729,8 @@ static int usage_iterate_range_by_user(cls_method_context_t hctx, uint64_t start
   const bool key_transition = conf->rgw_usage_log_key_transition;
 
   if (key_transition &&
-      user.at(0) == '0' &&
-      (key_iter.empty() || key_iter.at(0) == '0')) {
+      user.starts_with('0') &&
+      (key_iter.empty() || key_iter.starts_with('0'))) {
     // During key transition for records that could have keys that fall within name_by_time records,
     // we need to go 2 passes to cover both the old keys and the new keys.
     // Remove this block when key_transition is deprecated.
@@ -3760,7 +3760,7 @@ static int usage_iterate_range_by_user(cls_method_context_t hctx, uint64_t start
 
   if (max_entries > 0) {
     string start_key;
-    string user_key = user.at(0) == '0' ? (std::string("~") + user + "_") : (user + "_");
+    string user_key = user.starts_with('0') ? (std::string("~") + user + "_") : (user + "_");
     // Handle new keys
     if (key_iter.empty()) {
       usage_record_prefix_by_user(user, start_epoch, start_key);
@@ -3882,7 +3882,7 @@ static int usage_log_trim_cb(cls_method_context_t hctx, const string& key, rgw_u
   if (ret < 0)
     return ret;
 
-  if (trim_param->key_transition && o.at(0) == '0') {
+  if (trim_param->key_transition && o.starts_with('0')) {
     string key_by_user_old;
     usage_record_name_by_user_old(o, entry.epoch, entry.bucket, key_by_user_old);
     (void)cls_cxx_map_remove_key(hctx, key_by_user_old);
