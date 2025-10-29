@@ -20,7 +20,6 @@ At the end, the script iterates over the list of incomplete uploads and produces
 You can skip the verification of current and non-current objects by using the --mpu_only command option flag.
 
 Notes:
-- Tags policies are not supported, mainly to improve speed of scanning as we don't use it at Akamai. Contact developers if you would like to add support for it.
 - Ceph-17 does not support the NewerNoncurrentVersions attribute in S3 lifecycle policies. If you attempt to set a rule with this attribute, Ceph-17 will silently exclude it from the policy rules, resulting in a final rule that does not include the NewerNoncurrentVersions attribute.
 - Ceph-17 does not support complex rules with object size filters defined in the And section. For example, attempting to set the following rule will result in the ObjectSizeGreaterThan and ObjectSizeLessThan attributes being dropped:
        'And': {
@@ -45,6 +44,7 @@ from dateutil.tz import tzutc
 from botocore.client import Config
 from collections import Counter
 from unittest.mock import patch, MagicMock
+from botocore.exceptions import ClientError
 
 '''
 Avoid exposing credentials on the command line.
@@ -207,10 +207,8 @@ class LifecycleRule:
     def _parse_and_filter(self, and_filter: json):
         self.prefix = and_filter.get('Prefix')
 
-        for tag in and_filter.get('Tags', []):
+        for tag in and_filter.get('Tag', []):
             self.tags.append((tag['Key'], tag['Value']))
-            if not self.ctx.testmode: 
-                raise ValueError("Tags policies are not supported, mainly to improve speed of scanning as we don't use it at Akamai. Contact developers if you would like to add support for it.")
 
         self.object_size_greater_than = and_filter.get('ObjectSizeGreaterThan')
         self.object_size_less_than = and_filter.get('ObjectSizeLessThan')
@@ -218,6 +216,8 @@ class LifecycleRule:
     def _parse_simple_filter(self, filter_element: json):
         prefix = filter_element.get('Prefix', None)
         tag = filter_element.get('Tag', None)
+        if tag is not None:
+            self.tags.append((tag['Key'], tag['Value']))
         object_size_greater_than = filter_element.get('ObjectSizeGreaterThan', None)
         object_size_less_than = filter_element.get('ObjectSizeLessThan', None)
 
@@ -232,18 +232,19 @@ class LifecycleRule:
         if active_elements > 1:
             raise ValueError("Filter cannot contain more than one of Prefix, Tag, ObjectSizeGreaterThan, or ObjectSizeLessThan elements without AND section.")
 
-        if tag is not None and not self.ctx.testmode: 
-            raise ValueError("Tags policies are not supported, mainly to improve speed of scanning as we don't use it at Akamai. Contact developers if you would like to add support for it.")
-         
         self.prefix = prefix
         self.object_size_greater_than = object_size_greater_than
         self.object_size_less_than = object_size_less_than
 
-    def expire_current(self, obj: json) -> bool:
+    def expire_current(self, obj: json, tags=None) -> bool:
         if self.status != "Enabled":
             return False
         if self.expiration_date is None: 
             return False
+        if self.tags:    
+            # all rule tags must match for expiration
+            for k, v in self.tags:
+                if tags.get(k) != v: return False
         if self.prefix and not obj['Key'].startswith(self.prefix):
             return False
         if self.object_size_less_than and obj['Size'] >= self.object_size_less_than:
@@ -268,6 +269,11 @@ class LifecycleRule:
         for version in versions:
             rev += 1
             if version['IsLatest']: continue
+            if self.tags:    
+                # Tag filtering: all tags must match
+                tags = version.get("TagSet", {})
+                match = all(tags.get(k) == v for k, v in self.tags)
+                if not match: continue
             if self.newer_noncurrent_versions and rev > self.newer_noncurrent_versions:
                 self.ctx.noncurrent_counter.count_expired(version['Size'])
                 res = True
@@ -322,6 +328,41 @@ class LifecycleRule:
                 f"Expiration:[{self.expiration_date},{self.noncurrent_date},{self.incomplete_mpu_date}],"
                 f"Noncurrent_Versions:{self.newer_noncurrent_versions}")
 
+def fetch_version_tags(bucket, key, versions):
+    kwargs = {
+        "Bucket": bucket, 
+        "Key": key
+    }
+    for version in versions:
+        if version['IsLatest']: continue
+        version_id = version["VersionId"]
+        kwargs["VersionId"] = version_id
+        try:
+          tag_resp = s3.meta.client.get_object_tagging(**kwargs)
+          version["TagSet"] = {t['Key']: t['Value'] for t in tag_resp.get('TagSet', [])}
+        except ClientError as e:
+            print(f"Failed to get tags for {bucket} {key} {version_id}: {e}", file=sys.stderr)
+            version["TagSet"] = {}
+        except Exception as e:
+            # Catch-all for unexpected errors (e.g., network, decoding)
+            print(f"Unexpected error fetching tags for {bucket} {key} {version_id}: {e}", file=sys.stderr)
+            version["TagSet"] = {}  
+
+def fetch_tags(bucket, key):
+    kwargs = {
+        "Bucket": bucket, 
+        "Key": key
+    }
+    try:
+        tag_resp = s3.meta.client.get_object_tagging(**kwargs)
+        return {t['Key']: t['Value'] for t in tag_resp.get('TagSet', [])}
+    except ClientError as e:
+        print(f"Failed to get tags for {bucket} {key}: {e}", file=sys.stderr)
+        return {}
+    except Exception as e:
+        print(f"Unexpected error fetching tags for {bucket} {key} {version_id}: {e}", file=sys.stderr)
+        return {}
+
 def lc_obj_processor(ctx: LCContext, current: bool, non_current: bool, rules: json):
     kwargs = {
         "Bucket": cmd_args.bucket,
@@ -337,10 +378,15 @@ def lc_obj_processor(ctx: LCContext, current: bool, non_current: bool, rules: js
             for obj in response['Contents']:
                 #print(obj['LastModified'])
                 ctx.current_counter.count_total(obj['Size'])
+                needs_tags = any(rule.tags for rule in rules)
+                if needs_tags: 
+                    tagset = fetch_tags(kwargs['Bucket'], obj["Key"])
+                else: 
+                    tagset = {}
                 if current: 
                     for rule in rules:
                         #print(rule.__dict__)
-                        if rule.expire_current(obj):
+                        if rule.expire_current(obj, tagset):
                             break
 
                 if non_current:
@@ -350,6 +396,8 @@ def lc_obj_processor(ctx: LCContext, current: bool, non_current: bool, rules: js
                         for version in versions:
                             if not version['IsLatest']:
                                 ctx.noncurrent_counter.count_total(version['Size'])
+                        if needs_tags:
+                            fetch_version_tags(kwargs["Bucket"], obj["Key"], versions)
                         for rule in rules:
                             #print(rule.__dict__)
                             if rule.expire_noncurrent(versions):
