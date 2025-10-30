@@ -6249,23 +6249,29 @@ AWSBrowserUploadAbstractor::get_auth_data(const req_state* const s) const
 AWSEngine::result_t
 AWSEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s, optional_yield y) const
 {
-  /* Small reminder: an ver_abstractor is allowed to throw! */
-  const auto auth_data = ver_abstractor.get_auth_data(s);
+  result_t engine_result = result_t::deny(-EINVAL);
+  AWSEngine::VersionAbstractor::auth_data_t auth_data;
+  try {
+    /* Small reminder: an ver_abstractor is allowed to throw! */
+    auth_data = ver_abstractor.get_auth_data(s);
 
-  if (auth_data.access_key_id.empty() || auth_data.client_signature.empty()) {
-    return result_t::deny(-EINVAL);
-  } else {
-    result_t engine_result = authenticate(
-        dpp, auth_data.access_key_id, auth_data.client_signature,
-        auth_data.session_token, auth_data.string_to_sign,
-        auth_data.signature_factory, auth_data.completer_factory, s, y);
-
-    if (engine_result.get_reason() != 0) {
-      FillErrorInfo(auth_data, engine_result);
+    if (!auth_data.access_key_id.empty() && !auth_data.client_signature.empty()) {
+      engine_result = authenticate(
+          dpp, auth_data.access_key_id, auth_data.client_signature,
+          auth_data.session_token, auth_data.string_to_sign,
+          auth_data.signature_factory, auth_data.completer_factory, s, y);
     }
-
-    return engine_result;
+  } catch (int errcode) {
+    engine_result = result_t::deny(errcode);
+  } catch (const std::exception& ex) {
+    ldpp_dout(dpp, 0) << "exception during authentication: " << ex.what() << dendl;
   }
+
+  if (engine_result.get_reason() != 0) {
+    FillErrorInfo(auth_data, engine_result);
+  }
+
+  return engine_result;
 }
 void AWSEngine::FillErrorInfo(const VersionAbstractor::auth_data_t &auth_data,
                               result_t &engine_result) const
@@ -6276,6 +6282,18 @@ void AWSEngine::FillErrorInfo(const VersionAbstractor::auth_data_t &auth_data,
   */
   switch (engine_result.get_reason()) 
   {
+  case -ERR_AMZ_CONTENT_SHA256_MISMATCH: 
+    engine_result.set_message("The provided 'x-amz-content-sha256' header does not match "
+        "the calculated checksum of the request body.");
+    // AWS adds the expected and calculated checksum headers here, There is thought
+    // that they are sensitive information and should not be sent. They would also be
+    // difficult to get right now as the calculated checksum is in the completer which
+    // is not available here. Until a customer requests it, we will not add these headers.
+    break;
+  case -ERR_REQUEST_TIME_SKEWED:
+    engine_result.set_message("The difference between the request time and the server's "
+        "time is too large.");
+    break;
   case -ERR_SIGNATURE_NO_MATCH: {
     engine_result.set_message("The request signature we calculated does not match the "
         "signature you provided. Check your key and signing method.");
@@ -6304,6 +6322,24 @@ void AWSEngine::FillErrorInfo(const VersionAbstractor::auth_data_t &auth_data,
       engine_result.add_extra_header("CanonicalRequestBytes", hexStream.str());
     }
   } break;
+  case -ERR_INVALID_ACCESS_KEY:
+    engine_result.set_message("The AWS Access Key Id you provided does not exist in our records.");
+    break;
+  case -ERR_NOT_IMPLEMENTED:
+    engine_result.set_message("The requested operation is not implemented.");
+    break;
+  case -ERR_ACCESS_DENIED:
+    engine_result.set_message("Access Denied.");
+    break;  
+  case -ERR_PERMISSION_DENIED:  
+    engine_result.set_message("You do not have sufficient permissions to access the requested resource.");
+    break;
+  case -ERR_INVALID_SIGNATURE:
+    engine_result.set_message("The request signature is malformed or otherwise invalid.");
+    break;  
+  case -EPERM:
+    engine_result.set_message("You do not have permission to access the requested resource.");  
+    break;
   default:
     break;
   }
