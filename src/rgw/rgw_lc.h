@@ -584,7 +584,7 @@ public:
   int process(int index, int max_lock_secs, LCWorker* worker, bool once);
   int process_bucket(int index, int max_lock_secs, LCWorker* worker,
 		     const std::string& bucket_entry_marker, bool once);
-  bool expired_session(time_t started, uint64_t mod_time = 0);
+  bool expired_session(time_t started);
   time_t thread_stop_at();
   int list_lc_progress(std::string& marker, uint32_t max_entries,
 		       std::vector<std::unique_ptr<rgw::sal::Lifecycle::LCEntry>>&,
@@ -599,9 +599,10 @@ public:
   int set_bucket_config(rgw::sal::Bucket* bucket,
                         const rgw::sal::Attrs& bucket_attrs,
                         RGWLifecycleConfiguration *config);
+  // remove a bucket from the lc list, and optionally update the bucket
+  // instance metadata to remove RGW_ATTR_LC
   int remove_bucket_config(rgw::sal::Bucket* bucket,
-                           const rgw::sal::Attrs& bucket_attrs,
-			   bool merge_attrs = true);
+                           bool update_attrs);
 
   CephContext *get_cct() const override { return cct; }
   rgw::sal::Lifecycle* get_lc() const { return sal_lc.get(); }

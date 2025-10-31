@@ -455,8 +455,11 @@ int RadosBucket::remove_bucket(const DoutPrefixProvider* dpp,
   }
 
   // remove lifecycle config, if any (XXX note could be made generic)
-  (void) store->getRados()->get_lc()->remove_bucket_config(
-    this, get_attrs());
+  if (get_attrs().count(RGW_ATTR_LC)) {
+    constexpr bool update_attrs = false; // don't update xattrs, we're deleting
+    (void) store->getRados()->get_lc()->remove_bucket_config(
+      this, update_attrs);
+  }
 
   ret = store->ctl()->bucket->sync_user_stats(dpp, info.owner, info, y, nullptr);
   if (ret < 0) {
@@ -3025,8 +3028,7 @@ int RadosLifecycle::get_entry(const std::string& oid, const std::string& marker,
     return ret;
 
   LCEntry* e;
-  e = new StoreLCEntry(cls_entry.bucket, cls_entry.start_time, cls_entry.status,
-                       cls_entry.mod_time, cls_entry.instance);
+  e = new StoreLCEntry(cls_entry.bucket, cls_entry.start_time, cls_entry.status);
   if (!e)
     return -ENOMEM;
 
@@ -3045,8 +3047,7 @@ int RadosLifecycle::get_next_entry(const std::string& oid, const std::string& ma
     return ret;
 
   LCEntry* e;
-  e = new StoreLCEntry(cls_entry.bucket, cls_entry.start_time, cls_entry.status,
-                       cls_entry.mod_time, cls_entry.instance);
+  e = new StoreLCEntry(cls_entry.bucket, cls_entry.start_time, cls_entry.status);
   if (!e)
     return -ENOMEM;
 
@@ -3061,8 +3062,6 @@ int RadosLifecycle::set_entry(const std::string& oid, LCEntry& entry)
   cls_entry.bucket = entry.get_bucket();
   cls_entry.start_time = entry.get_start_time();
   cls_entry.status = entry.get_status();
-  cls_entry.mod_time = entry.get_mod_time();
-  cls_entry.instance = entry.get_instance();
 
   return cls_rgw_lc_set_entry(*store->getRados()->get_lc_pool_ctx(), oid, cls_entry);
 }
@@ -3080,7 +3079,7 @@ int RadosLifecycle::list_entries(const std::string& oid, const std::string& mark
 
   for (auto& entry : cls_entries) {
     entries.push_back(std::make_unique<StoreLCEntry>(entry.bucket, oid,
-			entry.start_time, entry.status, entry.mod_time, entry.instance));
+				entry.start_time, entry.status));
   }
 
   return ret;
@@ -3093,8 +3092,6 @@ int RadosLifecycle::rm_entry(const std::string& oid, LCEntry& entry)
   cls_entry.bucket = entry.get_bucket();
   cls_entry.start_time = entry.get_start_time();
   cls_entry.status = entry.get_status();
-  cls_entry.mod_time = entry.get_mod_time();
-  cls_entry.instance = entry.get_instance();
 
   return cls_rgw_lc_rm_entry(*store->getRados()->get_lc_pool_ctx(), oid, cls_entry);
 }

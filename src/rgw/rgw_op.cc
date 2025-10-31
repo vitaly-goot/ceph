@@ -1409,7 +1409,7 @@ void RGWDeleteBucketTags::execute(optional_yield y)
     return;
   }
 
-  op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this] {
+  op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
     rgw::sal::Attrs& attrs = s->bucket->get_attrs();
     attrs.erase(RGW_ATTR_TAGS);
     op_ret = s->bucket->put_info(this, false, real_time());
@@ -6638,7 +6638,10 @@ void RGWDeleteLC::execute(optional_yield y)
     return;
   }
 
-  op_ret = driver->get_rgwlc()->remove_bucket_config(s->bucket.get(), s->bucket_attrs);
+  // remove RGW_ATTR_LC and remove the bucket from the 'lc list'
+  constexpr bool update_attrs = true;
+  op_ret = driver->get_rgwlc()->remove_bucket_config(s->bucket.get(),
+                                                     update_attrs);
   if (op_ret < 0) {
     return;
   }
@@ -9908,7 +9911,7 @@ void RGWDeleteBucketEncryption::execute(optional_yield y)
     return;
   }
 
-  op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this] {
+  op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
     rgw::sal::Attrs& attrs = s->bucket->get_attrs();
     attrs.erase(RGW_ATTR_BUCKET_ENCRYPTION_POLICY);
     attrs.erase(RGW_ATTR_BUCKET_ENCRYPTION_KEY_ID);
