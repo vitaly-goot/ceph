@@ -6328,15 +6328,15 @@ void AWSEngine::FillErrorInfo(const VersionAbstractor::auth_data_t &auth_data,
   case -ERR_NOT_IMPLEMENTED:
     engine_result.set_message("The requested operation is not implemented.");
     break;
-  case -ERR_ACCESS_DENIED:
+  case -EACCES:
     engine_result.set_message("Access Denied.");
-    break;  
-  case -ERR_PERMISSION_DENIED:  
-    engine_result.set_message("You do not have sufficient permissions to access the requested resource.");
     break;
-  case -ERR_INVALID_SIGNATURE:
-    engine_result.set_message("The request signature is malformed or otherwise invalid.");
-    break;  
+  case -ERR_INVALID_REQUEST:
+    engine_result.set_message("The request you have made is invalid.");
+    break;
+  case -ERR_METHOD_NOT_ALLOWED:
+    engine_result.set_message("The HTTP method you are using is not allowed.");
+    break;
   case -EPERM:
     engine_result.set_message("You do not have permission to access the requested resource.");  
     break;
