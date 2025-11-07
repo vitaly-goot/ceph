@@ -599,10 +599,13 @@ public:
   int set_bucket_config(rgw::sal::Bucket* bucket,
                         const rgw::sal::Attrs& bucket_attrs,
                         RGWLifecycleConfiguration *config);
-  int remove_bucket_config(rgw::sal::Bucket* bucket,
-                           const rgw::sal::Attrs& bucket_attrs,
-			   bool merge_attrs = true);
-
+  // backport f3cc521 (tracker#71083): stop using merge_and_store_attrs() to
+  // remove lifecycle config; instead optionally update bucket instance attrs
+  // by erasing RGW_ATTR_LC and writing back with put_info().
+  // update_attrs=true means modify bucket attrs to remove RGW_ATTR_LC.
+  // update_attrs=false leaves bucket attrs untouched (caller already updated or will delete bucket).
+  int remove_bucket_config(const DoutPrefixProvider* dpp, optional_yield y,
+                           rgw::sal::Bucket* bucket, bool update_attrs);
   CephContext *get_cct() const override { return cct; }
   rgw::sal::Lifecycle* get_lc() const { return sal_lc.get(); }
   unsigned get_subsys() const;

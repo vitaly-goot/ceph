@@ -2678,7 +2678,8 @@ int RGWMetadataHandlerPut_BucketInstance::put_post(const DoutPrefixProvider *dpp
 
     } else {
       ldpp_dout(dpp, 20) << "remove lc config for " << bci.info.bucket.name << dendl;
-      ret = lc->remove_bucket_config(bucket.get(), bci.attrs, false /* cannot merge attrs */);
+      constexpr bool update_attrs = false; // upstream f3cc521: don't update attrs during bucket instance metadata handler removal path
+      ret = lc->remove_bucket_config(dpp, null_yield, bucket.get(), update_attrs);
       if (ret < 0) {
 	      ldpp_dout(dpp, 0) << __func__ << " failed to remove lc config for "
 			<< bci.info.bucket.name

@@ -6637,8 +6637,10 @@ void RGWDeleteLC::execute(optional_yield y)
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
     return;
   }
-
-  op_ret = driver->get_rgwlc()->remove_bucket_config(s->bucket.get(), s->bucket_attrs);
+  {
+    constexpr bool update_attrs = true; // explicit LC delete: remove RGW_ATTR_LC from bucket instance
+    op_ret = driver->get_rgwlc()->remove_bucket_config(this, y, s->bucket.get(), update_attrs);
+  }
   if (op_ret < 0) {
     return;
   }
