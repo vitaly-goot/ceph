@@ -2772,19 +2772,14 @@ int RGWLC::remove_bucket_config(const DoutPrefixProvider* dpp, optional_yield y,
   rgw_bucket& b = bucket->get_key();
   int ret{0};
 
-  if (update_attrs) {
-    // erase lifecycle config attr if present and write back bucket info
-    auto& attrs = bucket->get_attrs();
-    auto it = attrs.find(RGW_ATTR_LC);
-    if (it != attrs.end()) {
-      attrs.erase(it);
-      // write updated bucket instance metadata (attrs removal)
-      ret = bucket->put_info(dpp, false, ceph::real_time());
-      if (ret < 0) {
-        ldpp_dout(this, 0) << "remove_bucket_config(): failed put_info() for bucket="
-                           << b.name << " ret=" << ret << dendl;
-        return ret;
-      }
+  // erase lifecycle config attr if present and write back bucket info
+  if (update_attrs && attrs.erase(RGW_ATTR_LC)) {
+    // write updated bucket instance metadata (attrs removal)
+    ret = bucket->put_info(dpp, false, ceph::real_time());
+    if (ret < 0) {
+      ldpp_dout(this, 0) << "remove_bucket_config(): failed put_info() for bucket="
+                         << b.name << " ret=" << ret << dendl;
+      return ret;
     }
   }
   // remove entry from lifecycle progress list
