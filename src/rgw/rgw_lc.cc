@@ -2773,6 +2773,7 @@ int RGWLC::remove_bucket_config(const DoutPrefixProvider* dpp, optional_yield y,
   int ret{0};
 
   // erase lifecycle config attr if present and write back bucket info
+  auto& attrs = bucket->get_attrs();
   if (update_attrs && attrs.erase(RGW_ATTR_LC)) {
     // write updated bucket instance metadata (attrs removal)
     ret = bucket->put_info(dpp, false, ceph::real_time());
