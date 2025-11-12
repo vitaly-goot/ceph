@@ -2761,30 +2761,34 @@ int RGWLC::set_bucket_config(rgw::sal::Bucket* bucket,
   return ret;
 }
 
-int RGWLC::remove_bucket_config(rgw::sal::Bucket* bucket,
-                                const rgw::sal::Attrs& bucket_attrs,
-				bool merge_attrs)
+int RGWLC::remove_bucket_config(const DoutPrefixProvider* dpp, optional_yield y,
+                                rgw::sal::Bucket* bucket, bool update_attrs)
 {
-  rgw::sal::Attrs attrs = bucket_attrs;
+  /* Backport of upstream commit f3cc52124c650d32be2adf3cf540167142423c42
+   * tracker: https://tracker.ceph.com/issues/71083
+   * Original change: stop using merge_and_store_attrs() for removal of
+   * lifecycle config; manually erase RGW_ATTR_LC then write bucket info.
+   */
   rgw_bucket& b = bucket->get_key();
   int ret{0};
 
-  if (merge_attrs) {
-    attrs.erase(RGW_ATTR_LC);
-    ret = bucket->merge_and_store_attrs(this, attrs, null_yield);
-
+  // erase lifecycle config attr if present and write back bucket info
+  auto& attrs = bucket->get_attrs();
+  if (update_attrs && attrs.erase(RGW_ATTR_LC)) {
+    // write updated bucket instance metadata (attrs removal)
+    ret = bucket->put_info(dpp, false, ceph::real_time());
     if (ret < 0) {
-      ldpp_dout(this, 0) << "RGWLC::RGWDeleteLC() failed to set attrs on bucket="
-			 << b.name << " returned err=" << ret << dendl;
+      ldpp_dout(this, 0) << "remove_bucket_config(): failed put_info() for bucket="
+                         << b.name << " ret=" << ret << dendl;
       return ret;
     }
   }
-
+  // remove entry from lifecycle progress list
   ret = guard_lc_modify(this, driver, sal_lc.get(), b, cookie,
-			[&](rgw::sal::Lifecycle* sal_lc, const string& oid,
-			    rgw::sal::Lifecycle::LCEntry& entry) {
-    return sal_lc->rm_entry(oid, entry);
-  });
+                        [&](rgw::sal::Lifecycle* sal_lc, const std::string& oid,
+                            rgw::sal::Lifecycle::LCEntry& entry) {
+                          return sal_lc->rm_entry(oid, entry);
+                        });
 
   return ret;
 } /* RGWLC::remove_bucket_config */

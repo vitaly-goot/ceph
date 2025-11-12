@@ -455,8 +455,10 @@ int RadosBucket::remove_bucket(const DoutPrefixProvider* dpp,
   }
 
   // remove lifecycle config, if any (XXX note could be made generic)
-  (void) store->getRados()->get_lc()->remove_bucket_config(
-    this, get_attrs());
+  {
+    constexpr bool update_attrs = false; // bucket removal path: attrs not separately updated here
+    (void) store->getRados()->get_lc()->remove_bucket_config(dpp, y, this, update_attrs);
+  }
 
   ret = store->ctl()->bucket->sync_user_stats(dpp, info.owner, info, y, nullptr);
   if (ret < 0) {
