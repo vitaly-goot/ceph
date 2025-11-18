@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <tuple>
 #include <functional>
+#include <ranges>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string.hpp>
@@ -155,7 +156,7 @@ bool RGWLifecycleConfiguration::_add_rule(const LCRule& rule)
     op.obj_tags = rule.get_filter().get_tags();
   }
   op.rule_flags = rule.get_filter().get_flags();
-  prefix_map.emplace(std::move(prefix), std::move(op));
+  prefix_map[prefix].emplace_back(std::move(op));
   return true;
 }
 
@@ -571,7 +572,7 @@ struct op_env {
   rgw::sal::Bucket* bucket;
   LCObjsLister& ol;
 
-  op_env(lc_op& _op, rgw::sal::Driver* _driver, LCWorker* _worker,
+  op_env(const lc_op& _op, rgw::sal::Driver* _driver, LCWorker* _worker,
 	 rgw::sal::Bucket* _bucket, LCObjsLister& _ol)
     : op(_op), driver(_driver), worker(_worker), bucket(_bucket),
       ol(_ol) {}
@@ -983,7 +984,7 @@ static inline bool worker_should_stop(time_t stop_at, bool once)
 }
 
 int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
-				       const multimap<string, lc_op>& prefix_map,
+				       const map<string, std::vector<lc_op>>& prefix_map,
 				       LCWorker* worker, time_t stop_at, bool once)
 {
   MultipartMetaFilter mp_filter;
@@ -1045,9 +1046,6 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       return 0;
     }
 
-    if (!prefix_iter->second.status || prefix_iter->second.mp_expiration <= 0) {
-      continue;
-    }
     params.prefix = prefix_iter->first;
     do {
       auto offset = 0;
@@ -1061,12 +1059,17 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       }
 
       for (auto obj_iter = results.objs.begin(); obj_iter != results.objs.end(); ++obj_iter, ++offset) {
-	std::tuple<lc_op, rgw_bucket_dir_entry> t1 =
-	  {prefix_iter->second, *obj_iter};
-	worker->workpool->enqueue(WorkItem{t1});
-	if (going_down()) {
-	  return 0;
-	}
+        for (auto op : prefix_iter->second) {
+          if (!op.status || op.mp_expiration <= 0) {
+            continue;
+          }
+          std::tuple<lc_op, rgw_bucket_dir_entry> t1 =
+            {op, *obj_iter};
+          worker->workpool->enqueue(WorkItem{t1});
+          if (going_down()) {
+            return 0;
+          }
+        }
       } /* for objs */
 
       if ((offset % 100) == 0) {
@@ -1794,7 +1797,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
   };
   worker->workpool->setf(pf);
 
-  multimap<string, lc_op>& prefix_map = config.get_prefix_map();
+  map<string, std::vector<lc_op>>& prefix_map = config.get_prefix_map();
   ldpp_dout(this, 10) << __func__ <<  "() prefix_map size="
 		      << prefix_map.size()
 		      << dendl;
@@ -1810,10 +1813,6 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return 0;
     }
 
-    auto& op = prefix_iter->second;
-    if (!is_valid_op(op)) {
-      continue;
-    }
     ldpp_dout(this, 20) << __func__ << "(): prefix=" << prefix_iter->first
 			<< dendl;
     if (prefix_iter != prefix_map.begin() && 
@@ -1827,12 +1826,6 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     LCObjsLister ol(driver, bucket.get());
     ol.set_prefix(prefix_iter->first);
 
-    if (! zone_check(op, zone)) {
-      ldpp_dout(this, 7) << "LC rule not executable in " << zone->get_tier_type()
-			 << " zone, skipping" << dendl;
-      continue;
-    }
-
     ret = ol.init(this);
     if (ret < 0) {
       if (ret == (-ENOENT))
@@ -1841,24 +1834,29 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return ret;
     }
 
-    op_env oenv(op, driver, worker, bucket.get(), ol);
-    LCOpRule orule(oenv);
-    orule.build(); // why can't ctor do it?
+    auto op_list = prefix_iter->second | std::views::filter([zone](lc_op& op) {
+      return is_valid_op(op) && zone_check(op, zone);
+    });
     rgw_bucket_dir_entry* o{nullptr};
     time_t next_mtime_update = time(nullptr) + 60; // heartbeat every minute
     for (auto offset = 0; ol.get_obj(this, &o /* , fetch_barrier */); ++offset, ol.next()) {
-      orule.update();
-      std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
-      bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
-      int msl_index = multi_shard_list ? ol.get_shard_id() : -1;
-      worker->workpool->enqueue(WorkItem{t1}, msl_index);
-      if ((offset % 100) == 0) {
-	if (worker_should_stop(stop_at, once)) {
-	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
-			     << worker->ix
-			     << dendl;
-	  return 0;
-	}
+      for (const auto& op : op_list) {
+        op_env oenv(op, driver, worker, bucket.get(), ol);
+        LCOpRule orule(oenv);
+        orule.build(); // why can't ctor do it?
+        orule.update();
+        std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
+        bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
+        int msl_index = multi_shard_list ? ol.get_shard_id() : -1;
+        worker->workpool->enqueue(WorkItem{t1}, msl_index);
+        if ((offset % 100) == 0) {
+          if (worker_should_stop(stop_at, once)) {
+            ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
+                               << worker->ix
+                               << dendl;
+            return 0;
+          }
+        }
       }
 
       // periodic mod_time heartbeat update
@@ -3131,7 +3129,9 @@ void RGWLifecycleConfiguration::dump(Formatter *f) const
 {
   f->open_object_section("prefix_map");
   for (auto& prefix : prefix_map) {
-    f->dump_object(prefix.first.c_str(), prefix.second);
+    for (auto& op : prefix.second) {
+      f->dump_object(prefix.first.c_str(), op);
+    }
   }
   f->close_section();
 
