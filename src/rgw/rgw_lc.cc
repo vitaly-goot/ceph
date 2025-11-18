@@ -1059,7 +1059,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       }
 
       for (auto obj_iter = results.objs.begin(); obj_iter != results.objs.end(); ++obj_iter, ++offset) {
-        for (auto op : prefix_iter->second) {
+        for (const auto& op : prefix_iter->second) {
           if (!op.status || op.mp_expiration <= 0) {
             continue;
           }
