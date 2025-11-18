@@ -116,6 +116,16 @@ def worker_loop(worker_id: int,
         if not batch:
             return
 
+        # If in peek mode, just drop the batch
+        if args.peek > 0:
+            logging.debug(
+                f"[worker {worker_id}] peek mode; discarding batch of {len(batch)} keys "
+                f"({reason}), no deletes."
+            )
+            batch = []
+            last_flush = time.monotonic()
+            return True
+
         now = time.monotonic()
         with counters["lock"]:
             # compute allowance based on remaining cap
@@ -251,6 +261,8 @@ def parse_args(argv=None):
                    help="Print first N matching keys (global) and exit without deleting")
     p.add_argument("--no-strict-prefix", action="store_false", dest="strict_prefix",
                    help="Do not drop keys that do not start with their prefix client side")
+    p.add_argument("--yes-i-really-mean-it", action="store_true",
+                   help="Required when prefix is empty (''). Prevents accidental full-bucket deletes.")
     p.set_defaults(strict_prefix=True)
     return p.parse_args(argv)
 
@@ -274,6 +286,10 @@ def main(argv=None) -> int:
     )
 
     prefixes: List[str] = args.prefix  # list due to action="append"
+    if any(p == "" for p in prefixes):
+        if not args.yes_i_really_mean_it:
+            print("ERROR: empty prefix requires --yes-i-really-mean-it to proceed.")
+            return 2
 
     q: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue(maxsize=args.queue_size)
     counters = {
