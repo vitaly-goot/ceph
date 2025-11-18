@@ -1813,6 +1813,14 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return 0;
     }
 
+    auto op_list = prefix_iter->second | std::views::filter([zone](lc_op& op) {
+                     return is_valid_op(op) && zone_check(op, zone);
+                   });
+    if (op_list.empty()) {
+      ldpp_dout(this, 20) << __func__ << "(): no applicable rules; skip prefix=" << prefix_iter->first
+			<< dendl;
+      continue;
+    }
     ldpp_dout(this, 20) << __func__ << "(): prefix=" << prefix_iter->first
 			<< dendl;
     if (prefix_iter != prefix_map.begin() && 
@@ -1834,16 +1842,17 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return ret;
     }
 
-    auto op_list = prefix_iter->second | std::views::filter([zone](lc_op& op) {
-      return is_valid_op(op) && zone_check(op, zone);
-    });
+    std::vector<LCOpRule> orule_list;
+    for (const auto& op : op_list) {
+      op_env oenv(op, driver, worker, bucket.get(), ol);
+      LCOpRule orule(oenv);
+      orule.build();
+      orule_list.emplace_back(std::move(orule));
+    }
     rgw_bucket_dir_entry* o{nullptr};
     time_t next_mtime_update = time(nullptr) + 60; // heartbeat every minute
     for (auto offset = 0; ol.get_obj(this, &o /* , fetch_barrier */); ++offset, ol.next()) {
-      for (const auto& op : op_list) {
-        op_env oenv(op, driver, worker, bucket.get(), ol);
-        LCOpRule orule(oenv);
-        orule.build(); // why can't ctor do it?
+      for (auto& orule : orule_list) {
         orule.update();
         std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
         bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
