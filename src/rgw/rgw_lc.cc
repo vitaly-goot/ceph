@@ -1046,6 +1046,14 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       return 0;
     }
 
+    auto op_list = prefix_iter->second | std::views::filter([](const lc_op& op) {
+                     return op.status && op.mp_expiration > 0;
+                   });
+    if (op_list.empty()) {
+      ldpp_dout(this, 20) << __func__ << "(): no applicable rules for multiparts; skip prefix=" << prefix_iter->first
+			<< dendl;
+      continue;
+    }
     params.prefix = prefix_iter->first;
     do {
       auto offset = 0;
@@ -1059,10 +1067,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       }
 
       for (auto obj_iter = results.objs.begin(); obj_iter != results.objs.end(); ++obj_iter, ++offset) {
-        for (const auto& op : prefix_iter->second) {
-          if (!op.status || op.mp_expiration <= 0) {
-            continue;
-          }
+        for (const auto& op : op_list) {
           std::tuple<lc_op, rgw_bucket_dir_entry> t1 =
             {op, *obj_iter};
           worker->workpool->enqueue(WorkItem{t1});
@@ -1813,7 +1818,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return 0;
     }
 
-    auto op_list = prefix_iter->second | std::views::filter([zone](lc_op& op) {
+    auto op_list = prefix_iter->second | std::views::filter([zone](const lc_op& op) {
                      return is_valid_op(op) && zone_check(op, zone);
                    });
     if (op_list.empty()) {
