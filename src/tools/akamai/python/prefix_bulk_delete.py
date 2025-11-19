@@ -23,6 +23,8 @@ def setup_logging(trace: bool, trace_file: Optional[str]):
         datefmt="%H:%M:%S",
         handlers=[handler],
     )
+    for noisy in ("botocore", "boto3", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.INFO) 
 
 def install_faulthandler():
     try:
@@ -34,14 +36,19 @@ def install_faulthandler():
 
 # ---------- Client ----------
 def make_s3_client(access_key=None, secret_key=None, endpoint_url=None,
-                   max_attempts=5, max_pool_connections=256, profile=None):
+                   max_attempts=5, max_pool_connections=256, profile=None,
+                   connect_timeout=60, read_timeout=60):
     access_key = access_key or os.getenv("AWS_ACCESS_KEY_ID")
     secret_key = secret_key or os.getenv("AWS_SECRET_ACCESS_KEY")
     session = boto3.Session(aws_access_key_id=access_key,
                             aws_secret_access_key=secret_key,
                             profile_name=profile)
-    cfg = Config(retries={"mode": "standard", "max_attempts": max_attempts},
-                 max_pool_connections=max_pool_connections)
+    cfg = Config(
+        retries={"mode": "standard", "max_attempts": max_attempts},
+        max_pool_connections=max_pool_connections,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+    )
     return session.client("s3", endpoint_url=endpoint_url, config=cfg)
 
 # ---------- Iterators ----------
@@ -84,22 +91,182 @@ def iter_versions(s3, bucket: str, prefix: str, page_size: int = 1000):
             yield (ent["Key"], ent.get("VersionId"))
 
 # ---------- Deleter ----------
-def delete_batch(s3, bucket: str, items: List[Tuple[str, Optional[str]]]):
+def delete_one_by_one(s3, bucket: str, items: List[Tuple[str, Optional[str]]]):
+    """Fallback: delete items individually when bulk delete fails."""
+    deleted = 0
+    errors = 0
+    for k, vid in items:
+        try:
+            if vid:
+                s3.delete_object(Bucket=bucket, Key=k, VersionId=vid)
+            else:
+                s3.delete_object(Bucket=bucket, Key=k)
+            deleted += 1
+        except Exception as ex:
+            logging.warning("delete_object failed for %s: %s", k, ex)
+            errors += 1
+    return deleted, errors
+
+def delete_batch(s3, bucket: str, items: List[Tuple[str, Optional[str]]], use_individual: bool = False):
     """Delete up to 1000 items and return (deleted_count, error_count)."""
     if not items:
         return 0, 0
+    
+    if use_individual:
+        return delete_one_by_one(s3, bucket, items)
+    
     objs = [{"Key": k, **({"VersionId": vid} if vid else {})} for k, vid in items]
-    resp = s3.delete_objects(
-        Bucket=bucket,
-        Delete={"Objects": objs, "Quiet": False},  # Quiet=False so 'Deleted' is populated
-    )
-    errors = len(resp.get("Errors", []))
-    deleted_list = resp.get("Deleted")
-    if deleted_list is not None:
+    sample_preview = ", ".join(k for k, _ in items[:3])
+    logging.debug("delete_batch request size=%s sample=%s", len(items), sample_preview)
+    
+    t_start = time.monotonic()
+    try:
+        resp = s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": objs, "Quiet": False},  # Quiet=False so 'Deleted' is populated
+        )
+        t_elapsed = time.monotonic() - t_start
+        logging.debug("delete_batch response received in %.3fs", t_elapsed)
+    except Exception as ex:
+        t_elapsed = time.monotonic() - t_start
+        logging.info("delete_batch bulk request failed after %.3fs: %s; falling back to individual deletes", t_elapsed, ex)
+        return delete_one_by_one(s3, bucket, items)
+
+    errors_list = resp.get("Errors") or []
+    deleted_list = resp.get("Deleted") or []
+
+    errors = len(errors_list)
+
+    if deleted_list:
         deleted = len(deleted_list)
     else:
+        # Some S3-compatible endpoints (e.g. older RGW releases) omit the
+        # 'Deleted' field even when the request succeeds. Fall back to the
+        # request size minus the reported errors so counters still advance.
         deleted = max(0, len(items) - errors)
+
+        if deleted and not errors:
+            logging.debug("delete_objects response lacked 'Deleted'; inferred %s successes", deleted)
+
+    if errors_list:
+        logging.warning("delete_objects reported %s errors: %s", errors, errors_list[:3])
+
+    logging.debug(
+        "delete_batch response deleted=%s errors=%s sample=%s",
+        deleted,
+        errors,
+        sample_preview,
+    )
+
     return deleted, errors
+
+
+class CounterState:
+    def __init__(self, producers_active: int):
+        self._lock = threading.Lock()
+        self.producer_done = threading.Event()
+        self.stop_event = threading.Event()
+        self.producers_active = producers_active
+        self.found = 0
+        self.deleted = 0
+        self.errors = 0
+        self.sampled = 0
+        self.list_start: Optional[float] = None
+        self.list_end: Optional[float] = None
+        self.del_start: Optional[float] = None
+        self.del_end: Optional[float] = None
+        # Tracks number of keys reserved for deletion but not yet reflected
+        # in deleted/errors counters (in-flight). Used for strict cap.
+        self.reserved = 0
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "found": self.found,
+                "deleted": self.deleted,
+                "errors": self.errors,
+                "sampled": self.sampled,
+                "list_start": self.list_start,
+                "list_end": self.list_end,
+                "del_start": self.del_start,
+                "del_end": self.del_end,
+                "reserved": self.reserved,
+            }
+
+    def should_stop(self) -> bool:
+        return self.stop_event.is_set()
+
+    def increment_found(self, now: float) -> Tuple[int, int]:
+        with self._lock:
+            if self.list_start is None:
+                self.list_start = now
+            self.found += 1
+            return self.found, self.sampled
+
+    def try_sample(self, limit: int) -> Optional[int]:
+        if limit <= 0:
+            return None
+        with self._lock:
+            if self.sampled >= limit:
+                return None
+            self.sampled += 1
+            return self.sampled
+
+    def deleted_reached(self, cap: Optional[int]) -> bool:
+        if cap is None:
+            return False
+        with self._lock:
+            return self.deleted >= cap
+
+    def reserve_delete_batch(self, batch_len: int, cap: Optional[int], now: float) -> int:
+        if batch_len <= 0:
+            return 0
+        with self._lock:
+            if self.del_start is None:
+                self.del_start = now
+            if cap is None:
+                return batch_len
+            # Strict remaining considers in-flight reservations.
+            remaining = cap - (self.deleted + self.reserved)
+            if remaining <= 0:
+                logging.debug("reserve_delete_batch cap exhausted; refusing batch")
+                self.stop_event.set()
+                return 0
+            allowed = batch_len if batch_len <= remaining else remaining
+            if allowed < batch_len:
+                logging.debug(
+                    "reserve_delete_batch truncating batch batch=%s allowed=%s remaining(before)=%s; strict cap",
+                    batch_len,
+                    allowed,
+                    remaining,
+                )
+            self.reserved += allowed
+            # If we've now fully reserved up to cap, signal stop.
+            if self.deleted + self.reserved >= cap:
+                self.stop_event.set()
+            return allowed
+
+    def record_delete_results(self, deleted: int, errors: int, finished_at: float, cap: Optional[int]):
+        with self._lock:
+            self.deleted += deleted
+            self.errors += errors
+            if deleted or errors:
+                self.del_end = finished_at
+            # Reduce reserved by attempted keys (deleted + errors) to reflect completion.
+            attempted = deleted + errors
+            if attempted > 0:
+                self.reserved = max(0, self.reserved - attempted)
+            if cap is not None and self.deleted >= cap:
+                self.stop_event.set()
+
+    def mark_producer_complete(self, finished_at: float) -> bool:
+        with self._lock:
+            self.producers_active -= 1
+            if self.producers_active == 0:
+                self.list_end = finished_at
+                self.producer_done.set()
+                return True
+            return False
 
 # ---------- Worker ----------
 def worker_loop(worker_id: int,
@@ -127,51 +294,46 @@ def worker_loop(worker_id: int,
             return True
 
         now = time.monotonic()
-        with counters["lock"]:
-            # compute allowance based on remaining cap
-            if args.max_delete is None:
-                remaining = len(batch)
-            else:
-                remaining = args.max_delete - counters["deleted"]
+        allowed = counters.reserve_delete_batch(len(batch), args.max_delete, now)
+        allowed = min(allowed, len(batch))
+        if allowed <= 0:
+            logging.debug(f"[worker {worker_id}] no allowance for flush ({reason}); dropping batch.")
+            batch = []
+            last_flush = time.monotonic()
+            # Don't exit - continue draining queue in case there are STOP sentinels
+            return True
 
-            if remaining <= 0:
-                logging.debug(f"[worker {worker_id}] cap reached before flush ({reason}); exiting.")
-                counters["stop_event"].set()
-                return False  # signal caller to exit
-
-            to_send_count = min(len(batch), remaining)
-            send = batch[:to_send_count]
-
-            # mark deletion start time if this is the very first delete
-            if counters["del_start"] is None:
-                counters["del_start"] = now
-
-        d, e = delete_batch(s3, bucket, send)
-
-        now2 = time.monotonic()
-        with counters["lock"]:
-            counters["deleted"] += d
-            counters["errors"] += e
-            counters["del_end"] = now2  # last observed delete time
-
+        send = batch[:allowed]
+        sample_keys = ", ".join(k for k, _ in send[:3])
         logging.debug(
-            f"[worker {worker_id}] {reason} flush size={len(send)} deleted={d} "
-            f"errors={e} qsize={q.qsize()}"
+            f"[worker {worker_id}] {reason} flush size={len(send)} sample={sample_keys}"
         )
 
-        batch = batch[to_send_count:]
-        last_flush = time.monotonic()
+        d, e = delete_batch(s3, bucket, send, use_individual=args.use_individual_deletes)
 
-        # if we exhausted cap with this flush, tell all workers to stop
-        with counters["lock"]:
-            if args.max_delete is not None and counters["deleted"] >= args.max_delete:
-                logging.debug(f"[worker {worker_id}] cap reached after flush; signaling stop_event.")
-                counters["stop_event"].set()
+        finished = time.monotonic()
+        counters.record_delete_results(d, e, finished, args.max_delete)
+
+        logging.debug(
+            f"[worker {worker_id}] {reason} flush deleted={d} errors={e} qsize={q.qsize()}"
+        )
+
+        discarded = len(batch) - allowed
+        batch = batch[allowed:]
+        if discarded > 0:
+            logging.debug(f"[worker {worker_id}] discarded {discarded} keys due to strict cap enforcement")
+        last_flush = finished
+
+        if counters.should_stop():
+            logging.debug(f"[worker {worker_id}] stop requested post-flush; draining queue then exiting.")
         return True
 
     while True:
-        if counters["stop_event"].is_set():
-            logging.debug(f"[worker {worker_id}] stop_event set; exiting.")
+        # Only check stop_event if queue is empty and producer is done
+        if counters.should_stop() and q.empty() and counters.producer_done.is_set():
+            logging.debug(f"[worker {worker_id}] stop_event set and queue drained; flushing final batch and exiting.")
+            if batch:
+                flush("stop-signal")
             break
 
         try:
@@ -181,7 +343,7 @@ def worker_loop(worker_id: int,
             if batch and (time.monotonic() - last_flush) > args.batch_flush_seconds:
                 if not flush("aged"):
                     break
-            if counters["producer_done"].is_set() and q.empty():
+            if counters.producer_done.is_set() and q.empty():
                 logging.debug(f"[worker {worker_id}] queue drained; exiting.")
                 break
             continue
@@ -189,11 +351,20 @@ def worker_loop(worker_id: int,
         try:
             if item == ("__STOP__", None):
                 q.task_done()
-                logging.debug(f"[worker {worker_id}] STOP; final flush.")
+                logging.debug(f"[worker {worker_id}] STOP received.")
                 if batch:
-                    if not flush("final"):
-                        break
-                break
+                    flush("stop-sentinel")
+                if counters.producer_done.is_set() and q.empty():
+                    logging.debug(f"[worker {worker_id}] producer done and queue empty after STOP; exiting.")
+                    break
+                continue
+
+            # If strict cap reached, drop further normal items immediately
+            if counters.should_stop():
+                q.task_done()
+                logging.debug(f"[worker {worker_id}] dropping key due to strict cap (stop_event set)")
+                # Drain until STOP sentinels arrive
+                continue
 
             # Normal item
             batch.append(item)
@@ -201,8 +372,7 @@ def worker_loop(worker_id: int,
 
             # Full batch flush
             if len(batch) >= args.batch_size:
-                if not flush("batch"):
-                    break
+                flush("batch")
 
         except Exception as ex:
             logging.exception(f"[worker {worker_id}] exception: {ex}")
@@ -248,6 +418,12 @@ def parse_args(argv=None):
     p.add_argument("--secret-key")
     p.add_argument("--max-attempts", type=int, default=5)
     p.add_argument("--max-pool-connections", type=int, default=256)
+    p.add_argument("--connect-timeout", type=int, default=5,
+                   help="S3 client connect timeout in seconds")
+    p.add_argument("--read-timeout", type=int, default=5,
+                   help="S3 client read timeout in seconds")
+    p.add_argument("--use-individual-deletes", action="store_true",
+                   help="Use individual delete_object calls instead of bulk delete_objects")
     # Tracing and visibility
     p.add_argument("--trace", action="store_true",
                    help="Enable verbose DEBUG logs")
@@ -283,6 +459,8 @@ def main(argv=None) -> int:
         max_attempts=args.max_attempts,
         max_pool_connections=args.max_pool_connections,
         profile=args.profile,
+        connect_timeout=args.connect_timeout,
+        read_timeout=args.read_timeout,
     )
 
     prefixes: List[str] = args.prefix  # list due to action="append"
@@ -292,32 +470,18 @@ def main(argv=None) -> int:
             return 2
 
     q: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue(maxsize=args.queue_size)
-    counters = {
-        "found": 0,
-        "deleted": 0,
-        "errors": 0,
-        "sampled": 0,
-        "producer_done": threading.Event(),   # all producers done
-        "stop_event": threading.Event(),
-        "lock": threading.Lock(),
-        "producers_active": len(prefixes),
-        # timing windows
-        "list_start": None,
-        "list_end": None,
-        "del_start": None,
-        "del_end": None,
-    }
+    counters = CounterState(len(prefixes))
 
     # Heartbeat (INFO), only if heartbeat > 0
     def heartbeat():
-        while not counters["producer_done"].is_set() or not q.empty():
+        while not counters.producer_done.is_set() or not q.empty():
             now = time.monotonic()
-            with counters["lock"]:
-                found = counters["found"]
-                deleted = counters["deleted"]
-                errors = counters["errors"]
-                list_start = counters["list_start"]
-                del_start = counters["del_start"]
+            snap = counters.snapshot()
+            found = snap["found"]
+            deleted = snap["deleted"]
+            errors = snap["errors"]
+            list_start = snap["list_start"]
+            del_start = snap["del_start"]
 
             list_elapsed = (now - list_start) if list_start is not None else None
             del_elapsed = (now - del_start) if del_start is not None else None
@@ -333,12 +497,12 @@ def main(argv=None) -> int:
 
         # final heartbeat
         now = time.monotonic()
-        with counters["lock"]:
-            found = counters["found"]
-            deleted = counters["deleted"]
-            errors = counters["errors"]
-            list_start = counters["list_start"]
-            del_start = counters["del_start"]
+        snap = counters.snapshot()
+        found = snap["found"]
+        deleted = snap["deleted"]
+        errors = snap["errors"]
+        list_start = snap["list_start"]
+        del_start = snap["del_start"]
         list_elapsed = (now - list_start) if list_start is not None else None
         del_elapsed = (now - del_start) if del_start is not None else None
         list_rps = fmt_rate(found, list_elapsed)
@@ -367,32 +531,26 @@ def main(argv=None) -> int:
                 if args.strict_prefix and not k.startswith(prefix):
                     continue
 
-                with counters["lock"]:
-                    # If cap is already hit, stop listing
-                    if args.max_delete is not None and counters["deleted"] >= args.max_delete:
-                        logging.debug(f"[producer {prefix}] cap already reached; stopping listing.")
-                        break
+                if counters.should_stop():
+                    logging.debug(f"[producer {prefix}] stop requested; stopping listing.")
+                    break
 
-                    counters["found"] += 1
-                    f = counters["found"]
+                if counters.deleted_reached(args.max_delete):
+                    logging.debug(f"[producer {prefix}] cap already reached; stopping listing.")
+                    break
 
-                    # mark listing start time at first key
-                    if counters["list_start"] is None:
-                        counters["list_start"] = time.monotonic()
-
-                    sampled = counters["sampled"]
+                now = time.monotonic()
+                f, sampled_before = counters.increment_found(now)
 
                 # Peek is global by found count
                 if args.peek and f <= args.peek:
                     print(f"[peek] {f}: {k}")
 
                 # Sample is also global
-                if args.sample and sampled < args.sample:
-                    with counters["lock"]:
-                        if counters["sampled"] < args.sample:
-                            counters["sampled"] += 1
-                            sidx = counters["sampled"]
-                            logging.info(f"[sample] {sidx}: {k}")
+                if args.sample and sampled_before < args.sample:
+                    sidx = counters.try_sample(args.sample)
+                    if sidx is not None:
+                        logging.info(f"[sample] {sidx}: {k}")
 
                 if args.peek and f >= args.peek:
                     logging.debug(f"[producer {prefix}] peek limit reached; stopping listing.")
@@ -400,37 +558,30 @@ def main(argv=None) -> int:
 
                 # Normal enqueue
                 while True:
+                    if counters.should_stop():
+                        logging.debug(f"[producer {prefix}] stop requested before enqueue; exiting.")
+                        return time.monotonic() - start
                     try:
                         q.put((k, v), timeout=0.5)
                         break
                     except queue.Full:
-                        # Backpressure; bail if cap already hit
-                        if args.max_delete is not None:
-                            with counters["lock"]:
-                                if counters["deleted"] >= args.max_delete:
-                                    logging.debug(
-                                        f"[producer {prefix}] cap reached while queue full; "
-                                        "stopping listing."
-                                    )
-                                    return time.monotonic() - start
+                        if counters.should_stop() or counters.deleted_reached(args.max_delete):
+                            logging.debug(
+                                f"[producer {prefix}] stopping due to cap/backpressure.")
+                            return time.monotonic() - start
                         continue
 
         finally:
-            # Mark this producer as done; if it's the last one, set producer_done and enqueue STOPs
-            with counters["lock"]:
-                counters["producers_active"] -= 1
-                remaining = counters["producers_active"]
-                last = remaining == 0
-                if last:
-                    counters["list_end"] = time.monotonic()
+            # Mark this producer as done; enqueue STOP sentinels if it is the last one
+            finished = time.monotonic()
+            last = counters.mark_producer_complete(finished)
 
             if last:
-                counters["producer_done"].set()
                 for _ in range(args.workers):
                     try:
                         q.put(("__STOP__", None), timeout=0.5)
                     except queue.Full:
-                        # If queue full and cap hit, workers will exit via stop_event
+                        # If queue full and cap hit, workers will exit once backpressure clears
                         pass
 
         return time.monotonic() - start
@@ -454,9 +605,10 @@ def main(argv=None) -> int:
         t_list_wall = max(list_times) if list_times else 0.0
 
         if args.peek > 0:
-            counters["stop_event"].set()
+            counters.stop_event.set()
+            snap = counters.snapshot()
             print(
-                f"[peek] listed {counters['found']} keys that match prefixes "
+                f"[peek] listed {snap['found']} keys that match prefixes "
                 f"{prefixes}. Exiting."
             )
             return 0
@@ -469,14 +621,14 @@ def main(argv=None) -> int:
     t_total = time.monotonic() - t0
 
     # Use the precise listing/deletion windows if available
-    with counters["lock"]:
-        list_start = counters["list_start"]
-        list_end = counters["list_end"]
-        del_start = counters["del_start"]
-        del_end = counters["del_end"]
-        found = counters["found"]
-        deleted = counters["deleted"]
-        errors = counters["errors"]
+    snap = counters.snapshot()
+    list_start = snap["list_start"]
+    list_end = snap["list_end"]
+    del_start = snap["del_start"]
+    del_end = snap["del_end"]
+    found = snap["found"]
+    deleted = snap["deleted"]
+    errors = snap["errors"]
 
     list_window = (list_end - list_start) if list_start is not None and list_end is not None else None
     del_window = (del_end - del_start) if del_start is not None and del_end is not None else None
