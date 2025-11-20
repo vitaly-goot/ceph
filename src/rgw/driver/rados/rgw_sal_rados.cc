@@ -574,9 +574,8 @@ int RadosBucket::remove_bucket_bypass_gc(int concurrent_max, bool
 
         // tag for cls_refcount
         const std::string tag = (astate->tail_tag.length() > 0
-                                     ? astate->tail_tag.to_str()
-                                     : astate->obj_tag.to_str());
-
+                               ? astate->tail_tag.to_str()
+                               : astate->obj_tag.to_str());
         for (; miter != manifest.obj_end(dpp) && max_aio--; ++miter) {
           if (!max_aio) {
             ret = drain_aio(handles);

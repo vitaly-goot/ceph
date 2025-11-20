@@ -10251,9 +10251,9 @@ librados::Rados* RGWRados::get_rados_handle()
 }
 
 int RGWRados::delete_tail_obj_aio(const DoutPrefixProvider *dpp,
-                                  const rgw_raw_obj &obj,
-                                  const std::string &tag,
-                                  list<librados::AioCompletion *> &handles)
+                                  const rgw_raw_obj& obj,
+                                  const std::string& tag,
+                                  list<librados::AioCompletion *>& handles)
 {
   rgw_rados_ref ref;
   int ret = get_raw_obj_ref(dpp, obj, &ref);
