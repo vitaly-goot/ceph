@@ -8,6 +8,7 @@ import queue
 import signal
 import logging
 import faulthandler
+import random
 from typing import Optional, Tuple, List
 import boto3
 from botocore.config import Config
@@ -23,6 +24,7 @@ def setup_logging(trace: bool, trace_file: Optional[str]):
         datefmt="%H:%M:%S",
         handlers=[handler],
     )
+    # comment this if you would like to get boto traces 
     for noisy in ("botocore", "boto3", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.INFO) 
 
@@ -37,7 +39,7 @@ def install_faulthandler():
 # ---------- Client ----------
 def make_s3_client(access_key=None, secret_key=None, endpoint_url=None,
                    max_attempts=5, max_pool_connections=256, profile=None,
-                   connect_timeout=60, read_timeout=60):
+                   connect_timeout=5, read_timeout=5):
     access_key = access_key or os.getenv("AWS_ACCESS_KEY_ID")
     secret_key = secret_key or os.getenv("AWS_SECRET_ACCESS_KEY")
     session = boto3.Session(aws_access_key_id=access_key,
@@ -66,8 +68,7 @@ def iter_objects(s3, bucket: str, prefix: str, page_size: int = 1000):
             f"[producer {prefix}] list_objects_v2 page={page_i} "
             f"keys={len(page.get('Contents', []))}"
         )
-        for obj in page.get("Contents", []):
-            yield (obj["Key"], None)
+        yield [(obj["Key"], None) for obj in page.get("Contents", [])]
 
 def iter_versions(s3, bucket: str, prefix: str, page_size: int = 1000):
     pag = s3.get_paginator("list_object_versions")
@@ -85,10 +86,12 @@ def iter_versions(s3, bucket: str, prefix: str, page_size: int = 1000):
             f"[producer {prefix}] list_object_versions page={page_i} "
             f"versions={len(v)} markers={len(m)}"
         )
+        page_entries: List[Tuple[str, Optional[str]]] = []
         for ent in v:
-            yield (ent["Key"], ent.get("VersionId"))
+            page_entries.append((ent["Key"], ent.get("VersionId")))
         for ent in m:
-            yield (ent["Key"], ent.get("VersionId"))
+            page_entries.append((ent["Key"], ent.get("VersionId")))
+        yield page_entries
 
 # ---------- Deleter ----------
 def delete_one_by_one(s3, bucket: str, items: List[Tuple[str, Optional[str]]]):
@@ -339,11 +342,17 @@ def worker_loop(worker_id: int,
         try:
             item = q.get(timeout=0.5)
         except queue.Empty:
-            # Aged flush
-            if batch and (time.monotonic() - last_flush) > args.batch_flush_seconds:
+            if (
+                args.skip_page_percent == 0.0
+                and args.batch_flush_seconds > 0.0
+                and batch
+                and (time.monotonic() - last_flush) > args.batch_flush_seconds
+            ):
                 if not flush("aged"):
                     break
             if counters.producer_done.is_set() and q.empty():
+                if batch:
+                    flush("drain")
                 logging.debug(f"[worker {worker_id}] queue drained; exiting.")
                 break
             continue
@@ -406,8 +415,8 @@ def parse_args(argv=None):
                    help="Concurrent delete workers")
     p.add_argument("--batch-size", type=int, default=1000,
                    help="DeleteObjects batch size")
-    p.add_argument("--batch-flush-seconds", type=float, default=2.0,
-                   help="Flush partial batches after this idle time")
+    p.add_argument("--batch-flush-seconds", type=float, default=0.0,
+                   help="Flush partial batches after this idle time (0 disables)")
     p.add_argument("--queue-size", type=int, default=50000,
                    help="Key queue capacity")
     # Connection
@@ -435,6 +444,8 @@ def parse_args(argv=None):
                    help="During normal run, print first N keys observed at INFO (global)")
     p.add_argument("--peek", type=int, default=0,
                    help="Print first N matching keys (global) and exit without deleting")
+    p.add_argument("--skip-page-percent", type=float, default=0.0,
+                   help="Randomly skip this percentage of keys from each listed page before enqueueing")
     p.add_argument("--no-strict-prefix", action="store_false", dest="strict_prefix",
                    help="Do not drop keys that do not start with their prefix client side")
     p.add_argument("--yes-i-really-mean-it", action="store_true",
@@ -464,6 +475,10 @@ def main(argv=None) -> int:
     )
 
     prefixes: List[str] = args.prefix  # list due to action="append"
+    if args.skip_page_percent < 0.0 or args.skip_page_percent > 100.0:
+        print("ERROR: --skip-page-percent must be between 0 and 100.")
+        return 2
+
     if any(p == "" for p in prefixes):
         if not args.yes_i_really_mean_it:
             print("ERROR: empty prefix requires --yes-i-really-mean-it to proceed.")
@@ -521,55 +536,83 @@ def main(argv=None) -> int:
         start = time.monotonic()
 
         if args.include_versions:
-            it = iter_versions(s3, args.bucket, prefix)
+            page_iter = iter_versions(s3, args.bucket, prefix)
         else:
-            it = iter_objects(s3, args.bucket, prefix)
+            page_iter = iter_objects(s3, args.bucket, prefix)
 
         try:
-            for k, v in it:
-                # Client-side strict prefix safety for this prefix
-                if args.strict_prefix and not k.startswith(prefix):
-                    continue
-
-                if counters.should_stop():
-                    logging.debug(f"[producer {prefix}] stop requested; stopping listing.")
+            stop_listing = False
+            for page_index, page in enumerate(page_iter, 1):
+                if counters.should_stop() or counters.deleted_reached(args.max_delete):
+                    logging.debug(f"[producer {prefix}] stop requested before page {page_index}; exiting.")
                     break
 
-                if counters.deleted_reached(args.max_delete):
-                    logging.debug(f"[producer {prefix}] cap already reached; stopping listing.")
-                    break
-
-                now = time.monotonic()
-                f, sampled_before = counters.increment_found(now)
-
-                # Peek is global by found count
-                if args.peek and f <= args.peek:
-                    print(f"[peek] {f}: {k}")
-
-                # Sample is also global
-                if args.sample and sampled_before < args.sample:
-                    sidx = counters.try_sample(args.sample)
-                    if sidx is not None:
-                        logging.info(f"[sample] {sidx}: {k}")
-
-                if args.peek and f >= args.peek:
-                    logging.debug(f"[producer {prefix}] peek limit reached; stopping listing.")
-                    break
-
-                # Normal enqueue
-                while True:
-                    if counters.should_stop():
-                        logging.debug(f"[producer {prefix}] stop requested before enqueue; exiting.")
-                        return time.monotonic() - start
-                    try:
-                        q.put((k, v), timeout=0.5)
-                        break
-                    except queue.Full:
-                        if counters.should_stop() or counters.deleted_reached(args.max_delete):
-                            logging.debug(
-                                f"[producer {prefix}] stopping due to cap/backpressure.")
-                            return time.monotonic() - start
+                filtered_page: List[Tuple[str, Optional[str]]] = []
+                for k, v in page:
+                    if args.strict_prefix and not k.startswith(prefix):
                         continue
+                    filtered_page.append((k, v))
+
+                if args.skip_page_percent > 0.0 and filtered_page:
+                    total_before = len(filtered_page)
+                    skip_count = int(total_before * args.skip_page_percent / 100)
+                    if skip_count >= total_before:
+                        logging.debug(
+                            f"[producer {prefix}] skip-page-percent removed entire page {page_index} "
+                            f"({total_before} keys)"
+                        )
+                        filtered_page = []
+                    elif skip_count > 0:
+                        skipped_indexes = set(random.sample(range(len(filtered_page)), skip_count))
+                        filtered_page = [item for idx, item in enumerate(filtered_page) if idx not in skipped_indexes]
+                        logging.debug(
+                            f"[producer {prefix}] skip-page-percent removed {skip_count}/{total_before} keys "
+                            f"on page {page_index}"
+                        )
+
+                for k, v in filtered_page:
+                    if counters.should_stop():
+                        logging.debug(f"[producer {prefix}] stop requested; stopping listing.")
+                        stop_listing = True
+                        break
+
+                    if counters.deleted_reached(args.max_delete):
+                        logging.debug(f"[producer {prefix}] cap already reached; stopping listing.")
+                        stop_listing = True
+                        break
+
+                    now = time.monotonic()
+                    f, sampled_before = counters.increment_found(now)
+
+                    if args.peek and f <= args.peek:
+                        print(f"[peek] {f}: {k}")
+
+                    if args.sample and sampled_before < args.sample:
+                        sidx = counters.try_sample(args.sample)
+                        if sidx is not None:
+                            logging.info(f"[sample] {sidx}: {k}")
+
+                    if args.peek and f >= args.peek:
+                        logging.debug(f"[producer {prefix}] peek limit reached; stopping listing.")
+                        stop_listing = True
+                        break
+
+                    while True:
+                        if counters.should_stop():
+                            logging.debug(f"[producer {prefix}] stop requested before enqueue; exiting.")
+                            return time.monotonic() - start
+                        try:
+                            q.put((k, v), timeout=0.5)
+                            break
+                        except queue.Full:
+                            if counters.should_stop() or counters.deleted_reached(args.max_delete):
+                                logging.debug(
+                                    f"[producer {prefix}] stopping due to cap/backpressure.")
+                                return time.monotonic() - start
+                            continue
+
+                if stop_listing:
+                    break
 
         finally:
             # Mark this producer as done; enqueue STOP sentinels if it is the last one
