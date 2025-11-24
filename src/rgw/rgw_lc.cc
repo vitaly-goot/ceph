@@ -156,7 +156,7 @@ bool RGWLifecycleConfiguration::_add_rule(const LCRule& rule)
     op.obj_tags = rule.get_filter().get_tags();
   }
   op.rule_flags = rule.get_filter().get_flags();
-  prefix_map[prefix].emplace_back(std::move(op));
+  prefix_map.emplace(std::move(prefix), std::move(op));
   return true;
 }
 
@@ -980,7 +980,7 @@ static inline bool worker_should_stop(time_t stop_at, bool once)
 }
 
 int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
-				       const map<string, std::vector<lc_op>>& prefix_map,
+				       const map<string, std::vector<lc_op*>>& grouped_prefix_map,
 				       LCWorker* worker, time_t stop_at, bool once)
 {
   MultipartMetaFilter mp_filter;
@@ -1033,7 +1033,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
 
   worker->workpool->setf(pf);
 
-  for (auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
+  for (auto prefix_iter = grouped_prefix_map.begin(); prefix_iter != grouped_prefix_map.end();
        ++prefix_iter) {
     if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
@@ -1042,8 +1042,8 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       return 0;
     }
 
-    auto op_list = prefix_iter->second | std::views::filter([](const lc_op& op) {
-                     return op.status && op.mp_expiration > 0;
+    auto op_list = prefix_iter->second | std::views::filter([](const lc_op* op) {
+                     return op->status && op->mp_expiration > 0;
                    });
     if (op_list.empty()) {
       ldpp_dout(this, 20) << __func__ << "(): no applicable rules for multiparts; skip prefix=" << prefix_iter->first
@@ -1065,7 +1065,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       for (auto obj_iter = results.objs.begin(); obj_iter != results.objs.end(); ++obj_iter, ++offset) {
         for (const auto& op : op_list) {
           std::tuple<lc_op, rgw_bucket_dir_entry> t1 =
-            {op, *obj_iter};
+            {*op, *obj_iter};
           worker->workpool->enqueue(WorkItem{t1});
           if (going_down()) {
             return 0;
@@ -1794,14 +1794,19 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
   };
   worker->workpool->setf(pf);
 
-  map<string, std::vector<lc_op>>& prefix_map = config.get_prefix_map();
+  multimap<string, lc_op>& prefix_map = config.get_prefix_map();
   ldpp_dout(this, 10) << __func__ <<  "() prefix_map size="
 		      << prefix_map.size()
 		      << dendl;
 
+  std::map<std::string, std::vector<lc_op*>> grouped_prefix_map;
+  for (auto& prefix_entry : prefix_map) {
+    grouped_prefix_map[prefix_entry.first].push_back(&prefix_entry.second);
+  }
+
   rgw_obj_key pre_marker;
   rgw_obj_key next_marker;
-  for(auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
+  for(auto prefix_iter = grouped_prefix_map.begin(); prefix_iter != grouped_prefix_map.end();
       ++prefix_iter) {
     if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
@@ -1810,9 +1815,10 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return 0;
     }
 
-    auto op_list = prefix_iter->second | std::views::filter([zone](const lc_op& op) {
-                     return is_valid_op(op) && zone_check(op, zone);
-                   });
+    auto op_list = prefix_iter->second | std::views::filter([zone](const lc_op* op) {
+            return is_valid_op(*op) && zone_check(*op, zone);
+          });
+
     if (op_list.empty()) {
       ldpp_dout(this, 20) << __func__ << "(): no applicable rules; skip prefix=" << prefix_iter->first
 			<< dendl;
@@ -1820,7 +1826,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     }
     ldpp_dout(this, 20) << __func__ << "(): prefix=" << prefix_iter->first
 			<< dendl;
-    if (prefix_iter != prefix_map.begin() && 
+    if (prefix_iter != grouped_prefix_map.begin() && 
         (prefix_iter->first.compare(0, prev(prefix_iter)->first.length(),
 				    prev(prefix_iter)->first) == 0)) {
       next_marker = pre_marker;
@@ -1840,11 +1846,10 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     }
 
     std::vector<LCOpRule> orule_list;
-    for (const auto& op : op_list) {
-      op_env oenv(op, driver, worker, bucket.get(), ol);
-      LCOpRule orule(oenv);
-      orule.build();
-      orule_list.emplace_back(std::move(orule));
+    for (const auto* op : op_list) {
+      op_env oenv(*op, driver, worker, bucket.get(), ol);
+      orule_list.emplace_back(oenv);
+      orule_list.back().build();
     }
     rgw_bucket_dir_entry* o{nullptr};
     time_t next_mtime_update = time(nullptr) + 60; // heartbeat every minute
@@ -1903,7 +1908,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     worker->workpool->drain();
   }
 
-  ret = handle_multipart_expiration(bucket.get(), prefix_map, worker, stop_at, once);
+  ret = handle_multipart_expiration(bucket.get(), grouped_prefix_map, worker, stop_at, once);
   return ret;
 }
 
@@ -3135,9 +3140,7 @@ void RGWLifecycleConfiguration::dump(Formatter *f) const
 {
   f->open_object_section("prefix_map");
   for (auto& prefix : prefix_map) {
-    for (auto& op : prefix.second) {
-      f->dump_object(prefix.first.c_str(), op);
-    }
+    f->dump_object(prefix.first.c_str(), prefix.second);
   }
   f->close_section();
 
