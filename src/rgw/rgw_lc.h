@@ -460,7 +460,7 @@ class RGWLifecycleConfiguration
 {
 protected:
   CephContext *cct;
-  std::map<std::string, std::vector<lc_op>> prefix_map;
+  std::multimap<std::string, lc_op> prefix_map;
   std::multimap<std::string, LCRule> rule_map;
   bool _add_rule(const LCRule& rule);
   bool has_same_action(const lc_op& first, const lc_op& second);
@@ -501,7 +501,7 @@ public:
   bool valid();
 
   std::multimap<std::string, LCRule>& get_rule_map() { return rule_map; }
-  std::map<std::string, std::vector<lc_op>>& get_prefix_map() { return prefix_map; }
+  std::multimap<std::string, lc_op>& get_prefix_map() { return prefix_map; }
 /*
   void create_default(std::string id, std::string name) {
     ACLGrant grant;
@@ -614,7 +614,7 @@ public:
   private:
 
   int handle_multipart_expiration(rgw::sal::Bucket* target,
-				  const std::map<std::string, std::vector<lc_op>>& prefix_map,
+				  const std::map<std::string, std::vector<lc_op*>>& grouped_ops,
 				  LCWorker* worker, time_t stop_at, bool once);
 };
 
