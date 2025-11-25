@@ -614,7 +614,7 @@ public:
   private:
 
   int handle_multipart_expiration(rgw::sal::Bucket* target,
-				  const std::multimap<std::string, lc_op>& prefix_map,
+				  const std::map<std::string, std::vector<lc_op*>>& grouped_ops,
 				  LCWorker* worker, time_t stop_at, bool once);
 };
 

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <tuple>
 #include <functional>
+#include <ranges>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string.hpp>
@@ -571,7 +572,7 @@ struct op_env {
   rgw::sal::Bucket* bucket;
   LCObjsLister& ol;
 
-  op_env(lc_op& _op, rgw::sal::Driver* _driver, LCWorker* _worker,
+  op_env(const lc_op& _op, rgw::sal::Driver* _driver, LCWorker* _worker,
 	 rgw::sal::Bucket* _bucket, LCObjsLister& _ol)
     : op(_op), driver(_driver), worker(_worker), bucket(_bucket),
       ol(_ol) {}
@@ -737,7 +738,7 @@ class LCOpAction {
 public:
   virtual ~LCOpAction() {}
 
-  virtual bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) {
+  virtual bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) const {
     return false;
   }
 
@@ -752,11 +753,11 @@ public:
    *   but should_process() if the action has already been applied. In object removal
    *   it doesn't matter, but in object transition it does.
    */
-  virtual bool should_process() {
+  virtual bool should_process(const lc_op_ctx& oc) const {
     return true;
   }
 
-  virtual int process(lc_op_ctx& oc, optional_yield y) {
+  virtual int process(lc_op_ctx& oc, optional_yield y) const {
     return 0;
   }
 
@@ -766,7 +767,7 @@ public:
 class LCOpFilter {
 public:
 virtual ~LCOpFilter() {}
-  virtual bool check(const DoutPrefixProvider *dpp, lc_op_ctx& oc, optional_yield y) {
+  virtual bool check(const DoutPrefixProvider *dpp, lc_op_ctx& oc, optional_yield y) const {
     return false;
   }
 }; /* LCOpFilter */
@@ -778,18 +779,14 @@ class LCOpRule {
   boost::optional<std::string> next_key_name;
   ceph::real_time effective_mtime;
 
-  std::vector<shared_ptr<LCOpFilter> > filters; // n.b., sharing ovhd
-  std::vector<shared_ptr<LCOpAction> > actions;
+  std::vector<shared_ptr<const LCOpFilter> > filters; // n.b., sharing ovhd
+  std::vector<shared_ptr<const LCOpAction> > actions;
 
 public:
   LCOpRule(op_env& _env) : env(_env) {}
 
   boost::optional<std::string> get_next_key_name() {
     return next_key_name;
-  }
-
-  std::vector<shared_ptr<LCOpAction>>& get_actions() {
-    return actions;
   }
 
   void build();
@@ -983,7 +980,7 @@ static inline bool worker_should_stop(time_t stop_at, bool once)
 }
 
 int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
-				       const multimap<string, lc_op>& prefix_map,
+				       const map<string, std::vector<lc_op*>>& grouped_prefix_map,
 				       LCWorker* worker, time_t stop_at, bool once)
 {
   MultipartMetaFilter mp_filter;
@@ -1036,7 +1033,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
 
   worker->workpool->setf(pf);
 
-  for (auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
+  for (auto prefix_iter = grouped_prefix_map.begin(); prefix_iter != grouped_prefix_map.end();
        ++prefix_iter) {
     if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
@@ -1045,7 +1042,12 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       return 0;
     }
 
-    if (!prefix_iter->second.status || prefix_iter->second.mp_expiration <= 0) {
+    auto op_list = prefix_iter->second | std::views::filter([](const lc_op* op) {
+                     return op->status && op->mp_expiration > 0;
+                   });
+    if (op_list.empty()) {
+      ldpp_dout(this, 20) << __func__ << "(): no applicable rules for multiparts; skip prefix=" << prefix_iter->first
+			<< dendl;
       continue;
     }
     params.prefix = prefix_iter->first;
@@ -1061,12 +1063,14 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
       }
 
       for (auto obj_iter = results.objs.begin(); obj_iter != results.objs.end(); ++obj_iter, ++offset) {
-	std::tuple<lc_op, rgw_bucket_dir_entry> t1 =
-	  {prefix_iter->second, *obj_iter};
-	worker->workpool->enqueue(WorkItem{t1});
-	if (going_down()) {
-	  return 0;
-	}
+        for (const auto& op : op_list) {
+          std::tuple<lc_op, rgw_bucket_dir_entry> t1 =
+            {*op, *obj_iter};
+          worker->workpool->enqueue(WorkItem{t1});
+          if (going_down()) {
+            return 0;
+          }
+        }
       } /* for objs */
 
       if ((offset % 100) == 0) {
@@ -1176,7 +1180,7 @@ static int check_tags(const DoutPrefixProvider *dpp, lc_op_ctx& oc, bool *skip, 
 
 class LCOpFilter_Tags : public LCOpFilter {
 public:
-  bool check(const DoutPrefixProvider *dpp, lc_op_ctx& oc, optional_yield y) override {
+  bool check(const DoutPrefixProvider *dpp, lc_op_ctx& oc, optional_yield y) const override {
     auto& o = oc.o;
 
     if (o.is_delete_marker()) {
@@ -1204,7 +1208,7 @@ class LCOpAction_CurrentExpiration : public LCOpAction {
 public:
   LCOpAction_CurrentExpiration(op_env& env) {}
 
-  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) override {
+  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) const override {
     auto& o = oc.o;
     if (!o.is_current()) {
       ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
@@ -1254,7 +1258,7 @@ public:
     return is_expired;
   }
 
-  int process(lc_op_ctx& oc, optional_yield y) {
+  int process(lc_op_ctx& oc, optional_yield y) const override{
     auto& o = oc.o;
     int r;
 
@@ -1308,7 +1312,7 @@ public:
   LCOpAction_NonCurrentExpiration(op_env& env)
     {}
 
-  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) override {
+  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) const override {
     auto& o = oc.o;
     if (o.is_current()) {
       ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
@@ -1329,7 +1333,7 @@ public:
       pass_object_lock_check(oc.driver, oc.obj.get(), dpp, y);
   }
 
-  int process(lc_op_ctx& oc, optional_yield y) {
+  int process(lc_op_ctx& oc, optional_yield y) const override {
     auto& o = oc.o;
     int r = remove_expired_obj(oc.dpp, oc, true,
 			       rgw::notify::ObjectExpirationNoncurrent, y);
@@ -1359,7 +1363,7 @@ class LCOpAction_DMExpiration : public LCOpAction {
 public:
   LCOpAction_DMExpiration(op_env& env) {}
 
-  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) override {
+  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) const override {
     auto& o = oc.o;
     if (!o.is_delete_marker()) {
       ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
@@ -1379,7 +1383,7 @@ public:
     return true;
   }
 
-  int process(lc_op_ctx& oc, optional_yield y) {
+  int process(lc_op_ctx& oc, optional_yield y) const override {
     auto& o = oc.o;
     int r = remove_expired_obj(oc.dpp, oc, true,
 			       rgw::notify::ObjectExpirationDeleteMarker, y);
@@ -1408,16 +1412,15 @@ public:
 
 class LCOpAction_Transition : public LCOpAction {
   const transition_action& transition;
-  bool need_to_process{false};
 
 protected:
-  virtual bool check_current_state(bool is_current) = 0;
-  virtual ceph::real_time get_effective_mtime(lc_op_ctx& oc) = 0;
+  virtual bool check_current_state(bool is_current) const = 0;
+  virtual ceph::real_time get_effective_mtime(lc_op_ctx& oc) const = 0;
 public:
   LCOpAction_Transition(const transition_action& _transition)
     : transition(_transition) {}
 
-  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) override {
+  bool check(lc_op_ctx& oc, ceph::real_time *exp_time, const DoutPrefixProvider *dpp, optional_yield y) const override {
     auto& o = oc.o;
 
     if (o.is_delete_marker()) {
@@ -1448,18 +1451,15 @@ public:
 		      << is_expired << " "
 		      << oc.wq->thr_name() << dendl;
 
-    need_to_process =
-      (rgw_placement_rule::get_canonical_storage_class(o.meta.storage_class) !=
-       transition.storage_class);
-
     return is_expired;
   }
 
-  bool should_process() override {
-    return need_to_process;
+  bool should_process(const lc_op_ctx& oc) const override {
+    return (rgw_placement_rule::get_canonical_storage_class(oc.o.meta.storage_class) !=
+        transition.storage_class);
   }
 
-  int delete_tier_obj(lc_op_ctx& oc, optional_yield y) {
+  int delete_tier_obj(lc_op_ctx& oc, optional_yield y) const {
     int ret = 0;
 
     /* If bucket is versioned, create delete_marker for current version
@@ -1474,7 +1474,7 @@ public:
     return ret;
   }
 
-  int transition_obj_to_cloud(lc_op_ctx& oc, optional_yield y) {
+  int transition_obj_to_cloud(lc_op_ctx& oc, optional_yield y) const {
     /* If CurrentVersion object, remove it & create delete marker */
     bool delete_object = (!oc.tier->retain_head_object() ||
                      (oc.o.is_current() && oc.bucket->versioned()));
@@ -1497,7 +1497,7 @@ public:
     return 0;
   }
 
-  int process(lc_op_ctx& oc, optional_yield y) {
+  int process(lc_op_ctx& oc, optional_yield y) const override {
     auto& o = oc.o;
     int r;
 
@@ -1564,17 +1564,17 @@ public:
 
 class LCOpAction_CurrentTransition : public LCOpAction_Transition {
 protected:
-  bool check_current_state(bool is_current) override {
+  bool check_current_state(bool is_current) const override {
     return is_current;
   }
 
-  ceph::real_time get_effective_mtime(lc_op_ctx& oc) override {
+  ceph::real_time get_effective_mtime(lc_op_ctx& oc) const override {
     return oc.o.meta.mtime;
   }
 public:
   LCOpAction_CurrentTransition(const transition_action& _transition)
     : LCOpAction_Transition(_transition) {}
-    int process(lc_op_ctx& oc, optional_yield y) {
+    int process(lc_op_ctx& oc, optional_yield y) const override {
       int r = LCOpAction_Transition::process(oc, y);
       if (r == 0) {
         if (perfcounter) {
@@ -1587,11 +1587,11 @@ public:
 
 class LCOpAction_NonCurrentTransition : public LCOpAction_Transition {
 protected:
-  bool check_current_state(bool is_current) override {
+  bool check_current_state(bool is_current) const override {
     return !is_current;
   }
 
-  ceph::real_time get_effective_mtime(lc_op_ctx& oc) override {
+  ceph::real_time get_effective_mtime(lc_op_ctx& oc) const override {
     return oc.effective_mtime;
   }
 public:
@@ -1599,7 +1599,7 @@ public:
 				  const transition_action& _transition)
     : LCOpAction_Transition(_transition)
     {}
-    int process(lc_op_ctx& oc, optional_yield y) {
+    int process(lc_op_ctx& oc, optional_yield y) const override {
       int r = LCOpAction_Transition::process(oc, y);
       if (r == 0) {
         if (perfcounter) {
@@ -1649,7 +1649,7 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
 		      WorkQ* wq, optional_yield y)
 {
   lc_op_ctx ctx(env, o, next_key_name, effective_mtime, dpp, wq);
-  shared_ptr<LCOpAction> *selected = nullptr; // n.b., req'd by sharing
+  shared_ptr<const LCOpAction> *selected = nullptr; // n.b., req'd by sharing
   real_time exp;
 
   for (auto& a : actions) {
@@ -1664,7 +1664,7 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
   }
 
   if (selected &&
-      (*selected)->should_process()) {
+      (*selected)->should_process(ctx)) {
 
     /*
      * Calling filter checks after action checks because
@@ -1799,9 +1799,14 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
 		      << prefix_map.size()
 		      << dendl;
 
+  std::map<std::string, std::vector<lc_op*>> grouped_prefix_map;
+  for (auto& prefix_entry : prefix_map) {
+    grouped_prefix_map[prefix_entry.first].push_back(&prefix_entry.second);
+  }
+
   rgw_obj_key pre_marker;
   rgw_obj_key next_marker;
-  for(auto prefix_iter = prefix_map.begin(); prefix_iter != prefix_map.end();
+  for(auto prefix_iter = grouped_prefix_map.begin(); prefix_iter != grouped_prefix_map.end();
       ++prefix_iter) {
     if (worker_should_stop(stop_at, once)) {
       ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
@@ -1810,13 +1815,18 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return 0;
     }
 
-    auto& op = prefix_iter->second;
-    if (!is_valid_op(op)) {
+    auto op_list = prefix_iter->second | std::views::filter([zone](const lc_op* op) {
+            return is_valid_op(*op) && zone_check(*op, zone);
+          });
+
+    if (op_list.empty()) {
+      ldpp_dout(this, 20) << __func__ << "(): no applicable rules; skip prefix=" << prefix_iter->first
+			<< dendl;
       continue;
     }
     ldpp_dout(this, 20) << __func__ << "(): prefix=" << prefix_iter->first
 			<< dendl;
-    if (prefix_iter != prefix_map.begin() && 
+    if (prefix_iter != grouped_prefix_map.begin() && 
         (prefix_iter->first.compare(0, prev(prefix_iter)->first.length(),
 				    prev(prefix_iter)->first) == 0)) {
       next_marker = pre_marker;
@@ -1827,12 +1837,6 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     LCObjsLister ol(driver, bucket.get());
     ol.set_prefix(prefix_iter->first);
 
-    if (! zone_check(op, zone)) {
-      ldpp_dout(this, 7) << "LC rule not executable in " << zone->get_tier_type()
-			 << " zone, skipping" << dendl;
-      continue;
-    }
-
     ret = ol.init(this);
     if (ret < 0) {
       if (ret == (-ENOENT))
@@ -1841,24 +1845,29 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       return ret;
     }
 
-    op_env oenv(op, driver, worker, bucket.get(), ol);
-    LCOpRule orule(oenv);
-    orule.build(); // why can't ctor do it?
+    std::vector<LCOpRule> orule_list;
+    for (const auto* op : op_list) {
+      op_env oenv(*op, driver, worker, bucket.get(), ol);
+      orule_list.emplace_back(oenv);
+      orule_list.back().build();
+    }
     rgw_bucket_dir_entry* o{nullptr};
     time_t next_mtime_update = time(nullptr) + 60; // heartbeat every minute
     for (auto offset = 0; ol.get_obj(this, &o /* , fetch_barrier */); ++offset, ol.next()) {
-      orule.update();
-      std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
-      bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
-      int msl_index = multi_shard_list ? ol.get_shard_id() : -1;
-      worker->workpool->enqueue(WorkItem{t1}, msl_index);
-      if ((offset % 100) == 0) {
-	if (worker_should_stop(stop_at, once)) {
-	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
-			     << worker->ix
-			     << dendl;
-	  return 0;
-	}
+      for (auto& orule : orule_list) {
+        orule.update();
+        std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
+        bool multi_shard_list = cct->_conf.get_val<bool>("rgw_lc_multi_shard_list");
+        int msl_index = multi_shard_list ? ol.get_shard_id() : -1;
+        worker->workpool->enqueue(WorkItem{t1}, msl_index);
+        if ((offset % 100) == 0) {
+          if (worker_should_stop(stop_at, once)) {
+            ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker "
+                               << worker->ix
+                               << dendl;
+            return 0;
+          }
+        }
       }
 
       // periodic mod_time heartbeat update
@@ -1899,7 +1908,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     worker->workpool->drain();
   }
 
-  ret = handle_multipart_expiration(bucket.get(), prefix_map, worker, stop_at, once);
+  ret = handle_multipart_expiration(bucket.get(), grouped_prefix_map, worker, stop_at, once);
   return ret;
 }
 
