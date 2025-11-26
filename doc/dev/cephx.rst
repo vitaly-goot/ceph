@@ -133,7 +133,7 @@ where::
     ticket_info {
       u32 service_id       # CEPH_ENTITY_TYPE_AUTH
       u8 msg_version (1)
-      {CephXServiceTicket service_ticket}^principal_secret
+      {CephXServiceTicket service_ticket}^principal_secret # principal_secret ONLY for _AUTH
       {CephxTicketBlob ticket_blob}^existing session_key   # if we are renewing a ticket,
       CephxTicketBlob ticket_blob                          # otherwise
     }
@@ -141,7 +141,7 @@ where::
     service_ticket_info {
       u32 service_id       # CEPH_ENTITY_TYPE_{OSD,MDS,MGR}
       u8 msg_version (1)
-      {CephXServiceTicket service_ticket}^principal_secret
+      {CephxServiceTicket service_ticket}^auth_session_key # session_key from _AUTH CephxServiceTicket
       CephxTicketBlob ticket_blob
     }
 
