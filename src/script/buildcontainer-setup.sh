@@ -12,6 +12,25 @@ dnf_clean() {
     fi
 }
 
+run_custom_image_script() {
+    if [ -z "${CUSTOM_IMAGE_SCRIPT}" ]; then
+        return
+    fi
+    local script_path="${CUSTOM_IMAGE_SCRIPT}"
+    if [ "${script_path#/}" = "${script_path}" ]; then
+        script_path="${CEPH_CTR_SRC}/${script_path}"
+    fi
+    if [ ! -f "${script_path}" ]; then
+        echo "Custom image script not found: ${script_path}" >&2
+        exit 2
+    fi
+    if [ ! -x "${script_path}" ]; then
+        chmod +x "${script_path}"
+    fi
+    echo "Running custom image script: ${script_path}"
+    "${script_path}"
+}
+
 set -e
 export LOCALE=C
 cd ${CEPH_CTR_SRC}
@@ -39,7 +58,7 @@ case "${CEPH_BASE_BRANCH}~${DISTRO_KIND}" in
     ;;
     *~*ubuntu*)
         apt-get update
-        apt-get install -y wget reprepro
+        apt-get install -y wget reprepro curl gnupg
         install_container_deps
     ;;
     *)
@@ -47,3 +66,5 @@ case "${CEPH_BASE_BRANCH}~${DISTRO_KIND}" in
         exit 2
     ;;
 esac
+
+run_custom_image_script
