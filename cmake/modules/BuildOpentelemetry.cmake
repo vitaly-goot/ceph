@@ -12,12 +12,11 @@ function(build_opentelemetry)
   # Akamai: We have to help OTel build in a way compatible with our external
   # abseil-cpp and gRPC. We *do* need to pass the CMAKE_PREFIX_PATH through
   # (this includes absl as well as some gRPC parts) but we'll do that in
-  # ExternalProject_add later - it's complicated. We also need to build in
-  # C++17 mode, and specify that we already have abseil and don't need to use
-  # the opentelemetry in-tree version. We may need to switch this to C++20
-  # mode at some point.
+  # ExternalProject_add later - it's complicated. We also need to build with
+  # the same C++ standard as our externally-built gRPC/abseil dependencies.
+  # These are built in C++20 mode in this tree, so match that here too.
   set(opentelemetry_CMAKE_ARGS -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-                               -DCMAKE_CXX_STANDARD=17
+                               -DCMAKE_CXX_STANDARD=20
                                -DWITH_ABSEIL=ON
                                -DWITH_JAEGER=ON
                                -DWITH_OTLP=ON

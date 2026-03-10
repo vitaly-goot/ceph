@@ -22,6 +22,7 @@ print_flag() {
 }
 
 echo "Custom build config from ${SCRIPT_DIR}/config.env"
+print_flag AKCEPH_ENABLE_GCC11
 print_flag AKCEPH_ENABLE_CCACHE
 print_flag AKCEPH_ENABLE_GO
 print_flag AKCEPH_ENABLE_GRPC
@@ -32,6 +33,7 @@ echo "  - AKCEPH_GRPC_VERSION=${AKCEPH_GRPC_VERSION:-unset}"
 echo "  - CMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD:-unset}"
 
 scripts=(
+    "${SCRIPT_DIR}/gcc.sh"
     "${SCRIPT_DIR}/ccache-bin.sh"
     "${SCRIPT_DIR}/golang.sh"
     "${SCRIPT_DIR}/abseil.sh"
