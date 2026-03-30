@@ -372,7 +372,6 @@ class LCObjsLister {
   string prefix;
   vector<rgw_bucket_dir_entry>::iterator obj_iter;
   rgw_bucket_dir_entry pre_obj;
-  int64_t delay_ms;
   int shard_id;
   uint32_t init_num_shards;
   std::map<int, bool> is_shard_empty;
@@ -384,7 +383,6 @@ public:
       driver(_driver), bucket(_bucket) {
     list_params.list_versions = bucket->versioned();
     list_params.allow_unordered = !(driver->ctx()->_conf.get_val<bool>("rgw_lc_allow_ordered_list"));
-    delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
     shard_id = -1;
     init_num_shards = 0;
   }
@@ -510,6 +508,7 @@ public:
   }
 
   void delay() {
+    auto delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
     std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
   }
 
@@ -3155,4 +3154,3 @@ void RGWLifecycleConfiguration::dump(Formatter *f) const
   }
   f->close_section();
 }
-
