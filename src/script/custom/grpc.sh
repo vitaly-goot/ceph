@@ -46,8 +46,12 @@ cd build
 declare -a disable_plugins; disable_plugins=()
 for p in CSHARP NODE OBJECTIVE_C PHP RUBY; do disable_plugins+=("-DgRPC_BUILD_GRPC_${p}_PLUGIN=OFF"); done
 
-env CXX="g++" "CXXFLAGS=-march=$AKCEPH_GCC_TARGET_ARCH" \
-    cmake -GNinja \
+COMMON_FLAGS="-march=$AKCEPH_GCC_TARGET_ARCH -flto=auto -ffat-lto-objects"
+cmake -GNinja \
+    -DCMAKE_C_COMPILER=gcc-11 \
+    -DCMAKE_CXX_COMPILER=g++-11 \
+    -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
+    -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" \
     -DgRPC_INSTALL=ON \
     -DgRPC_ABSL_PROVIDER=package \
     -DgRPC_SSL_PROVIDER=package \

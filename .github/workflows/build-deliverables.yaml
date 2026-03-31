@@ -1,0 +1,186 @@
+# GitHub Action to build ceph with build-with-container.py
+
+name: Build Ceph Deliverables
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'aka_version_*'
+      # Added while testing to trigger builds on patch branches, can be removed later
+      - 'patch/*'
+  pull_request:
+    branches:
+      - 'aka_version_*'
+
+concurrency:
+  group: build-ceph-deliverables-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+
+  preflight-registry:
+    runs-on: ceph
+    steps:
+      - name: Verify Docker and Buildx are available
+        run: |
+          set -euo pipefail
+          docker version
+          docker buildx version
+
+      - name: Verify registry CA trust and TLS handshake
+        if: ${{ github.event_name != 'pull_request' }}
+        run: |
+          set -euo pipefail
+
+          registry="${{ vars.RT_DOCKER_URL }}"
+          cert_path="/etc/docker/certs.d/${registry}/ca.crt"
+
+          if [[ ! -s "${cert_path}" ]]; then
+            echo "Missing registry CA at ${cert_path}"
+            echo "Install the Artifactory CA on the self-hosted runner before starting long builds."
+            exit 1
+          fi
+
+          if ! echo | openssl s_client -verify_return_error -servername "${registry}" -connect "${registry}:443" -CAfile "${cert_path}" >/tmp/registry_tls_check.log 2>&1; then
+            echo "TLS handshake failed using CA file: ${cert_path}"
+            cat /tmp/registry_tls_check.log
+            exit 1
+          fi
+
+          if ! grep -q "Verify return code: 0 (ok)" /tmp/registry_tls_check.log; then
+            echo "Registry cert verification did not return OK"
+            cat /tmp/registry_tls_check.log
+            exit 1
+          fi
+
+          echo "Registry TLS trust check passed"
+
+      - name: Verify registry authentication
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          REGISTRY: ${{ vars.RT_DOCKER_URL }}
+          REGISTRY_USERNAME: ${{ vars.RT_DOCKER_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.RT_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${REGISTRY_USERNAME}" || -z "${REGISTRY_PASSWORD}" ]]; then
+            echo "Registry credentials are missing"
+            exit 1
+          fi
+          echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USERNAME}" --password-stdin
+          docker logout "${REGISTRY}" || true
+
+  build-ceph-debians:
+    needs: preflight-registry
+    strategy:
+      matrix:
+        include:
+          #- os_version: ubuntu20.04
+          #  base_image: ubuntu:20.04
+          - os_version: ubuntu22.04
+            base_image: ubuntu:22.04
+          # This does not work currently due to build-with-container.py not supporting debian 13, but can be added back once that is supported
+          #- os_version: debian13
+          #  base_image: debian:trixie-slim
+
+    runs-on: ceph
+    steps:
+        - name: Checkout ceph
+          uses: actions/checkout@v4
+          with:
+            path: ceph
+            fetch-depth: 0
+            lfs: true
+            submodules: recursive
+
+        - name: Derive build variables
+          id: derive-build-vars
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.1
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
+
+        - name: Create ccache config file
+          id: write-ccache-config
+          uses: StorageTeam/build-ceph-action/composite-actions/write-ccache-config@v0.1
+          with:
+            ceph_path: ceph
+            redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
+            ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
+            cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
+            output_path: ceph/src/script/custom/ccache.config
+
+        - name: Run Build With Container on debians
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.1
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
+            build_target: debs
+            env_file: src/script/custom/ccache.config
+            custom_image_script: run-all.sh
+
+        - name: Cleanup Working dir in debs
+          run: |
+            # Delete workdir in ceph/<operating system>/debs/ to save space, as it is not needed for the upload artifact step
+            . /etc/os-release
+
+            case "$ID" in
+              ubuntu) OS_NAME="Ubuntu" ;;
+              debian) OS_NAME="Debian" ;;
+              *) OS_NAME="Unknown: $ID" && exit 1;;
+            esac
+            rm -rf ceph/debs/$OS_NAME/WORKDIR
+
+        - name: Upload debian packages
+          uses: actions/upload-artifact@v3
+          with:
+            name: ceph-debians-${{ matrix.os_version }}
+            path: ceph/debs
+
+  build-ceph-docker-images:
+    needs: build-ceph-debians
+    strategy:
+      matrix:
+        include:
+          - os_version: ubuntu22.04
+            base_image: ubuntu:22.04
+    runs-on: ceph
+    steps:
+      - name: Checkout ceph
+        uses: actions/checkout@v4
+        with:
+          path: ceph
+          fetch-depth: 1
+
+      - name: Derive build variables
+        id: derive-build-vars
+        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.1
+        with:
+          ceph_path: ceph
+          os_version: ${{ matrix.os_version }}
+
+      - name: Build and push docker image
+        # Set to main for testing. Will use new tag once verified.
+        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@main
+        with:
+          artifact_name: ceph-debians-${{ matrix.os_version }}
+          artifact_path: ceph
+          docker_context: ceph
+          dockerfile: ceph/.github/docker/Dockerfile.debian-packages
+          # This needs to change to env vars once those are setup
+          image_tags: |
+            ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}
+          platforms: linux/amd64
+          build_args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+          buildx_driver: docker
+          push: ${{ github.event_name != 'pull_request' }}
+          registry: ${{ vars.RT_DOCKER_URL }}
+          # This needs to change to env vars once those are setup
+          registry_username: ${{ vars.RT_DOCKER_USERNAME }}
+          registry_password: ${{ secrets.RT_ACCESS_TOKEN }}

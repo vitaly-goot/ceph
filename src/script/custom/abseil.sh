@@ -37,8 +37,12 @@ cd abseil-cpp
 git checkout -b "$ABSEIL_VERSION" "tags/$ABSEIL_VERSION"
 mkdir -p build
 cd build
-env CXX="g++" "CXXFLAGS=-march=$AKCEPH_GCC_TARGET_ARCH" \
-    cmake \
+COMMON_FLAGS="-march=$AKCEPH_GCC_TARGET_ARCH -flto=auto -ffat-lto-objects"
+cmake \
+    -DCMAKE_C_COMPILER=gcc-11 \
+    -DCMAKE_CXX_COMPILER=g++-11 \
+    -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
+    -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" \
     -DABSL_ENABLE_INSTALL=ON \
     -DCMAKE_INSTALL_PREFIX=${INSTALL_DIR} \
     -DCMAKE_INSTALL_LIBDIR=${INSTALL_DIR}/lib \

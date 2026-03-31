@@ -1,47 +1,28 @@
 # GitHub Action to build ceph with build-with-container.py
 
-name: Build Ceph Debians
+name: Build Ceph Binaries
 
 on:
-#  workflow_dispatch:
-#    inputs:
-#      ceph_version:
-#          # Multiple choices can be provided here as a dropdown in the UI
-#        type: choice
-#        description: 'Ceph version to test against'
-#        options:
-#          - "18"
-#          - "17"
-#          - "20"
-#        required: true
-#        default: '18'
+  workflow_dispatch:
+  # Each push run is trivial. No need to restrict how often it runs. 
+  # It will be automatically cancelled if a new push happens before the previous one finishes.
   push:
-    branches:
-      - 'aka_version_*'
-      - "*"
   pull_request:
     branches:
       - 'aka_version_*'
-      - "*"
-  #push:
-  #  branches:
-  #    - 'aka_version_*'
-  #    - "*"
-  #pull_request:
-  #  branches:
-  #    - 'aka_version_*'
-  #    - "*"
 
 concurrency:
-  group: build-ceph-debs-${{ github.ref }}
+  group: build-ceph-binaries-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
 
-  build-ceph-debs:
+  build-ceph-binaries:
     strategy:
       matrix:
-        os_version: [ubuntu20.04, ubuntu22.04]
+        os_version: 
+          #- ubuntu20.04
+          - ubuntu22.04
     runs-on: ceph
     steps:
         - name: Checkout ceph
@@ -52,79 +33,28 @@ jobs:
             lfs: true
             submodules: recursive
 
-        - name: Get current Directory
-          working-directory: ceph
-          run: |
-            echo "Current directory: $(pwd)"
-            echo "Contents of current directory:"
-            ls -la
-
-        - name: Set CXX Version by OS Version
-          id: set-cxx-version
-          run: |
-            case ${{ matrix.os_version }} in
-                ubuntu20.04)
-                    echo "CMAKE_CXX_STANDARD=17" >> $GITHUB_ENV
-                    ;;
-                ubuntu22.04)
-                    echo "Using Default C++ version for Ubuntu 22.04"
-                    ;;
-                *)
-                    echo "Unsupported OS version: ${{ matrix.os_version }}"
-                    exit 1
-                    ;;
-            esac
-
-        - name: Get Ceph Version
-          id: get-ceph-version
-          working-directory: ceph
-          run: |
-            CEPH_VERSION=$(head -n 1 src/ceph_release)
-            echo "CEPH_VERSION=${CEPH_VERSION}" >> $GITHUB_ENV
-
-        - name: Check if ceph_version is supported and set RELEASE_VERSION
-          id: set-release
-          run: |
-            case $CEPH_VERSION in
-                17*)
-                    echo "REDIS_DB_NUMBER=2" >> $GITHUB_ENV
-                    ;;
-                18*)
-                    echo "REDIS_DB_NUMBER=0" >> $GITHUB_ENV
-                    ;;
-                20*)
-                    echo "REDIS_DB_NUMBER=1" >> $GITHUB_ENV
-                    ;;
-                *)
-                    echo "Unsupported ceph_version: $CEPH_VERSION"
-                    exit 1
-                    ;;
-            esac
+        - name: Derive build variables
+          id: derive-build-vars
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.1
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
 
         - name: Create ccache config file
-          working-directory: ceph
-          run: |
-            # Delete existing ccache config file if it exists as that is for developers
-            rm -rf src/script/custom/ccache.config
-            # Create a new ccache config file for CI with the correct cache directory
-            mkdir -p src/script/custom
-            echo "CCACHE_HASHDIR=true
-            CCACHE_SLOPPINESS=time_macros
-            CCACHE_CPP2=true
-            CCACHE_RESHARE=true
-            CCACHE_REMOTE_STORAGE=redis://172.24.237.209:6379/3
-            CCACHE_REMOTE_ONLY=true
-            HOME=/tmp
-            XDG_CACHE_HOME=/tmp/.cache
-            CYPRESS_CACHE_FOLDER=/tmp/.cache/Cypress" > src/script/custom/ccache.config
-            # If CXX version is set, add it to the ccache config file
-            if [ -n "$CMAKE_CXX_STANDARD" ]; then
-              echo "CMAKE_CXX_STANDARD=17" >> src/script/custom/ccache.config
-            fi
+          id: write-ccache-config
+          uses: StorageTeam/build-ceph-action/composite-actions/write-ccache-config@v0.1
+          with:
+            ceph_path: ceph
+            redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
+            ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
+            cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
+            output_path: ceph/src/script/custom/ccache.config
 
-        - name: Run Ceph 
-          # Working Directory is ceph, where checkout@v4 placed this repository.
-          working-directory: ceph
-          run: |
-            # Builds binaries to get through the build quicker.
-            python3 src/script/build-with-container.py -d ${{ matrix.os_version }} --ccache-dir /ceph/.ccache/ --custom-image-script run-all.sh -e build --env-file src/script/custom/ccache.config
+        - name: Run Ceph
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.1
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
+            build_target: build
+            env_file: src/script/custom/ccache.config
+            custom_image_script: run-all.sh
