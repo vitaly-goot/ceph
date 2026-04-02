@@ -58,3 +58,4 @@ jobs:
             build_target: build
             env_file: src/script/custom/ccache.config
             custom_image_script: run-all.sh
+            patch_rocksdb_portable: 'true'
