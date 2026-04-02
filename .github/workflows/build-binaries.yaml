@@ -35,14 +35,14 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.1
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
 
         - name: Create ccache config file
           id: write-ccache-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-ccache-config@v0.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-ccache-config@v0.2
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
@@ -51,7 +51,7 @@ jobs:
             output_path: ceph/src/script/custom/ccache.config
 
         - name: Run Ceph
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.1
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}

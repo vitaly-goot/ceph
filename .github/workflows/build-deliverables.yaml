@@ -80,8 +80,6 @@ jobs:
     strategy:
       matrix:
         include:
-          #- os_version: ubuntu20.04
-          #  base_image: ubuntu:20.04
           - os_version: ubuntu22.04
             base_image: ubuntu:22.04
           # This does not work currently due to build-with-container.py not supporting debian 13, but can be added back once that is supported
@@ -100,14 +98,14 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.1
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
 
         - name: Create ccache config file
           id: write-ccache-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-ccache-config@v0.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-ccache-config@v0.2
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
@@ -116,13 +114,14 @@ jobs:
             output_path: ceph/src/script/custom/ccache.config
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.1
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
             build_target: debs
             env_file: src/script/custom/ccache.config
             custom_image_script: run-all.sh
+            patch_rocksdb_portable: 'true'
 
         - name: Cleanup Working dir in debs
           run: |
@@ -159,14 +158,14 @@ jobs:
 
       - name: Derive build variables
         id: derive-build-vars
-        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.1
+        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
         with:
           ceph_path: ceph
           os_version: ${{ matrix.os_version }}
 
       - name: Build and push docker image
         # Set to main for testing. Will use new tag once verified.
-        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@main
+        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.2
         with:
           artifact_name: ceph-debians-${{ matrix.os_version }}
           artifact_path: ceph
