@@ -133,4 +133,4 @@ Standard `gofmt` style. Code lives primarily in `src/ceph-node-proxy/` and build
 
 ## CI
 
-Workflows in `.github/workflows/` target `aka_version_*` branches and run on a custom self-hosted `ceph` runner. The `build-binaries.yaml` and `build-debians.yaml` workflows call `run-all.sh` to set up the environment, then invoke a composite action from `StorageTeam/build-ceph-action`. CI uses Redis-backed remote ccache (configured in `src/script/custom/ccache.config`).
+Workflows in `.github/workflows/` target `aka_version_*` branches and run on a custom self-hosted `ceph` runner. The `build-binaries.yaml` and `build-debians.yaml` workflows call `run-all.sh` to set up the environment, then invoke a composite action from `StorageTeam/build-ceph-action`. CI uses Redis-backed remote ccache (configured in `src/script/custom/build-vars.config`).

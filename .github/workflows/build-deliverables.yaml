@@ -103,15 +103,15 @@ jobs:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
 
-        - name: Create ccache config file
-          id: write-ccache-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-ccache-config@v0.2
+        - name: Create build vars config file
+          id: write-build-vars-config
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
             ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
             cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
-            output_path: ceph/src/script/custom/ccache.config
+            output_path: ceph/src/script/custom/build-vars.config
 
         - name: Run Build With Container on debians
           uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
@@ -119,7 +119,7 @@ jobs:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
             build_target: debs
-            env_file: src/script/custom/ccache.config
+            env_file: src/script/custom/build-vars.config
             custom_image_script: run-all.sh
             patch_rocksdb_portable: 'true'
 
