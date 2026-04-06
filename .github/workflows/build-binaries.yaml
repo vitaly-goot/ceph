@@ -15,6 +15,9 @@ concurrency:
   group: build-ceph-binaries-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  build_arch: "x86-64-v3"
+
 jobs:
 
   build-ceph-binaries:
@@ -42,13 +45,14 @@ jobs:
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3.1
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
             ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
             cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
             output_path: ceph/src/script/custom/build-vars.config
+            build_arch: ${{ env.build_arch }}
 
         - name: Run Ceph
           uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
