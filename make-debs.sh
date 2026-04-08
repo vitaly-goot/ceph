@@ -18,7 +18,8 @@ set -xe
 
 . /etc/os-release
 base=${1:-/tmp/release}
-releasedir=$base/$NAME/WORKDIR
+SAFE_NAME=${NAME//[^a-zA-Z0-9._-]/_}
+releasedir=$base/$SAFE_NAME/WORKDIR
 rm -fr $(dirname $releasedir)
 #
 # remove all files not under git so they are not
@@ -55,6 +56,23 @@ cp -a debian $releasedir/ceph-$vers/debian
 cd $releasedir
 perl -ni -e 'print if(!(/^Package: .*-dbg$/../^$/))' ceph-$vers/debian/control
 perl -pi -e 's/--dbg-package.*//' ceph-$vers/debian/rules
+# On Debian 13, keep only librados/librbd packages and strip missing files
+if [ "$ID" = "debian" ] && [ "${VERSION_ID:-0}" -ge 13 ] 2>/dev/null; then
+    cp ceph-$vers/debian/control ceph-$vers/debian/control.orig
+    awk '/^Source:/{keep=1} /^Package:/{keep=0} /^Package: (librados2|librados-dev|libradospp-dev|librbd1|librbd-dev)$/{keep=1} keep' ceph-$vers/debian/control.orig > ceph-$vers/debian/control
+    # Remove references to tracepoint libs (LTTNG disabled)
+    sed -i '/_tp\.so/d' ceph-$vers/debian/librados2.install
+    sed -i '/_tp\.so/d' ceph-$vers/debian/librbd1.install
+    sed -i '/_tp\.so/d' ceph-$vers/debian/librados-dev.install
+    sed -i '/_tp\.so/d' ceph-$vers/debian/librbd-dev.install
+    # Blank out dh overrides that reference packages we're not building
+    for target in override_dh_installinit override_dh_installsystemd \
+                  override_dh_installlogrotate override_dh_installchangelogs \
+                  override_dh_strip override_dh_shlibdeps override_dh_python3 \
+                  override_dh_dwz; do
+        sed -i "/^${target}:/,/^[^\t]/{s/^\t.*/\t@true/}" ceph-$vers/debian/rules
+    done
+fi
 #
 # always set the debian version to 1 which is ok because the debian
 # directory is included in the sources and the upstream version will

@@ -39,8 +39,8 @@ mkdir -p build
 cd build
 COMMON_FLAGS="-march=$AKCEPH_GCC_TARGET_ARCH -flto=auto -ffat-lto-objects"
 cmake \
-    -DCMAKE_C_COMPILER=gcc-11 \
-    -DCMAKE_CXX_COMPILER=g++-11 \
+    -DCMAKE_C_COMPILER=${AKCEPH_CC:-gcc} \
+    -DCMAKE_CXX_COMPILER=${AKCEPH_CXX:-g++} \
     -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
     -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" \
     -DABSL_ENABLE_INSTALL=ON \

@@ -20,26 +20,35 @@ fi
 
 source /etc/os-release
 
-if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "20.04" ]]; then
-    echo "GCC 11 install not needed on ${ID} ${VERSION_ID}, skipping"
-    exit 0
-fi
+case "${ID}:${VERSION_ID}" in
+    ubuntu:20.04)
+        echo "Installing GCC 11 on Ubuntu 20.04"
+        apt-get update -qq
+        apt-get install -y -qq software-properties-common
+        add-apt-repository -y ppa:ubuntu-toolchain-r/test
+        apt-get update -qq
+        apt-get install -y -qq gcc-11 g++-11
+        update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-11
+        if [[ -x /usr/bin/gcc-10 ]]; then
+            update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 \
+                --slave /usr/bin/g++ g++ /usr/bin/g++-10
+        fi
+        update-alternatives --set gcc /usr/bin/gcc-11
+        export AKCEPH_CC=gcc-11
+        export AKCEPH_CXX=g++-11
+        ;;
+    debian:13)
+        echo "Using GCC 14 on Debian 13"
+        export AKCEPH_CC=gcc-14
+        export AKCEPH_CXX=g++-14
+        ;;
+    *)
+        echo "GCC install not needed on ${ID} ${VERSION_ID}, using system default"
+        export AKCEPH_CC=gcc
+        export AKCEPH_CXX=g++
+        ;;
+esac
 
-echo "Installing GCC 11 on Ubuntu 20.04"
-
-apt-get update -qq
-apt-get install -y -qq software-properties-common
-add-apt-repository -y ppa:ubuntu-toolchain-r/test
-apt-get update -qq
-apt-get install -y -qq gcc-11 g++-11
-
-update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 \
-    --slave /usr/bin/g++ g++ /usr/bin/g++-11
-if [[ -x /usr/bin/gcc-10 ]]; then
-    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 \
-        --slave /usr/bin/g++ g++ /usr/bin/g++-10
-fi
-update-alternatives --set gcc /usr/bin/gcc-11
-
-echo "GCC version now: $(gcc --version | head -1)"
-echo "G++ version now: $(g++ --version | head -1)"
+echo "GCC version now: $(${AKCEPH_CC} --version | head -1)"
+echo "G++ version now: $(${AKCEPH_CXX} --version | head -1)"
