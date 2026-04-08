@@ -446,12 +446,22 @@ def parse_args(argv=None):
                    help="Print first N matching keys (global) and exit without deleting")
     p.add_argument("--skip-page-percent", type=float, default=0.0,
                    help="Randomly skip this percentage of keys from each listed page before enqueueing")
-    p.add_argument("--no-strict-prefix", action="store_false", dest="strict_prefix",
-                   help="Do not drop keys that do not start with their prefix client side")
     p.add_argument("--yes-i-really-mean-it", action="store_true",
                    help="Required when prefix is empty (''). Prevents accidental full-bucket deletes.")
-    p.set_defaults(strict_prefix=True)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+
+    # Validate worker count: must be in [1, 256]
+    if args.workers <= 0:
+        p.error("--workers must be >= 1; 0 would leave no delete workers to process the queue")
+    if args.workers > 256:
+        p.error("--workers must be <= 256; pick a smaller value to avoid resource exhaustion")
+
+    if args.batch_size <= 0:
+        p.error("--batch-size must be >= 1")
+    if args.batch_size > 1000:
+        p.error("--batch-size must be <= 1000 (DeleteObjects limit)")
+
+    return args
 
 def fmt_rate(n: int, s: Optional[float]) -> str:
     if s is None or s <= 0 or n == 0:
@@ -462,6 +472,19 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     setup_logging(args.trace, args.trace_file)
     install_faulthandler()
+
+    if args.max_pool_connections <= 0:
+        logging.error("--max-pool-connections must be >= 1")
+        return 2
+
+    if args.max_pool_connections < args.workers:
+        logging.warning(
+            "max_pool_connections (%s) < workers (%s); bumping max_pool_connections to %s",
+            args.max_pool_connections,
+            args.workers,
+            args.workers,
+        )
+        args.max_pool_connections = args.workers
 
     s3 = make_s3_client(
         access_key=args.access_key,
@@ -549,8 +572,6 @@ def main(argv=None) -> int:
 
                 filtered_page: List[Tuple[str, Optional[str]]] = []
                 for k, v in page:
-                    if args.strict_prefix and not k.startswith(prefix):
-                        continue
                     filtered_page.append((k, v))
 
                 if args.skip_page_percent > 0.0 and filtered_page:
