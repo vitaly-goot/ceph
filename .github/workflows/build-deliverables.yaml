@@ -85,9 +85,8 @@ jobs:
         include:
           - os_version: ubuntu22.04
             base_image: ubuntu:22.04
-          # This does not work currently due to build-with-container.py not supporting debian 13, but can be added back once that is supported
-          #- os_version: debian13
-          #  base_image: debian:trixie-slim
+          - os_version: debian13
+            base_image: debian:trixie
 
     runs-on: ceph
     steps:
