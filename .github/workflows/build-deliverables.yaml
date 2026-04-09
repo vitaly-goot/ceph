@@ -129,14 +129,9 @@ jobs:
         - name: Cleanup Working dir in debs
           run: |
             # Delete workdir in ceph/<operating system>/debs/ to save space, as it is not needed for the upload artifact step
-            . /etc/os-release
+            workdir="$(find ceph/debs -mindepth 2 -maxdepth 2 -type d -name WORKDIR -print -quit)"
 
-            case "$ID" in
-              ubuntu) OS_NAME="Ubuntu" ;;
-              debian) OS_NAME="Debian" ;;
-              *) OS_NAME="Unknown: $ID" && exit 1;;
-            esac
-            rm -rf ceph/debs/$OS_NAME/WORKDIR
+            rm -rf "$workdir"
 
         - name: Upload debian packages
           uses: actions/upload-artifact@v3
