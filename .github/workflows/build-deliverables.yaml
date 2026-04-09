@@ -100,14 +100,14 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.3.2
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3.2
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
@@ -117,7 +117,7 @@ jobs:
             build_arch: ${{ env.build_arch }}
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.3.2
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
