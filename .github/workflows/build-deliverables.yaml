@@ -23,7 +23,6 @@ permissions:
 
 env:
   build_arch: "x86-64-v3"
-  enable_ccache: ${{ contains(matrix.os_version, 'debian') && 'false' || 'true' }}
 
 jobs:
 
@@ -116,7 +115,6 @@ jobs:
             cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
             output_path: ceph/src/script/custom/build-vars.config
             build_arch: ${{ env.build_arch }}
-            enable_ccache: ${{ env.enable_ccache }}
 
         - name: Run Build With Container on debians
           uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4
@@ -127,7 +125,6 @@ jobs:
             env_file: src/script/custom/build-vars.config
             custom_image_script: run-all.sh
             patch_rocksdb_portable: 'true'
-            enable_ccache: ${{ env.enable_ccache }}
 
         - name: Cleanup Working dir in debs
           run: |
