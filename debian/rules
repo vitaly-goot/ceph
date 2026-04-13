@@ -5,7 +5,6 @@ export DESTDIR=$(CURDIR)/debian/tmp
 
 include /usr/share/dpkg/default.mk
 
-extraopts += -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11
 # OBJGEN1-917
 # We are seeing the same OSD crash with Ceph build with static libstdcxx
 # Removing this flags for all
@@ -53,6 +52,19 @@ endif
 ifneq (,$(filter with_system_libs,$(DEB_BUILD_OPTIONS)))
   extraopts += -DWITH_SYSTEM_BOOST=ON
   extraopts += -DWITH_SYSTEM_PMDK=ON
+endif
+# Debian 13+ (Trixie) specifics for v18
+DETECTED_DISTRO := $(shell . /etc/os-release 2>/dev/null && echo "$${ID}:$${VERSION_ID}")
+ifeq ($(DETECTED_DISTRO),debian:13)
+  extraopts += -DWITH_SYSTEM_BOOST=ON
+  extraopts += -DCMAKE_DISABLE_FIND_PACKAGE_fmt=TRUE
+  extraopts += -DWITH_RADOSGW=OFF
+  extraopts += -DWITH_MGR=OFF
+  extraopts += -DWITH_KRBD=OFF
+  extraopts += -DWITH_LTTNG=OFF
+  extraopts += -DWITH_JAEGER=OFF
+  DEB_CFLAGS_APPEND += -Wno-error=int-conversion -Wno-error=incompatible-pointer-types
+  extraopts += -DCEPH_PYBIND_EXTRA_CFLAGS="-Wno-error=int-conversion;-Wno-error=incompatible-pointer-types"
 endif
 
 # for python3-${pkg} packages

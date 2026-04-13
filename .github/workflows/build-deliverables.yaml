@@ -85,9 +85,8 @@ jobs:
         include:
           - os_version: ubuntu22.04
             base_image: ubuntu:22.04
-          # This does not work currently due to build-with-container.py not supporting debian 13, but can be added back once that is supported
-          #- os_version: debian13
-          #  base_image: debian:trixie-slim
+          - os_version: debian13
+            base_image: debian:trixie
 
     runs-on: ceph
     steps:
@@ -101,14 +100,14 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.4
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
@@ -118,7 +117,7 @@ jobs:
             build_arch: ${{ env.build_arch }}
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -130,14 +129,9 @@ jobs:
         - name: Cleanup Working dir in debs
           run: |
             # Delete workdir in ceph/<operating system>/debs/ to save space, as it is not needed for the upload artifact step
-            . /etc/os-release
+            workdir="$(find ceph/debs -mindepth 2 -maxdepth 2 -type d -name WORKDIR -print -quit)"
 
-            case "$ID" in
-              ubuntu) OS_NAME="Ubuntu" ;;
-              debian) OS_NAME="Debian" ;;
-              *) OS_NAME="Unknown: $ID" && exit 1;;
-            esac
-            rm -rf ceph/debs/$OS_NAME/WORKDIR
+            rm -rf "$workdir"
 
         - name: Upload debian packages
           uses: actions/upload-artifact@v3
@@ -162,14 +156,14 @@ jobs:
 
       - name: Derive build variables
         id: derive-build-vars
-        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
+        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4
         with:
           ceph_path: ceph
           os_version: ${{ matrix.os_version }}
 
       - name: Build and push docker image
         # Set to main for testing. Will use new tag once verified.
-        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.2
+        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.4
         with:
           artifact_name: ceph-debians-${{ matrix.os_version }}
           artifact_path: ceph

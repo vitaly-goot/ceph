@@ -56,10 +56,14 @@ case "${CEPH_BASE_BRANCH}~${DISTRO_KIND}" in
         install_container_deps
         dnf_clean
     ;;
-    *~*ubuntu*)
+    *~*ubuntu*|*~*debian*)
         apt-get update
-        apt-get install -y wget reprepro curl gnupg
+        DEBIAN_FRONTEND=noninteractive apt-get install -y wget reprepro curl gnupg nasm awscli s3cmd vim
         install_container_deps
+        # Debian 13+ needs system Boost for Python 3.13 compatibility
+        if [ "${ID}" = "debian" ] && [ "${VERSION_ID}" -ge 13 ] 2>/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y libboost-all-dev
+        fi
     ;;
     *)
         echo "Unknown action, branch or build: ${CEPH_BASE_BRANCH}~${DISTRO_KIND}" >&2

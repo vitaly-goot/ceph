@@ -1,0 +1,87 @@
+# GitHub Action to build ceph with build-with-container.py
+
+name: Build Ceph Debian Deliverables
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'aka_version_*'
+      # Added while testing to trigger builds on patch branches, can be removed later
+      - 'patch/*'
+  pull_request:
+    branches:
+      - 'aka_version_*'
+
+concurrency:
+  group: build-ceph-debian-deliverables-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  build_arch: "x86-64-v3"
+  enable_ccache: "false"
+
+jobs:
+
+  build-ceph-debians:
+    strategy:
+      matrix:
+        include:
+          - os_version: debian13
+            base_image: debian:trixie
+    runs-on: ceph
+    steps:
+        - name: Checkout ceph
+          uses: actions/checkout@v4
+          with:
+            path: ceph
+            fetch-depth: 0
+            lfs: true
+            submodules: recursive
+
+        - name: Derive build variables
+          id: derive-build-vars
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
+
+        - name: Create build vars config file
+          id: write-build-vars-config
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.4
+          with:
+            ceph_path: ceph
+            redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
+            ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
+            cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
+            output_path: ceph/src/script/custom/build-vars.config
+            build_arch: ${{ env.build_arch }}
+            enable_ccache: ${{ env.enable_ccache }}
+
+        - name: Run Build With Container on debians
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
+            build_target: debs
+            env_file: src/script/custom/build-vars.config
+            custom_image_script: run-all.sh
+            patch_rocksdb_portable: 'true'
+            enable_ccache: ${{ env.enable_ccache }}
+
+        - name: Cleanup Working dir in debs
+          run: |
+            # Delete workdir in ceph/<operating system>/debs/ to save space, as it is not needed for the upload artifact step
+            workdir="$(find ceph/debs -mindepth 2 -maxdepth 2 -type d -name WORKDIR -print -quit)"
+
+            rm -rf "$workdir"
+
+        - name: Upload debian packages
+          uses: actions/upload-artifact@v3
+          with:
+            name: ceph-debians-${{ matrix.os_version }}
+            path: ceph/debs

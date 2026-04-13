@@ -11,6 +11,25 @@ if [[ -f "${SCRIPT_DIR}/config.env" ]]; then
 fi
 export AKCEPH_CONFIG_LOADED=1
 
+# Detect compiler based on distro
+if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    case "${ID}:${VERSION_ID}" in
+        debian:13)
+            export AKCEPH_CC=gcc-14
+            export AKCEPH_CXX=g++-14
+            ;;
+        ubuntu:20.04)
+            export AKCEPH_CC=gcc-11
+            export AKCEPH_CXX=g++-11
+            ;;
+        *)
+            export AKCEPH_CC=gcc
+            export AKCEPH_CXX=g++
+            ;;
+    esac
+fi
+
 print_flag() {
     local key="$1"
     local value="${!key:-0}"
