@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <optional>
+#include <rgw_common.h>
 #include <stdlib.h>
 #include <system_error>
 #include <unistd.h>
@@ -20,16 +21,17 @@
 #include "common/Clock.h"
 #include "common/armor.h"
 #include "common/async/spawn_throttle.h"
+#include "common/ceph_json.h"
+#include "common/dout.h"
 #include "common/errno.h"
 #include "common/mime.h"
-#include "common/utf8.h"
-#include "common/ceph_json.h"
 #include "common/static_ptr.h"
 #include "common/perf_counters_key.h"
 #include "rgw_cksum.h"
 #include "rgw_cksum_digest.h"
 #include "rgw_common.h"
 #include "common/split.h"
+#include "common/utf8.h"
 #include "rgw_tracer.h"
 
 #include "rgw_rados.h"
@@ -69,6 +71,9 @@
 #include "rgw_bucket_sync.h"
 #include "rgw_bucket_logging.h"
 #include "rgw_restore.h"
+#include "rgw_restore_waiter.h"
+#include "rgw_ubns.h"
+#include "rgw_ubns_machine.h"
 
 #include "services/svc_zone.h"
 #include "services/svc_quota.h"
@@ -472,6 +477,14 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
     } else {
       return -EACCES;
     }
+  }
+  if (ret == -ENOENT && !upload_id.empty()) {
+    /* multipart upload */
+    ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message =
+        "The specified multipart upload does not exist. The upload ID might "
+        "be invalid, "
+        "or the multipart upload might have been aborted or completed";
   }
 
   return ret;
@@ -984,12 +997,111 @@ void handle_replication_status_header(
  *  `1`  :  restore is already in progress
  *  `2`  :  already restored
  */
+static int wait_for_restore_completion(req_state* s, const DoutPrefixProvider *dpp,
+                                        int64_t timeout_ms,
+                                        std::shared_ptr<rgw::restore::RestoreWaiter> waiter = nullptr,
+                                        std::shared_ptr<rgw::restore::RestoreWaiterRegistry> registry = nullptr,
+                                        optional_yield y = null_yield)
+{
+  if (timeout_ms <= 0 || (!waiter && !registry)) {
+    ldpp_dout(dpp, 5) << "restore is still in progress, please check restore status and retry" << dendl;
+    s->err.message = "restore is still in progress";
+    return -ERR_REQUEST_TIMEOUT;
+  }
+
+  // If waiter not provided, register one now (for RestoreAlreadyInProgress case)
+  std::unique_ptr<rgw::restore::WaiterGuard> guard;
+  if (!waiter) {
+    waiter = registry->register_waiter(
+      s->bucket->get_key(),
+      s->object->get_key()
+    );
+    if (!waiter) {
+      ldpp_dout(dpp, 5) << "restore waiter unavailable, returning timeout" << dendl;
+      s->err.message = "restore is still in progress";
+      return -ERR_REQUEST_TIMEOUT;
+    }
+    guard = std::make_unique<rgw::restore::WaiterGuard>(
+      registry,
+      waiter
+    );
+  }
+
+  const auto start_time = ceph::real_clock::now();
+  constexpr int64_t poll_interval_ms = 200;  // Poll RADOS every 200ms for cross-instance restores
+  int64_t remaining_ms = timeout_ms;
+
+  auto elapsed_ms = [start_time]() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+      ceph::real_clock::now() - start_time).count();
+  };
+
+  while (remaining_ms > 0) {
+    // Try waiting on condition variable for notification
+    const int64_t wait_time_ms = (poll_interval_ms < remaining_ms) ? poll_interval_ms : remaining_ms;
+
+    const bool notified = waiter->wait_for(std::chrono::milliseconds(wait_time_ms), y);
+
+    if (notified) {
+      // Got notification from restore processor
+      if (waiter->failed.load(std::memory_order_acquire)) {
+        const int result = waiter->result.load(std::memory_order_acquire);
+        ldpp_dout(dpp, 0) << "Restore failed after " << elapsed_ms() << "ms (notified)" << dendl;
+        s->err.message = "restore operation failed";
+        return result < 0 ? result : -EIO;
+      }
+      ldpp_dout(dpp, 10) << "Restore completed successfully in " << elapsed_ms() << "ms (notified)" << dendl;
+      return static_cast<int>(rgw::sal::RGWRestoreStatus::CloudRestored);
+    }
+
+    // No notification - poll RADOS to check status (for cross-instance restores)
+    // Invalidate cache to force fresh read from RADOS
+    s->object->invalidate();
+    int ret = s->object->get_obj_attrs(y, dpp);
+    if (ret < 0) {
+      ldpp_dout(dpp, 5) << "Failed to read object attrs during restore wait: " << ret << dendl;
+      // Continue waiting - transient error
+      remaining_ms = timeout_ms - elapsed_ms();
+      continue;
+    }
+
+    const rgw::sal::Attrs& attrs = s->object->get_attrs();
+    auto attr_iter = attrs.find(RGW_ATTR_RESTORE_STATUS);
+    if (attr_iter != attrs.end()) {
+      rgw::sal::RGWRestoreStatus restore_status;
+      auto iter = attr_iter->second.cbegin();
+      decode(restore_status, iter);
+
+      if (restore_status == rgw::sal::RGWRestoreStatus::CloudRestored) {
+        ldpp_dout(dpp, 10) << "Restore completed successfully in " << elapsed_ms() << "ms (polled)" << dendl;
+        return static_cast<int>(rgw::sal::RGWRestoreStatus::CloudRestored);
+      }
+      if (restore_status == rgw::sal::RGWRestoreStatus::RestoreFailed) {
+        ldpp_dout(dpp, 0) << "Restore failed after " << elapsed_ms() << "ms (polled)" << dendl;
+        s->err.message = "restore operation failed";
+        return -EIO;
+      }
+      // else RestoreAlreadyInProgress - continue waiting
+    }
+
+    // Update remaining time based on actual elapsed time
+    remaining_ms = timeout_ms - elapsed_ms();
+  }
+
+  // Timeout reached
+  ldpp_dout(dpp, 5) << "Restore timeout after " << elapsed_ms() << "ms, still in progress" << dendl;
+  s->err.message = "restore is still in progress";
+  return -ERR_REQUEST_TIMEOUT;
+}
+
 int handle_cloudtier_obj(req_state* s, const DoutPrefixProvider *dpp, rgw::sal::Driver* driver,
                          rgw::sal::Attrs& attrs, bool sync_cloudtiered, std::optional<uint64_t> days,
                          bool read_through, optional_yield y)
 {
   int op_ret = 0;
   ldpp_dout(dpp, 20) << "reached handle cloud tier " << dendl;
+  rgw::restore::Restore* restore_handle = driver ? driver->get_rgwrestore() : nullptr;
+  auto waiter_registry = restore_handle ? restore_handle->get_waiter_registry() : nullptr;
   auto attr_iter = attrs.find(RGW_ATTR_MANIFEST);
   if (attr_iter == attrs.end()) {
     if (!read_through) {
@@ -1032,11 +1144,11 @@ int handle_cloudtier_obj(req_state* s, const DoutPrefixProvider *dpp, rgw::sal::
     }
     if (restore_status == rgw::sal::RGWRestoreStatus::RestoreAlreadyInProgress) {
       if (read_through) {
-        op_ret = -ERR_REQUEST_TIMEOUT;
-        ldpp_dout(dpp, 5) << "restore is still in progress, please check restore status and retry" << dendl;
-        s->err.message = "restore is still in progress";
-        return op_ret;
-      } else { 
+        // For glacier tier, fail immediately as restores can take hours/days
+        int64_t timeout_ms = (tier_config.tier_placement.tier_type == "cloud-s3-glacier")
+          ? 0 : s->cct->_conf.get_val<int64_t>("rgw_read_through_timeout_ms");
+        return wait_for_restore_completion(s, dpp, timeout_ms, nullptr, waiter_registry, y);
+      } else {
        	// for restore-op, corresponds to RESTORE_ALREADY_IN_PROGRESS
         return static_cast<int>(rgw::sal::RGWRestoreStatus::RestoreAlreadyInProgress);
       } 
@@ -1088,6 +1200,26 @@ int handle_cloudtier_obj(req_state* s, const DoutPrefixProvider *dpp, rgw::sal::
         }
       }
 
+      // For read-through, register waiter BEFORE initiating restore
+      std::shared_ptr<rgw::restore::RestoreWaiter> waiter;
+      std::unique_ptr<rgw::restore::WaiterGuard> guard;
+
+      if (read_through && waiter_registry) {
+        // For glacier tier, fail immediately as restores can take hours/days
+        int64_t timeout_ms = (tier->get_tier_type() == "cloud-s3-glacier")
+          ? 0 : s->cct->_conf.get_val<int64_t>("rgw_read_through_timeout_ms");
+        if (timeout_ms > 0) {
+          waiter = waiter_registry->register_waiter(
+            s->bucket->get_key(),
+            s->object->get_key()
+          );
+          guard = std::make_unique<rgw::restore::WaiterGuard>(
+            waiter_registry,
+            waiter
+          );
+        }
+      }
+
       op_ret = driver->get_rgwrestore()->restore_obj_from_cloud(s->bucket.get(),
 		      s->object.get(), tier.get(), days, dpp, y);
 
@@ -1098,13 +1230,12 @@ int handle_cloudtier_obj(req_state* s, const DoutPrefixProvider *dpp, rgw::sal::
       }
 
       ldpp_dout(dpp, 20) << "Restore of object " << s->object->get_key() << " initiated" << dendl;
-      /*  Even if restore is complete the first read through request will return
-       *  but actually downloaded object asyncronously.
-       */
-      if (read_through) { //read-through
-        op_ret = -ERR_REQUEST_TIMEOUT;
-        ldpp_dout(dpp, 5) << "restore is still in progress, please check restore status and retry" << dendl;
-        s->err.message = "restore is still in progress";
+
+      if (read_through) {
+        // For glacier tier, fail immediately as restores can take hours/days
+        int64_t timeout_ms = (tier->get_tier_type() == "cloud-s3-glacier")
+          ? 0 : s->cct->_conf.get_val<int64_t>("rgw_read_through_timeout_ms");
+        return wait_for_restore_completion(s, dpp, timeout_ms, waiter, waiter_registry, y);
       }
       return op_ret;
     }
@@ -2599,6 +2730,19 @@ void RGWGetObj::execute(optional_yield y)
                        <<". Failing with " << op_ret << dendl;
       goto done_err;
     }
+    // If restore completed (via wait), invalidate cache and reload attrs
+    if (op_ret == static_cast<int>(rgw::sal::RGWRestoreStatus::CloudRestored)) {
+      // Invalidate cached state to force fresh read from RADOS with updated manifest
+      s->object->invalidate();
+
+      op_ret = s->object->get_obj_attrs(y, this);
+      if (op_ret < 0) {
+        ldpp_dout(this, 0) << "ERROR: failed to reload attrs after restore" << dendl;
+        goto done_err;
+      }
+      attrs = s->object->get_attrs();
+      s->obj_size = s->object->get_size();
+    }
   }
 
   attr_iter = attrs.find(RGW_ATTR_USER_MANIFEST);
@@ -3045,6 +3189,12 @@ void RGWSetBucketVersioning::execute(optional_yield y)
       op_ret = -ERR_MFA_REQUIRED;
       return;
     }
+  }
+
+  if (s->info.env->exists("HTTP_X_RGW_VALIDATE_ONLY")) {
+    ldpp_dout(this, 15) << "x-rgw-validate-only header set - exiting early"
+                        << dendl;
+    return;
   }
 
   op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->owner.id,
@@ -3684,6 +3834,18 @@ static int select_bucket_placement(const DoutPrefixProvider* dpp,
 
 void RGWCreateBucket::execute(optional_yield y)
 {
+  // UBNS: Create an empty optional<UBNSCreateMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSCreateMachine> ubns_creater(std::nullopt);
+
+  if (s->ubns_client) {
+    // Create a real ubns_creater. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_creater.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), s->user->get_id().to_str());
+  }
+
   op_ret = get_params(y);
   if (op_ret < 0)
     return;
@@ -3693,6 +3855,27 @@ void RGWCreateBucket::execute(optional_yield y)
   const RGWZoneGroup& my_zonegroup = site.get_zonegroup();
   const std::string rgwx_zonegroup = s->info.args.get(RGW_SYS_PARAM_PREFIX "zonegroup");
   const RGWZoneGroup* bucket_zonegroup = &my_zonegroup;
+
+  if (ubns_creater) {
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::CREATE_START);
+    if (!success) {
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed AddBucketEntry() request failed with unknown error" << dendl;
+        op_ret = -EEXIST;
+      }
+      return;
+    }
+    // creater state is CREATE_RPC_SUCCEEDED or CREATE_RPC_SOFT_FAILURE.
+    if (ubns_creater->state() == rgw::UBNSCreateMachine::CreateMachineState::CREATE_RPC_SOFT_FAILURE) {
+      ldpp_dout(this, 1) << "UBNS state CREATE_RPC_SOFT_FAILURE: stop RGWCreateBucket::execute() and return success code" << dendl;
+      op_ret = 0; // Success.
+      return;
+    }
+  }
 
   // Validate LocationConstraint if it's provided and enforcement is strict
   if (!location_constraint.empty() && !relaxed_region_enforcement) {
@@ -3931,6 +4114,24 @@ void RGWCreateBucket::execute(optional_yield y)
       op_ret = -ERR_BUCKET_EXISTS;
     }
   }
+
+  if (ubns_creater) {
+    // Move the state machine from CREATE_RPC_SUCCEEDED to UPDATE_START.
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::UPDATE_START);
+    if (!success) {
+      // We've created the bucket! We will need to be reconcile this
+      // externally, there's no obvious way to roll this back from
+      // RGWCreateBucket::execute().
+      auto result = ubns_creater->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed UpdateBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // creater state is UPDATE_RPC_SUCCEEDED or UPDATE_RPC_FAILED.
+  }
 }
 
 int RGWDeleteBucket::verify_permission(optional_yield y)
@@ -3956,6 +4157,41 @@ void RGWDeleteBucket::execute(optional_yield y)
   if (s->bucket_name.empty()) {
     op_ret = -EINVAL;
     return;
+  }
+
+  // UBNS: Create an empty optional<UBNSDeleteMachine>. This will be used
+  // later to decide whether or not UBNS is active.
+  std::optional<rgw::UBNSDeleteMachine> ubns_deleter(std::nullopt);
+
+  if (s->ubns_client) {
+    // Fetch the user ID from the bucket. UBNS requires us to pass a matching
+    // owner, and there's no guarantee that the user requesting bucket
+    // deletion is the owner of the bucket.
+    const std::string user_id = to_string(s->bucket->get_owner());
+    ldpp_dout(this, 5) << fmt::format(FMT_STRING("UBNS RGWDeleteBucket::execute(): bucket('{}','{}',''): fetched owner '{}'"), s->bucket_name, s->ubns_client->cluster_id(), user_id) << dendl;
+
+    // Create a real ubns_deleter. We'll use this at appropriate points in the
+    // function to interact with UBNS. Notice the use of emplace() here - the
+    // state machine's copy and move constructors are deleted, and most forms
+    // of std::optional creation have an implicit move.
+    ubns_deleter.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), user_id);
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::UPDATE_START);
+    if (!success) {
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request with unknown error" << dendl;
+        // This is an internal error, it has nothing to do with the bucket.
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+      return;
+    }
+    // deleter state is UPDATE_RPC_SUCCEEDED.
   }
 
   if (!s->bucket_exists) {
@@ -4002,6 +4238,24 @@ void RGWDeleteBucket::execute(optional_yield y)
       // lost a race, either with mdlog sync or another delete bucket operation.
       // in either case, we've already called ctl.bucket->unlink_bucket()
       op_ret = 0;
+  }
+
+  if (ubns_deleter) {
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::DELETE_START);
+    if (!success) {
+      // There's an error, but we've already deleted the bucket! We need to
+      // reconcile this externally, there's no obvious way to roll this back
+      // from RGWDeleteBucket::execute() - what do we do, recreate the bucket?
+      auto result = ubns_deleter->saved_grpc_result();
+      if (result) {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request: " << result->message() << dendl;
+        op_ret = -result->code();
+      } else {
+        ldpp_dout(this, 0) << "UBNS failed DeleteBucketEntry request failed with unknown error" << dendl;
+        op_ret = -ERR_INTERNAL_ERROR;
+      }
+    }
+    // deleter state is DELETE_RPC_SUCCEEDED or DELETE_RPC_FAILED.
   }
 
   auto counters = rgw::op_counters::get(s);
@@ -4463,6 +4717,10 @@ void RGWPutObj::execute(optional_yield y)
         ldpp_dout(this, 0) << "ERROR: get_multipart_info returned " << op_ret << ": " << cpp_strerror(-op_ret) << dendl;
       } else {// -ENOENT: raced with upload complete/cancel, no need to spam log
         ldpp_dout(this, 20) << "failed to get multipart info (returned " << op_ret << ": " << cpp_strerror(-op_ret) << "): probably raced with upload complete / cancel" << dendl;
+      }
+      if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+        s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                         "or the multipart upload might have been aborted or completed";
       }
       return;
     }
@@ -4946,8 +5204,15 @@ void RGWPostObj::execute(optional_yield y)
       ldpp_dout(this, 15) << "supplied_md5=" << supplied_md5 << dendl;
     }
 
+    std::string filename = get_current_filename();
+    ldpp_dout(this, 15) << "post form processing file [" << filename.length() << "] " << filename << dendl;
+    if (g_conf().get_val<bool>("rgw_post_check_null_byte_in_filename") && filename.find('\0') != std::string::npos) {
+      ldpp_dout(this, 1) << "ERROR: reject request since uploaded filename includes a null character midway." << filename << dendl;
+      op_ret = -ERR_ZERO_IN_URL;
+      return;
+    } 
     std::unique_ptr<rgw::sal::Object> obj =
-		     s->bucket->get_object(rgw_obj_key(get_current_filename()));
+		     s->bucket->get_object(rgw_obj_key(filename));
     if (s->bucket->versioning_enabled()) {
       obj->gen_rand_obj_instance_name();
     }
@@ -5741,6 +6006,9 @@ bool RGWCopyObj::parse_copy_location(const std::string_view& url_src,
     params_str = url_src.substr(pos + 1);
   }
 
+  if (name_str.empty()) {
+    return false;
+  }
   if (name_str[0] == '/') // trim leading slash
     name_str.remove_prefix(1);
 
@@ -7080,8 +7348,9 @@ void RGWCompleteMultipart::execute(optional_yield y)
       op_ret = 0;
       return;
     }
-    op_ret = -ERR_INTERNAL_ERROR;
-    s->err.message = "This multipart completion is already in progress";
+    op_ret = -ERR_NO_SUCH_UPLOAD;
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
     return;
   }
 
@@ -7364,6 +7633,10 @@ void RGWAbortMultipart::execute(optional_yield y)
   }
   op_ret = upload->abort(this, s->cct, y);
   serializer->unlock();
+  if (op_ret == -ERR_NO_SUCH_UPLOAD) {
+    s->err.message = "The specified multipart upload does not exist. The upload ID might be invalid, "
+                     "or the multipart upload might have been aborted or completed";
+  }
 }
 
 int RGWListMultipart::verify_permission(optional_yield y)
@@ -9004,6 +9277,12 @@ void RGWPutBucketObjectLock::execute(optional_yield y)
     s->err.message = "retention period must be a positive integer value";
     ldpp_dout(this, 4) << "ERROR: " << s->err.message << dendl;
     op_ret = -ERR_INVALID_RETENTION_PERIOD;
+    return;
+  }
+
+  if (s->info.env->exists("HTTP_X_RGW_VALIDATE_ONLY")) {
+    ldpp_dout(this, 15) << "x-rgw-validate-only header set - exiting early"
+                        << dendl;
     return;
   }
 

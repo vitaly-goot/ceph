@@ -183,6 +183,8 @@ void rgw_bucket_dir_entry_meta::generate_test_instances(list<rgw_bucket_dir_entr
   m->owner = "owner";
   m->owner_display_name = "display name";
   m->content_type = "content/type";
+  m->restore_status = 2; // CloudRestored
+  m->restore_expiry_date = ceph::real_time{std::chrono::seconds(1234567890)};
   o.push_back(m);
   o.push_back(new rgw_bucket_dir_entry_meta);
 }
@@ -203,6 +205,8 @@ void rgw_bucket_dir_entry_meta::dump(Formatter *f) const
   encode_json("accounted_size", accounted_size, f);
   encode_json("user_data", user_data, f);
   encode_json("appendable", appendable, f);
+  encode_json("restore_status", static_cast<int>(restore_status), f);
+  encode_json("restore_expiry_date", restore_expiry_date, f);
 }
 
 void rgw_bucket_dir_entry_meta::decode_json(JSONObj *obj) {
@@ -221,6 +225,10 @@ void rgw_bucket_dir_entry_meta::decode_json(JSONObj *obj) {
   JSONDecoder::decode_json("accounted_size", accounted_size, obj);
   JSONDecoder::decode_json("user_data", user_data, obj);
   JSONDecoder::decode_json("appendable", appendable, obj);
+  int rs_val = 0;
+  JSONDecoder::decode_json("restore_status", rs_val, obj);
+  restore_status = static_cast<uint8_t>(rs_val);
+  JSONDecoder::decode_json("restore_expiry_date", restore_expiry_date, obj);
 }
 
 void rgw_bucket_dir_entry::generate_test_instances(list<rgw_bucket_dir_entry*>& o)
@@ -465,6 +473,9 @@ void rgw_bucket_olh_entry::dump(Formatter *f) const
   encode_json("key", key, f);
   encode_json("delete_marker", delete_marker, f);
   encode_json("epoch", epoch, f);
+  ceph::real_time tp {std::chrono::nanoseconds (epoch)};
+  utime_t ut(tp);
+  encode_json("epoch_timestamp", ut, f);
   encode_json("pending_log", pending_log, f);
   encode_json("tag", tag, f);
   encode_json("exists", exists, f);
@@ -931,6 +942,8 @@ void cls_rgw_lc_entry::dump(Formatter *f) const
   encode_json("bucket", bucket, f);
   encode_json("start_time", start_time, f);
   encode_json("status", status, f);
+  encode_json("mod_time", mod_time, f);
+  encode_json("instance", instance, f);
 }
 
 void cls_rgw_lc_entry::generate_test_instances(list<cls_rgw_lc_entry*>& o)
@@ -939,6 +952,8 @@ void cls_rgw_lc_entry::generate_test_instances(list<cls_rgw_lc_entry*>& o)
   s->bucket = "bucket";
   s->start_time = 10;
   s->status = 1;
+  s->mod_time = 10;
+  s->instance = "rgw.test.1";
   o.push_back(s);
   o.push_back(new cls_rgw_lc_entry);
 }

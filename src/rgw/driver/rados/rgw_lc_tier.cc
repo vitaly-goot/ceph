@@ -97,8 +97,24 @@ static inline string get_key_oid(const rgw_obj_key& key)
 
 static inline string obj_to_aws_path(const rgw_obj& obj)
 {
-  string path = obj.bucket.name + "/" + get_key_oid(obj.key);
-  return path;
+  return obj.bucket.name + "/" + get_key_oid(obj.key);
+}
+
+static inline string make_target_obj_name(const RGWLCCloudTierCtx& tier_ctx)
+{
+  string target_obj_name;
+  if (tier_ctx.target_by_bucket) {
+    // Per-bucket targeting: object key only, no source bucket prefix
+    target_obj_name = tier_ctx.obj->get_name();
+  } else {
+    // Legacy: include source bucket name as prefix
+    target_obj_name = tier_ctx.bucket_info.bucket.name + "/" +
+                      tier_ctx.obj->get_name();
+  }
+  if (!tier_ctx.o.is_current()) {
+    target_obj_name += get_key_instance(tier_ctx.obj->get_key());
+  }
+  return target_obj_name;
 }
 
 static int read_upload_status(const DoutPrefixProvider *dpp, rgw::sal::Driver *driver,
@@ -271,11 +287,7 @@ int rgw_cloud_tier_restore_object(RGWLCCloudTierCtx& tier_ctx,
 
   rgw_bucket dest_bucket;
   dest_bucket.name = tier_ctx.target_bucket_name;
-  target_obj_name = tier_ctx.bucket_info.bucket.name + "/" +
-                    tier_ctx.obj->get_name();
-  if (!tier_ctx.o.is_current()) {
-    target_obj_name += get_key_instance(tier_ctx.obj->get_key());
-  }
+  target_obj_name = make_target_obj_name(tier_ctx);
 
   if (!in_progress) { // first time. Send RESTORE req.
 
@@ -338,11 +350,7 @@ int rgw_cloud_tier_get_object(RGWLCCloudTierCtx& tier_ctx, bool head,
 
   rgw_bucket dest_bucket;
   dest_bucket.name = tier_ctx.target_bucket_name;
-  target_obj_name = tier_ctx.bucket_info.bucket.name + "/" +
-                    tier_ctx.obj->get_name();
-  if (!tier_ctx.o.is_current()) {
-    target_obj_name += get_key_instance(tier_ctx.obj->get_key());
-  }
+  target_obj_name = make_target_obj_name(tier_ctx);
 
   rgw_obj dest_obj(dest_bucket, rgw_obj_key(target_obj_name));
 
@@ -403,6 +411,19 @@ int rgw_cloud_tier_get_object(RGWLCCloudTierCtx& tier_ctx, bool head,
       char* end = nullptr;
       accounted_size = strtoull(val.c_str(), &end, 10);	    
     }
+  }
+
+  /*
+   * The HTTP ETag header value is a quoted-string per RFC 7232.
+   * Strip the surrounding quotes so we do not double quote them.
+   */
+  etag = rgw_string_unquote(etag);
+
+  if (auto i = attrs.find(RGW_ATTR_ETAG); i != attrs.end()) {
+    const string unquoted = rgw_string_unquote(i->second.to_str());
+    bufferlist bl;
+    bl.append(unquoted);
+    i->second = std::move(bl);
   }
 
   ldpp_dout(tier_ctx.dpp, 20) << __func__ << "(): Sucessfully fetched object from cloud bucket:" << dest_bucket << ", object: " << target_obj_name << dendl;
@@ -920,11 +941,7 @@ static int cloud_tier_plain_transfer(RGWLCCloudTierCtx& tier_ctx) {
   rgw_bucket dest_bucket;
   dest_bucket.name = tier_ctx.target_bucket_name;
 
-  target_obj_name = tier_ctx.bucket_info.bucket.name + "/" +
-    tier_ctx.obj->get_name();
-  if (!tier_ctx.o.is_current()) {
-    target_obj_name += get_key_instance(tier_ctx.obj->get_key());
-  }
+  target_obj_name = make_target_obj_name(tier_ctx);
 
   rgw_obj dest_obj(dest_bucket, rgw_obj_key(target_obj_name));
 
@@ -964,11 +981,7 @@ static int cloud_tier_send_multipart_part(RGWLCCloudTierCtx& tier_ctx,
   rgw_bucket dest_bucket;
   dest_bucket.name = tier_ctx.target_bucket_name;
 
-  target_obj_name = tier_ctx.bucket_info.bucket.name + "/" +
-    tier_ctx.obj->get_name();
-  if (!tier_ctx.o.is_current()) {
-    target_obj_name += get_key_instance(tier_ctx.obj->get_key());
-  }
+  target_obj_name = make_target_obj_name(tier_ctx);
 
   rgw_obj dest_obj(dest_bucket, rgw_obj_key(target_obj_name));
 
@@ -1319,11 +1332,7 @@ static int cloud_tier_multipart_transfer(RGWLCCloudTierCtx& tier_ctx) {
 
   target_bucket.name = tier_ctx.target_bucket_name;
 
-  target_obj_name = tier_ctx.bucket_info.bucket.name + "/" +
-    tier_ctx.obj->get_name();
-  if (!tier_ctx.o.is_current()) {
-    target_obj_name += get_key_instance(tier_ctx.obj->get_key());
-  }
+  target_obj_name = make_target_obj_name(tier_ctx);
   dest_obj.init(target_bucket, target_obj_name);
 
   rgw_pool pool = static_cast<rgw::sal::RadosStore*>(tier_ctx.driver)->svc()->zone->get_zone_params().log_pool;
@@ -1454,6 +1463,23 @@ static int cloud_tier_create_bucket(RGWLCCloudTierCtx& tier_ctx) {
   bufferlist out_bl;
   int ret = 0;
   pair<string, string> key(tier_ctx.storage_class, tier_ctx.target_bucket_name);
+  stringstream ss;
+  XMLFormatter formatter;
+  bufferlist bl;
+  std::string lconstraint;
+
+  struct CreateBucketReq {
+	  std::optional<std::string>  lconstraint;
+
+    explicit CreateBucketReq(std::optional<std::string> _lconstraint) : lconstraint(_lconstraint) {}
+
+    void dump_xml(Formatter *f) const {
+      if (lconstraint) {
+        encode_xml("LocationConstraint", lconstraint, f);
+      };
+    }
+  } req_enc(lconstraint);
+
   struct CreateBucketResult {
     std::string code;
 
@@ -1463,8 +1489,15 @@ static int cloud_tier_create_bucket(RGWLCCloudTierCtx& tier_ctx) {
   } result;
 
   ldpp_dout(tier_ctx.dpp, 30) << "Cloud_tier_ctx: creating bucket:" << tier_ctx.target_bucket_name << dendl;
-  bufferlist bl;
   string resource = tier_ctx.target_bucket_name;
+
+  if (!tier_ctx.location_constraint.empty()) {
+    req_enc.lconstraint = tier_ctx.location_constraint;
+    encode_xml("CreateBucketConfiguration", req_enc, &formatter);
+
+    formatter.flush(ss);
+    bl.append(ss.str());
+  }
 
   ret = tier_ctx.conn.send_resource(tier_ctx.dpp, "PUT", resource, nullptr, nullptr,
                                     out_bl, &bl, nullptr, null_yield);

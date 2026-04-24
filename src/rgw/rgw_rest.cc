@@ -178,9 +178,34 @@ string uppercase_underscore_http_attr(const string& orig)
   return string(buf);
 }
 
-/* avoid duplicate hostnames in hostnames lists */
-static set<string> hostnames_set;
-static set<string> hostnames_s3website_set;
+struct HostnameConfig
+{
+  // hostname reverse regex patterns
+  vector<regex> hostnames_patterns;
+  vector<regex> hostnames_s3website_patterns;
+
+  bool empty() { return hostnames_patterns.empty() && hostnames_s3website_patterns.empty(); }
+};
+
+static std::shared_ptr<HostnameConfig> hostname_cfg;
+
+static std::regex make_hostname_pattern(const std::string& hostname)
+{
+  std::string reverse_hostname(hostname);
+  std::string pattern;
+  std::reverse(reverse_hostname.begin(), reverse_hostname.end());
+  for (char c : reverse_hostname) {
+    if (isalnum(c) or c == '-') {
+      pattern += c; // Legal hostname characters are treated as literals
+    } else if (c == '#') {
+      pattern += "[0-9]{1,10}"; // Match a sequence of digits up to 10 digits
+    } else {
+      pattern += '\\'; // Escape everything else, including dot
+      pattern += c;
+    }
+  }
+  return std::regex(pattern, std::regex_constants::icase | std::regex_constants::optimize | std::regex_constants::nosubs);
+}
 
 void rgw_rest_init(CephContext *cct, const rgw::sal::ZoneGroup& zone_group)
 {
@@ -212,6 +237,9 @@ void rgw_rest_init(CephContext *cct, const rgw::sal::ZoneGroup& zone_group)
     http_status_names[h->code] = h->name;
   }
 
+  auto new_cfg = std::make_shared<HostnameConfig>();
+
+  set<string> hostnames_set;
   std::list<std::string> rgw_dns_names;
   std::string rgw_dns_names_str = cct->_conf->rgw_dns_name;
   get_str_list(rgw_dns_names_str, ", ", rgw_dns_names);
@@ -221,6 +249,9 @@ void rgw_rest_init(CephContext *cct, const rgw::sal::ZoneGroup& zone_group)
   zone_group.get_hostnames(names);
   hostnames_set.insert(names.begin(), names.end());
   hostnames_set.erase(""); // filter out empty hostnames
+
+  std::transform(hostnames_set.cbegin(), hostnames_set.cend(),
+      std::back_inserter(new_cfg->hostnames_patterns), make_hostname_pattern);
   ldout(cct, 20) << "RGW hostnames: " << hostnames_set << dendl;
   /* TODO: We should have a sanity check that no hostname matches the end of
    * any other hostname, otherwise we will get ambiguous results from
@@ -232,43 +263,34 @@ void rgw_rest_init(CephContext *cct, const rgw::sal::ZoneGroup& zone_group)
    * X.B.A ambiguously splits to both {X, B.A} and {X.B, A}
    */
 
+  set<string> hostnames_s3website_set;
   zone_group.get_s3website_hostnames(names);
   hostnames_s3website_set.insert(cct->_conf->rgw_dns_s3website_name);
   hostnames_s3website_set.insert(names.begin(), names.end());
   hostnames_s3website_set.erase(""); // filter out empty hostnames
+
+  std::transform(hostnames_s3website_set.cbegin(), hostnames_s3website_set.cend(),
+      std::back_inserter(new_cfg->hostnames_s3website_patterns), make_hostname_pattern);
   ldout(cct, 20) << "RGW S3website hostnames: " << hostnames_s3website_set << dendl;
   /* TODO: we should repeat the hostnames_set sanity check here
    * and ALSO decide about overlap, if any
    */
-}
 
-static bool str_ends_with_nocase(const string& s, const string& suffix, size_t *pos)
-{
-  size_t len = suffix.size();
-  if (len > (size_t)s.size()) {
-    return false;
-  }
-
-  ssize_t p = s.size() - len;
-  if (pos) {
-    *pos = p;
-  }
-
-  return boost::algorithm::iends_with(s, suffix);
+  hostname_cfg.swap(new_cfg);
 }
 
 static bool rgw_find_host_in_domains(const string& host, string *domain, string *subdomain,
-                                     const set<string>& valid_hostnames_set)
+                                     const vector<regex>& valid_hostnames_patterns)
 {
-  set<string>::iterator iter;
-  /** TODO, Future optimization
-   * store hostnames_set elements _reversed_, and look for a prefix match,
-   * which is much faster than a suffix match.
-   */
-  for (iter = valid_hostnames_set.begin(); iter != valid_hostnames_set.end(); ++iter) {
-    size_t pos;
-    if (!str_ends_with_nocase(host, *iter, &pos))
+  std::string reverse_host(host);
+  std::reverse(reverse_host.begin(), reverse_host.end());
+  for (const auto &pattern : valid_hostnames_patterns) {
+    std::smatch m;
+    if (!std::regex_search(reverse_host, m, pattern, std::regex_constants::match_continuous))
       continue;
+
+    // NOTE, it is reverse continuous matching, so m.position is always 0.
+    const size_t pos = host.length() - m.length();
 
     if (pos == 0) {
       *domain = host;
@@ -1931,7 +1953,20 @@ int RGWHandler_REST::read_permissions(RGWOp* op_obj, optional_yield y)
     return -EINVAL;
   }
 
-  return do_read_permissions(op_obj, only_bucket, y);
+  auto ret = do_read_permissions(op_obj, only_bucket, y);
+  switch (s->op) {
+  case OP_HEAD:
+  case OP_GET:
+    if (ret == -ENOENT /* note, access already accounted for */) [[unlikely]] {
+      (void) s->object->load_obj_state(s, s->yield, true /* follow_olh */);
+      auto tf = s->object->is_delete_marker() ? "true" : "false";
+      dump_header(s, "x-amz-delete-marker", tf);
+    }
+  default:
+    break;
+  }
+
+  return ret;
 }
 
 void RGWRESTMgr::register_resource(string resource, RGWRESTMgr *mgr)
@@ -2061,16 +2096,17 @@ int RGWREST::preprocess(req_state *s, rgw::io::BasicClient* cio)
       }
     }
     ldpp_dout(s, 10) << "host=" << info.host << dendl;
+    std::shared_ptr<HostnameConfig> curr_cfg = hostname_cfg; // Hold a reference of current config
     string domain;
     string subdomain;
     bool in_hosted_domain_s3website = false;
-    bool in_hosted_domain = rgw_find_host_in_domains(info.host, &domain, &subdomain, hostnames_set);
+    bool in_hosted_domain = rgw_find_host_in_domains(info.host, &domain, &subdomain, curr_cfg->hostnames_patterns);
 
     string s3website_domain;
     string s3website_subdomain;
 
     if (s3website_enabled) {
-      in_hosted_domain_s3website = rgw_find_host_in_domains(info.host, &s3website_domain, &s3website_subdomain, hostnames_s3website_set);
+      in_hosted_domain_s3website = rgw_find_host_in_domains(info.host, &s3website_domain, &s3website_subdomain, curr_cfg->hostnames_s3website_patterns);
       if (in_hosted_domain_s3website) {
 	in_hosted_domain = true; // TODO: should hostnames be a strict superset of hostnames_s3website?
         domain = s3website_domain;
@@ -2101,14 +2137,14 @@ int RGWREST::preprocess(req_state *s, rgw::io::BasicClient* cio)
 	ldpp_dout(s, 5) << "resolved host cname " << info.host << " -> "
 			 << cname << dendl;
 	in_hosted_domain =
-	  rgw_find_host_in_domains(cname, &domain, &subdomain, hostnames_set);
+	  rgw_find_host_in_domains(cname, &domain, &subdomain, curr_cfg->hostnames_patterns);
 
         if (s3website_enabled
 	    && !in_hosted_domain_s3website) {
 	  in_hosted_domain_s3website =
 	    rgw_find_host_in_domains(cname, &s3website_domain,
 				     &s3website_subdomain,
-				     hostnames_s3website_set);
+                                     curr_cfg->hostnames_s3website_patterns);
 	  if (in_hosted_domain_s3website) {
 	    in_hosted_domain = true; // TODO: should hostnames be a
 				     // strict superset of hostnames_s3website?
@@ -2139,7 +2175,7 @@ int RGWREST::preprocess(req_state *s, rgw::io::BasicClient* cio)
         && (domain.empty() || domain != info.host)
         && !looks_like_ip_address(info.host.c_str())
         && RGWHandler_REST::validate_bucket_name(info.host) == 0
-        && !(hostnames_set.empty() && hostnames_s3website_set.empty())) {
+        && !curr_cfg->empty()) {
       subdomain.append(info.host);
       in_hosted_domain = 1;
     }

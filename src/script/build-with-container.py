@@ -213,6 +213,7 @@ _CONTAINER_SOURCES = [
     "Dockerfile.build",
     "src/script/lib-build.sh",
     "src/script/run-make.sh",
+    "src/script/custom"
     "ceph.spec.in",
     "do_cmake.sh",
     "install-deps.sh",
@@ -225,6 +226,48 @@ def _cmdstr(cmd):
     return " ".join(shlex.quote(c) for c in cmd)
 
 
+def _podman_pause_error(output):
+    text = output.lower()
+    return (
+        "invalid internal status" in text
+        and "podman system migrate" in text
+    )
+
+
+def _podman_preflight(ctx):
+    if ctx._podman_preflight_done:
+        return
+    if "podman" not in ctx.container_engine:
+        ctx._podman_preflight_done = True
+        return
+
+    ctx._podman_preflight_done = True
+    info_cmd = [ctx.container_engine, "info"]
+    res = subprocess.run(info_cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        return
+
+    output = f"{res.stdout}\n{res.stderr}"
+    if not _podman_pause_error(output):
+        log.warning("podman runtime preflight failed: %s", res.stderr.strip())
+        return
+
+    log.warning(
+        "podman reported invalid internal status; attempting self-heal with 'podman system migrate'"
+    )
+    migrate_cmd = [ctx.container_engine, "system", "migrate"]
+    mig = subprocess.run(migrate_cmd, capture_output=True, text=True)
+    if mig.returncode != 0:
+        log.warning("podman system migrate failed: %s", mig.stderr.strip())
+        return
+
+    res2 = subprocess.run(info_cmd, capture_output=True, text=True)
+    if res2.returncode == 0:
+        log.info("podman runtime preflight recovered after system migrate")
+    else:
+        log.warning("podman info still failing after migrate: %s", res2.stderr.strip())
+
+
 def _run(cmd, *args, **kwargs):
     ctx = kwargs.pop("ctx", None)
     if ctx and ctx.dry_run:
@@ -232,6 +275,10 @@ def _run(cmd, *args, **kwargs):
         # because we can not return a result (as we did nothing)
         # raise a specific exception to be caught by higher layer
         raise DidNotExecute(cmd)
+
+    cmd0 = str(cmd[0]) if cmd else ""
+    if ctx and "podman" in cmd0:
+        _podman_preflight(ctx)
 
     log.info("Executing command: %s", _cmdstr(cmd))
     return subprocess.run(cmd, *args, **kwargs)
@@ -244,7 +291,7 @@ def _container_cmd(
     cmd = [
         ctx.container_engine,
         "run",
-        "--name=ceph_build",
+        #"--name=ceph_build",
     ]
     if interactive:
         cmd.append("-it")
@@ -252,8 +299,7 @@ def _container_cmd(
         cmd.append("--rm")
     if "podman" in ctx.container_engine:
         cmd.append("--pids-limit=-1")
-    if ctx.map_user:
-        cmd.append("--user=0")
+    cmd.extend(ctx.user_map_flags)
     if ctx.cli.env_file:
         cmd.append(f"--env-file={ctx.cli.env_file.absolute()}")
     if workdir:
@@ -322,12 +368,20 @@ def _hash_sources(bsize=4096):
     hh = hashlib.sha256()
     buf = bytearray(bsize)
     for path in sorted(_CONTAINER_SOURCES):
-        with open(path, "rb") as fh:
-            while True:
-                rlen = fh.readinto(buf)
-                hh.update(buf[:rlen])
-                if rlen < len(buf):
-                    break
+        source = pathlib.Path(path)
+        if not source.exists():
+            continue
+        paths = [source]
+        if source.is_dir():
+            paths = sorted(p for p in source.rglob("*") if p.is_file())
+        for fpath in paths:
+            hh.update(str(fpath).encode("utf8"))
+            with open(fpath, "rb") as fh:
+                while True:
+                    rlen = fh.readinto(buf)
+                    hh.update(buf[:rlen])
+                    if rlen < len(buf):
+                        break
     return f"sha256:{hh.hexdigest()}"
 
 
@@ -386,6 +440,7 @@ class Context:
     def __init__(self, cli):
         self.cli = cli
         self._engine = None
+        self._podman_preflight_done = False
         self.distro_cache_name = ""
         self.current_srpm = None
 
@@ -555,6 +610,22 @@ class Context:
         return os.getuid() != 0
 
     @property
+    def user_map_flags(self):
+        """Return container flags to map the host user into the container."""
+        if os.getuid() == 0:
+            return []
+        flags = []
+        if "podman" in self.container_engine:
+            flags.append("--userns=keep-id")
+        else:
+            flags.append(f"--user={os.getuid()}:{os.getgid()}")
+        flags.extend([
+            "-eBUF_CACHE_DIR=/tmp/.cache",
+            "-eNPM_CONFIG_CACHE=/tmp/.npm",
+        ])
+        return flags
+
+    @property
     def dry_run(self):
         return self.cli.dry_run
 
@@ -694,6 +765,22 @@ def npm_cache_dir(ctx):
 def build_container(ctx):
     """Generate a build environment container image."""
     ctx.build.wants(Steps.DNF_CACHE, ctx)
+    if ctx.cli.custom_image_script:
+        custom_script = pathlib.Path(ctx.cli.custom_image_script)
+        if custom_script.is_absolute():
+            raise ValueError(
+                "--custom-image-script must be a path relative to source root"
+            )
+        resolved_script = custom_script
+        if not resolved_script.is_file():
+            fallback = pathlib.Path("src/script/custom") / custom_script
+            if fallback.is_file():
+                resolved_script = fallback
+        if not resolved_script.is_file():
+            raise FileNotFoundError(
+                f"custom image script not found: {custom_script}"
+            )
+        ctx.cli.custom_image_script = str(resolved_script)
     cmd = [
         ctx.container_engine,
         "build",
@@ -725,6 +812,10 @@ def build_container(ctx):
         cmd.append(f"--build-arg=WITH_CRIMSON={with_crimson}")
     if ctx.cli.build_args:
         cmd.extend([f"--build-arg={v}" for v in ctx.cli.build_args])
+    if ctx.cli.custom_image_script:
+        cmd.append(
+            f"--build-arg=CUSTOM_IMAGE_SCRIPT={ctx.cli.custom_image_script}"
+        )
     cmd += ["-f", ctx.cli.containerfile, ctx.cli.containerdir]
     with ctx.user_command():
         _run(cmd, check=True, ctx=ctx)
@@ -1216,6 +1307,13 @@ def parse_cli(build_step_names):
         help=(
             "Extra argument to pass to container image build."
             " Can be used to override default build image behavior."
+        ),
+    )
+    g_image.add_argument(
+        "--custom-image-script",
+        help=(
+            "Run this script while building the container image. "
+            "Path must be relative to source root and included in build context."
         ),
     )
     g_image.add_argument(

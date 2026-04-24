@@ -37,6 +37,7 @@ objects as well::
       "acls": [ { "type": <id | email | uri>,
                   "source_id": <source_id>,
                   "dest_id": <dest_id> } ... ],
+      "location_constraint": <location-constraint>,
       "target_path": <target_path>,
       "target_storage_class": <target-storage-class>,
       "multipart_sync_threshold": {object_size},
@@ -222,8 +223,10 @@ Example 3:
 
 This will restore the object ``doc3.rtf`` for ``read_through_restore_days`` days.
 
-Note: The above CLI command may time out if object restoration takes too long.
-You can verify the restore status before reissuing the command.
+The ``rgw_read_through_timeout_ms`` configuration option controls how long the
+``GET`` request will wait for restore completion before returning a timeout error.
+The default is 10000 milliseconds (10 seconds). Setting this to 0 disables waiting,
+requiring clients to poll for completion by retrying the ``GET`` request.
 
 
 Verifying the Restoration Status

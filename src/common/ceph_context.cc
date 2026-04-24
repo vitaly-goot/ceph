@@ -265,12 +265,13 @@ private:
  * logging-related config changes to the log.
  */
 class LogObs : public md_config_obs_t {
+  CephContext *_cct;
   ceph::logging::Log *log;
   ceph::mutex lock;
 
 public:
-  explicit LogObs(ceph::logging::Log *l)
-    : log(l), lock(ceph::make_mutex("log_obs")) {
+  explicit LogObs(CephContext *cct, ceph::logging::Log *l)
+    : _cct(cct), log(l), lock(ceph::make_mutex("log_obs")) {
   }
 
   std::vector<std::string> get_tracked_keys() const noexcept override {
@@ -292,7 +293,8 @@ public:
       "err_to_journald"s,
       "log_coarse_timestamps"s,
       "fsid"s,
-      "host"s
+      "host"s,
+      "enable_accesslog"s
     };
   }
 
@@ -375,9 +377,16 @@ public:
     if (log->graylog() && changed.count("fsid")) {
       log->graylog()->set_fsid(conf.get_val<uuid_d>("fsid"));
     }
+
+    if (changed.count("enable_accesslog")) {
+      if (conf.get_val<bool>("enable_accesslog")) {
+        log->start_accesslog(conf->host);
+      } else {
+        log->stop_accesslog();
+      }
+    }
   }
 };
-
 
 namespace ceph::common {
 // cct config watcher
@@ -722,7 +731,7 @@ CephContext::CephContext(uint32_t module_type_,
     _log = new ceph::logging::Log(&_conf->subsys);
   }
 
-  _log_obs = new LogObs(_log);
+  _log_obs = new LogObs(this, _log);
   _conf.add_observer(_log_obs);
 
   _cct_obs = new CephContextObs(this);

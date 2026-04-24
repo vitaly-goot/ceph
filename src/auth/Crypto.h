@@ -75,6 +75,17 @@ public:
   virtual int decrypt(const ceph::buffer::list& in,
 		      ceph::buffer::list& out, std::string *error) const = 0;
 
+  virtual int encrypt(const ceph::buffer::list& in,
+		      ceph::buffer::list& out, 
+                      ceph::buffer::ptr& iv, std::string *error) const {
+    return encrypt(in, out, error);
+  }
+  virtual int decrypt(const ceph::buffer::list& in,
+		      ceph::buffer::list& out, 
+                      ceph::buffer::ptr& iv, std::string *error) const {
+    return decrypt(in, out, error);
+  }
+
   // TODO: provide nullptr in the out::buf to get/estimate size requirements?
   // Or maybe dedicated methods?
   virtual std::size_t encrypt(const in_slice_t& in,

@@ -17,6 +17,7 @@ struct RGWRequest
   uint64_t id;
   req_state *s;
   RGWOp *op;
+  std::optional<RGWOp::UriLogRewrite> uri_log_rewrite;
 
   explicit RGWRequest(uint64_t id) : id(id), s(NULL), op(NULL) {}
 

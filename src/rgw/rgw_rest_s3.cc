@@ -4,6 +4,7 @@
 #include <boost/algorithm/string/case_conv.hpp>
 #include <cstdint>
 #include <errno.h>
+#include <algorithm>
 #include <array>
 #include <string.h>
 #include <string_view>
@@ -1870,6 +1871,15 @@ int RGWListBucket_ObjStore_S3::get_common_params()
      shard_id = s->bucket_instance_shard_id;
     }
   }
+
+  // Parse x-amz-optional-object-attributes header.
+  const char* opt_attrs = s->info.env->get("HTTP_X_AMZ_OPTIONAL_OBJECT_ATTRIBUTES");
+  if (opt_attrs) {
+    auto tokens = ceph::split(opt_attrs, ", ");
+    fetch_restore_status =
+        std::find(tokens.begin(), tokens.end(), "RestoreStatus") != tokens.end();
+  }
+
   return 0;
 }
 
@@ -1903,6 +1913,30 @@ if(!continuation_token_exist) {
   marker = continuation_token;
 }
 return 0;
+}
+
+/**
+ * Emit <RestoreStatus> XML element for a listing entry.
+ * Only emits for RestoreAlreadyInProgress and CloudRestored states.
+ */
+static void dump_restore_status(req_state* s,
+                                const rgw_bucket_dir_entry_meta& meta)
+{
+  using RGWRestoreStatus = rgw::sal::RGWRestoreStatus;
+  auto status = static_cast<RGWRestoreStatus>(meta.restore_status);
+
+  if (status != RGWRestoreStatus::RestoreAlreadyInProgress &&
+      status != RGWRestoreStatus::CloudRestored) {
+    return;
+  }
+
+  bool in_progress = (status == RGWRestoreStatus::RestoreAlreadyInProgress);
+  s->formatter->open_object_section("RestoreStatus");
+  s->formatter->dump_bool("IsRestoreInProgress", in_progress);
+  if (!in_progress && meta.restore_expiry_date != ceph::real_time{}) {
+    dump_time(s, "RestoreExpiryDate", meta.restore_expiry_date);
+  }
+  s->formatter->close_section(); // RestoreStatus
 }
 
 void RGWListBucket_ObjStore_S3::send_common_versioned_response()
@@ -1986,6 +2020,9 @@ void RGWListBucket_ObjStore_S3::send_versioned_response()
         s->formatter->dump_int("Size", iter->meta.accounted_size);
         auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
         s->formatter->dump_string("StorageClass", storage_class.c_str());
+        if (fetch_restore_status) {
+          dump_restore_status(s, iter->meta);
+        }
       }
       dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
       if (iter->meta.appendable) {
@@ -2078,6 +2115,9 @@ void RGWListBucket_ObjStore_S3::send_response()
       s->formatter->dump_int("Size", iter->meta.accounted_size);
       auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
       s->formatter->dump_string("StorageClass", storage_class.c_str());
+      if (fetch_restore_status) {
+        dump_restore_status(s, iter->meta);
+      }
       dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
       if (s->system_request) {
 	s->formatter->dump_string("RgwxTag", iter->tag);
@@ -2153,6 +2193,9 @@ void RGWListBucket_ObjStore_S3v2::send_versioned_response()
         s->formatter->dump_int("Size", iter->meta.accounted_size);
         auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
         s->formatter->dump_string("StorageClass", storage_class.c_str());
+        if (fetch_restore_status) {
+          dump_restore_status(s, iter->meta);
+        }
       }
       if (fetchOwner == true) {
         dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
@@ -2222,6 +2265,9 @@ void RGWListBucket_ObjStore_S3v2::send_response()
       s->formatter->dump_int("Size", iter->meta.accounted_size);
       auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
       s->formatter->dump_string("StorageClass", storage_class.c_str());
+      if (fetch_restore_status) {
+        dump_restore_status(s, iter->meta);
+      }
       if (fetchOwner == true) {
         dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
       }
@@ -4690,6 +4736,16 @@ void RGWListMultipart_ObjStore_S3::send_response()
   if (op_ret)
     set_req_state_err(s, op_ret);
   dump_errno(s);
+  ceph::real_time mtime;
+  ceph::real_time abort_date;
+  string rule_id;
+  bool exist_multipart_abort = get_s3_multipart_abort_header(s, mtime, abort_date, rule_id);
+  if (exist_multipart_abort)
+  {
+    dump_time_header(s, "x-amz-abort-date", abort_date);
+    dump_header_if_nonempty(s, "x-amz-abort-rule-id", rule_id);
+  }
+
   // Explicitly use chunked transfer encoding so that we can stream the result
   // to the user without having to wait for the full length of it.
   end_header(s, this, to_mime_type(s->format), CHUNKED_TRANSFER_ENCODING);
@@ -6243,7 +6299,11 @@ AWSSignerV4::prepare(const DoutPrefixProvider *dpp,
   if (opt_content) {
     content_hash = rgw::auth::s3::calc_v4_payload_hash(opt_content->to_str());
     extra_headers["x-amz-content-sha256"] = content_hash;
-
+  } else {
+    /* Some S3-compatible services require x-amz-content-sha256 header to always
+     * be present and included in the signature, even for unsigned payload.
+     * AWS S3 specification states that this header is required for all requests. */
+    extra_headers["x-amz-content-sha256"] = AWS4_UNSIGNED_PAYLOAD_HASH;
   }
 
   /* craft canonical headers */
@@ -6283,15 +6343,16 @@ AWSSignerV4::prepare(const DoutPrefixProvider *dpp,
   auto cct = dpp->get_cct();
 
   /* Craft canonical request. */
-  auto canonical_req_hash = \
-    rgw::auth::s3::get_v4_canon_req_hash(cct,
-                                         info.method,
-                                         std::move(canonical_uri),
-                                         std::move(canonical_qs),
-                                         std::move(canonical_headers),
-                                         signed_hdrs,
-                                         exp_payload_hash,
-                                         dpp);
+  const auto canonical_req = string_join_reserve("\n",
+    info.method,
+    std::move(canonical_uri),
+    std::move(canonical_qs),
+    std::move(canonical_headers),
+    signed_hdrs,
+    exp_payload_hash);
+
+  auto canonical_req_hash =
+    rgw::auth::s3::get_v4_canon_req_hash(cct, canonical_req, dpp);
 
   auto string_to_sign = \
     rgw::auth::s3::get_v4_string_to_sign(cct,
@@ -6414,15 +6475,17 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
   auto canonical_method = rgw::auth::s3::get_canonical_method(s, s->op_type, s->info);
 
   /* Craft canonical request. */
-  auto canonical_req_hash = \
-    rgw::auth::s3::get_v4_canon_req_hash(s->cct,
-                                         std::move(canonical_method),
-                                         std::move(canonical_uri),
-                                         std::move(canonical_qs),
-                                         std::move(*canonical_headers),
-                                         signed_hdrs,
-                                         exp_payload_hash,
-                                         s);
+  const auto canonical_req = string_join_reserve("\n",
+    canonical_method,
+    canonical_uri,
+    canonical_qs,
+    *canonical_headers,
+    signed_hdrs,
+    exp_payload_hash
+  );
+
+  auto canonical_req_hash =
+    rgw::auth::s3::get_v4_canon_req_hash(s->cct, canonical_req, s);
 
   auto string_to_sign = \
     rgw::auth::s3::get_v4_string_to_sign(s->cct,
@@ -6474,7 +6537,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
       session_token,
       std::move(string_to_sign),
       sig_factory,
-      null_completer_factory
+      null_completer_factory,
+      std::move(canonical_req)
     };
   } else {
     /* We're going to handle a signed payload. Be aware that even empty HTTP
@@ -6543,7 +6607,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
         session_token,
         std::move(string_to_sign),
         sig_factory,
-        cmpl_factory
+        cmpl_factory,
+        std::move(canonical_req)
       };
     } else {
       ldpp_dout(s, 10) << "body content detected in multiple chunks" << dendl;
@@ -6603,7 +6668,8 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
         session_token,
         std::move(string_to_sign),
         sig_factory,
-        cmpl_factory
+        cmpl_factory,
+        std::move(canonical_req)
       };
     }
   }
@@ -6764,23 +6830,101 @@ AWSBrowserUploadAbstractor::get_auth_data(const req_state* const s) const
 AWSEngine::result_t
 AWSEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s, optional_yield y) const
 {
-  /* Small reminder: an ver_abstractor is allowed to throw! */
-  const auto auth_data = ver_abstractor.get_auth_data(s);
+  result_t engine_result = result_t::deny(-EINVAL);
+  AWSEngine::VersionAbstractor::auth_data_t auth_data;
+  try {
+    /* Small reminder: an ver_abstractor is allowed to throw! */
+    auth_data = ver_abstractor.get_auth_data(s);
 
-  if (auth_data.access_key_id.empty() || auth_data.client_signature.empty()) {
-    return result_t::deny(-EINVAL);
-  } else {
-    return authenticate(dpp,
-                        auth_data.access_key_id,
-		        auth_data.client_signature,
-			auth_data.session_token,
-			auth_data.string_to_sign,
-                        auth_data.signature_factory,
-			auth_data.completer_factory,
-			s, y);
+    if (!auth_data.access_key_id.empty() && !auth_data.client_signature.empty()) {
+      engine_result = authenticate(
+          dpp, auth_data.access_key_id, auth_data.client_signature,
+          auth_data.session_token, auth_data.string_to_sign,
+          auth_data.signature_factory, auth_data.completer_factory, s, y);
+    }
+  } catch (int errcode) {
+    engine_result = result_t::deny(errcode);
+  } catch (const std::exception& ex) {
+    ldpp_dout(dpp, 0) << "exception during authentication: " << ex.what() << dendl;
+  }
+
+  if (engine_result.get_reason() != 0) {
+    FillErrorInfo(auth_data, engine_result);
+  }
+
+  return engine_result;
+}
+void AWSEngine::FillErrorInfo(const VersionAbstractor::auth_data_t &auth_data,
+                              result_t &engine_result) const
+{
+  /* Place a message and any extra headers in the result object.
+   * This is done to provide more information to the user about the error.
+   * This information will be moved to req_state when req_state is no longer const
+  */
+  switch (engine_result.get_reason()) 
+  {
+  case -ERR_AMZ_CONTENT_SHA256_MISMATCH: 
+    engine_result.set_message("The provided 'x-amz-content-sha256' header does not match "
+        "the calculated checksum of the request body.");
+    // AWS adds the expected and calculated checksum headers here, There is thought
+    // that they are sensitive information and should not be sent. They would also be
+    // difficult to get right now as the calculated checksum is in the completer which
+    // is not available here. Until a customer requests it, we will not add these headers.
+    break;
+  case -ERR_REQUEST_TIME_SKEWED:
+    engine_result.set_message("The difference between the request time and the server's "
+        "time is too large.");
+    break;
+  case -ERR_SIGNATURE_NO_MATCH: {
+    engine_result.set_message("The request signature we calculated does not match the "
+        "signature you provided. Check your key and signing method.");
+    engine_result.clear_extra_headers(6);
+    engine_result.add_extra_header("AWSAccessKeyId", std::string(auth_data.access_key_id));
+    engine_result.add_extra_header("StringToSign", auth_data.string_to_sign);
+    engine_result.add_extra_header("SignatureProvided", std::string(auth_data.client_signature));
+    std::stringstream hexStream;  
+    hexStream << std::hex << std::setfill('0');
+    for (char c : auth_data.string_to_sign) {
+      hexStream << std::setw(2)
+                << static_cast<int>(static_cast<unsigned char>(c)) << " ";
+    }
+    engine_result.add_extra_header("StringToSignBytes", hexStream.str());
+    if (auth_data.canonical_request.size() > 0) {
+      using sanitize = rgw::crypt_sanitize::log_content;
+      std::stringstream canonicalStream;
+      canonicalStream << sanitize{auth_data.canonical_request};
+      engine_result.add_extra_header("CanonicalRequest", canonicalStream.str());
+          
+      hexStream.str(""); // Clear the content of the string buffer
+      for (char c : canonicalStream.str()) {
+        hexStream << std::setw(2)
+                  << static_cast<int>(static_cast<unsigned char>(c)) << " ";
+      }
+      engine_result.add_extra_header("CanonicalRequestBytes", hexStream.str());
+    }
+  } break;
+  case -ERR_INVALID_ACCESS_KEY:
+    engine_result.set_message("The AWS Access Key Id you provided does not exist in our records.");
+    break;
+  case -ERR_NOT_IMPLEMENTED:
+    engine_result.set_message("The requested operation is not implemented.");
+    break;
+  case -EACCES:
+    engine_result.set_message("Access Denied.");
+    break;
+  case -ERR_INVALID_REQUEST:
+    engine_result.set_message("The request you have made is invalid.");
+    break;
+  case -ERR_METHOD_NOT_ALLOWED:
+    engine_result.set_message("The HTTP method you are using is not allowed.");
+    break;
+  case -EPERM:
+    engine_result.set_message("You do not have permission to access the requested resource.");  
+    break;
+  default:
+    break;
   }
 }
-
 } // namespace rgw::auth::s3
 
 rgw::LDAPHelper* rgw::auth::s3::LDAPEngine::ldh = nullptr;
@@ -6826,7 +6970,8 @@ rgw::auth::s3::LDAPEngine::get_acl_strategy() const
 }
 
 rgw::auth::RemoteApplier::AuthInfo
-rgw::auth::s3::LDAPEngine::get_creds_info(const rgw::RGWToken& token) const noexcept
+rgw::auth::s3::LDAPEngine::get_creds_info(const rgw::RGWToken& token) const
+noexcept
 {
   /* The short form of "using" can't be used here -- we're aliasing a class'
    * member. */

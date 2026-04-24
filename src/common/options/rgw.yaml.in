@@ -441,12 +441,12 @@ options:
 - name: rgw_lc_max_wp_worker
   type: int
   level: advanced
-  desc: Number of workpool threads per LCWorker
-  long_desc: Number of threads in per-LCWorker workpools--used to accelerate per-bucket
+  desc: Number of workpool coroutines per LCWorker
+  long_desc: Number of coroutines in per-LCWorker workpools--used to accelerate per-bucket
     processing
-  fmt_desc: This option specifies the number of threads in each lifecycle
+  fmt_desc: This option specifies the number of coroutines in each lifecycle
     workers work pool. This option can help accelerate processing each bucket.
-  default: 3
+  default: 128
   services:
   - rgw
   with_legacy: true
@@ -482,6 +482,29 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_lc_ordered_list_threshold
+  type: uint
+  level: dev
+  desc: Threshold for enabling ordered listing in lifecycle processing.
+  long_desc: When bucket shard count is below this threshold, lifecycle processing will
+    use ordered listing for better performance. Above this threshold, unordered listing
+    is used to avoid excessive OSD requests. A value of 0 disables ordered listing entirely.
+  default: 500
+  min: 0
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_list_cnt
+  type: uint
+  level: dev
+  desc: The count of number of objects in per listing of lc processing from each bucket.
+  long_desc: Number of objects that will be requested when performing a listing request
+    of a bucket for lifecycle processing.
+  default: 1000
+  min: 100
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_restore_debug_interval
   type: int
   level: dev
@@ -492,6 +515,21 @@ options:
     For example, during debugging if one wanted every 10 minutes to be equivalent to one day,
     then this would be set to 600, the number of seconds in 10 minutes.
   default: -1
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_read_through_timeout_ms
+  type: int
+  level: advanced
+  desc: Maximum time in milliseconds for read-through GET requests to wait for cloud
+    object restore completion
+  long_desc: When a GET request is made for a cloud-tiered object that must be restored,
+    the request will wait up to this many milliseconds for the restore to complete.
+    If the restore completes within this time, the GET request succeeds and returns the
+    object data. If the time is exceeded, the request fails with ERR_REQUEST_TIMEOUT.
+    Set to 0 to fail immediately without waiting.
+  default: 10000
+  min: 0
   services:
   - rgw
   with_legacy: true
@@ -4142,6 +4180,13 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgwlc_auto_session_clear_on_mtime
+  type: bool
+  level: advanced
+  desc: Use lc entry mod_time heartbeat to decide active vs stale session (60 minute threshold)
+  default: false
+  services:
+  - rgw
 - name: rgwlc_skip_bucket_step
   type: bool
   level: advanced
@@ -4421,3 +4466,172 @@ options:
   flags:
   - startup
   with_legacy: true
+- name: rgw_post_check_null_byte_in_filename
+  type: bool
+  level: advanced
+  desc: If enabled, RGW will deny POST requests if the uploaded object's name contains a null character (\0) in the middle.
+  default: true
+  services:
+  - rgw
+- name: rgw_ubns_cluster_id
+  type: str
+  level: advanced
+  desc: Cluster ID for the Akamai Unique Bucket Name Service
+  long_desc: The cluster ID for the Akamai Unique Bucket Name Service. This value
+    is used to identify the Ceph cluster to UBNS, and is required for UBNS
+    operation. It is an opaque string that is unique to the cluster. It must
+    be the same on all RGWs in the cluster or the results will be
+    unpredictable.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_enabled
+  type: bool
+  level: advanced
+  desc: Enable the Akamai Unique Bucket Name Service
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_initial_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS.
+  long_desc: The initial reconnect backoff timeout, the amount of time the
+    gRPC channel will wait before attempting to reconnect to the server.
+    The library enforces a minimum value of 100ms for this setting.
+    Be careful when changing this setting.
+  default: 1000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_min_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_MIN_RECONNECT_BACKOFF_MS (minimum reconnect backoff).
+  long_desc: The smallest value for the reconnect backoff timer. Be careful
+    when changing this setting.
+  default: 20000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_arg_max_reconnect_backoff_ms
+  type: int
+  level: advanced
+  desc: Setting for GRPC_ARG_MAX_RECONNECT_BACKOFF_MS (minimum reconnect backoff).
+  long_desc: The largest value for the reconnect backoff timer. Be careful
+    when changing this setting.
+  default: 120000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_enabled
+  type: bool
+  level: advanced
+  desc: Enable mTLS for UBNS gRPC connections.
+  long_desc: If set to true, the RGW will use mTLS to secure the connection to the
+    UBNS service. If true, the RGW will require rgw_ubns_grpc_mtls_ca_cert,
+    rgw_ubns_grpc_mtls_client_cert, and rgw_ubns_grpc_mtls_client_key to be set
+    in order to start.
+  default: true
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_ca_cert_file
+  type: str
+  level: advanced
+  desc: Path to the CA certificate file for UBNS gRPC connections.
+  long_desc: The path to the CA certificate that will be used to verify the
+    server's certificate when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_client_cert_file
+  type: str
+  level: advanced
+  desc: Path to the client certificate file for UBNS gRPC connections.
+  long_desc: The path to the client certificate that will be used to authenticate
+    the RGW when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_mtls_client_key_file
+  type: str
+  level: advanced
+  desc: Path to the client key file for UBNS gRPC connections.
+  long_desc: The path to the client key that will be used to authenticate the RGW
+    when connecting to the UBNS service via gRPC.
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_ubns_grpc_uri
+  type: str
+  level: advanced
+  desc: URI for the UBNS service via gRPC.
+  long_desc: The gRPC server address to use. This value is passed unchanged to
+    grpc::CreateCustomChannel() so may be in any format supported by the C++
+    gRPC library.
+  default: ipv4:127.0.0.1:9000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_usage_log_key_transition
+  type: bool
+  level: advanced
+  desc: To handle the co-existence of both old and new name-by-user keys
+  long_desc: The new usage log keyed by owner/payer ID has the prefix of "~"
+    for IDs starting with '0'.  This prefix is absent from the old scheme.
+    This option instructs RGW to handle the old keys if they still exist.
+    It should be set false when the old keys no longer exist to avoid
+    performance penalty.
+  fmt_desc: To handle the co-existence of both old and new name-by-user keys
+  default: true
+  services:
+  - rgw
+  see_also:
+  - rgw_enable_usage_log
+  with_legacy: true
+- name: rgw_akamai_ceph_200_revert
+  type: bool
+  level: advanced
+  desc: Revert Akamai CEPH-200 fix behaviour
+  long_desc: Revert to pre-CEPH-200 behaviour.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_secret_encrypt_enabled
+  type: bool
+  level: advanced
+  desc: Is the feature that encrypts secrets enabled?
+  default: false
+  services:
+    - rgw
+  flags:
+    - startup
+- name: rgw_secret_encrypt_key_file
+  type: str
+  level: advanced
+  desc: Name of the file that contains the encryption keys to encrypt secrets, including S3 secret keys.
+  default: /dev/shm/rgw_secret_encryption/encrypt_keys.json
+  services:
+    - rgw
+  flags:
+    - startup
+- name: rgw_secret_encrypt_key_reload_interval
+  type: uint
+  level: advanced
+  desc: The key file reload (upon unknown key) interval in seconds
+  default: 5
+  services:
+    - rgw
+  flags:
+    - startup

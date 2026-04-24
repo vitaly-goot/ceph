@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package authenticator.v1;
+
+option go_package = "bits.linode.com/LinodeApi/obj-endpoint/gen/proto/authenticator/v1";
+
+// Errors mapping to S3 errors.
+// See: https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html#RESTErrorResponses
+message S3ErrorDetails {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    // Access Denied.
+    // 403 Forbidden.
+    TYPE_ACCESS_DENIED = 1;
+    // The authorization header that you provided is not valid.
+    // 400 Bad Request.
+    TYPE_AUTHORIZATION_HEADER_MALFORMED = 2;
+    // The provided token has expired.
+    // 400 Bad Request.
+    TYPE_EXPIRED_TOKEN = 3;
+    // An internal error occurred. Try again.
+    // 500 Internal Server Error.
+    TYPE_INTERNAL_ERROR = 4;
+    // The AWS access key ID that you provided does not exist in our records.
+    // 403 Forbidden.
+    TYPE_INVALID_ACCESS_KEY_ID = 5;
+    // The request is using the wrong signature version. Use AWS4-HMAC-SHA256 (Signature Version 4).
+    // 400 Bad Request.
+    TYPE_INVALID_REQUEST = 6;
+    // The provided security credentials are not valid.
+    // 403 Forbidden.
+    TYPE_INVALID_SECURITY = 7;
+    // The provided token is malformed or otherwise not valid.
+    // 400 Bad Request.
+    TYPE_INVALID_TOKEN = 8;
+    // The specified URI couldn't be parsed.
+    // 400 Bad Request.
+    TYPE_INVALID_URI = 9;
+    // The specified method is not allowed against this resource.
+    // 405 Method Not Allowed.
+    TYPE_METHOD_NOT_ALLOWED = 10;
+    // Your request is missing a required header.
+    // 400 Bad Request.
+    TYPE_MISSING_SECURITY_HEADER = 11;
+    // The difference between the request time and the server's time is too large.
+    // 403 Forbidden.
+    TYPE_REQUEST_TIME_TOO_SKEWED = 12;
+    // The request signature that the server calculated does not match the signature that you provided. Check your AWS
+    // secret access key and signing method.
+    // 403 Forbidden.
+    TYPE_SIGNATURE_DOES_NOT_MATCH = 13;
+    // The provided token must be refreshed.
+    // 400 Bad Request.
+    TYPE_TOKEN_REFRESH_REQUIRED = 14;
+  }
+
+  Type type = 1;
+  int32 http_status_code = 2;
+}
+
+// AuthenticatorService provides RPCs for authenticating S3 requests.
+service AuthenticatorService {
+  // AuthenticateREST authenticated requests made via the REST API.
+  rpc AuthenticateREST(AuthenticateRESTRequest) returns (AuthenticateRESTResponse);
+  // AuthenticatePresignedURL authenticated requests made via Presigned URLs.
+  rpc AuthenticatePresignedURL(AuthenticatePresignedURLRequest) returns (AuthenticatePresignedURLResponse);
+}
+
+// Request message for authenticating REST API S3 requests.
+message AuthenticateRESTRequest {
+  enum HTTPMethod {
+    HTTP_METHOD_UNSPECIFIED = 0;
+    HTTP_METHOD_GET = 1;
+    HTTP_METHOD_HEAD = 2;
+    HTTP_METHOD_POST = 3;
+    HTTP_METHOD_PUT = 4;
+    HTTP_METHOD_DELETE = 5;
+  }
+
+  // The StringToSign used for calculating the signature, formed from data in the user's S3 REST request. For
+  // unauthenticated requests, this field will be empty.
+  optional string string_to_sign = 1;
+  // The Authorization HTTP header from the user's S3 REST request. Contains authentication information. For
+  // unauthenticated requests, this field will be empty.
+  optional string authorization_header = 2;
+  // The HTTP method from the user's S3 REST request used for the S3 request.
+  HTTPMethod http_method = 3;
+  // The name of the bucket the operation was performed on from the user's S3 REST request.
+  optional string bucket_name = 4;
+  // The object key the operation was performed on from the user's S3 REST request. For actions performed against a
+  // bucket, this field will be empty.
+  optional string object_key = 5;
+  // A map of all query string parameters from the user's S3 REST request.
+  map<string, string> query_parameters = 6;
+  // A map of all relevant x-amz-* headers from the user's S3 REST request.
+  map<string, string> x_amz_headers = 7;
+}
+
+// Response message for REST authentications.
+message AuthenticateRESTResponse {
+  // The user ID of the signer. This will be set to an assumed user if STS was used.
+  string user_id = 1;
+  // The user ID of the signer. This will be set to the assuming user/service if STS was used. This will be omitted if
+  // STS was not used.
+  optional string original_user_id = 2;
+}
+
+// Request message for authenticating Presigned URL S3 requests.
+message AuthenticatePresignedURLRequest {
+  enum HTTPMethod {
+    HTTP_METHOD_UNSPECIFIED = 0;
+    HTTP_METHOD_GET = 1;
+    HTTP_METHOD_PUT = 2;
+  }
+
+  // The StringToSign used for calculating the signature, formed from data in the user's S3 presigned URL request.
+  string string_to_sign = 1;
+  // The entire presigned URL from the user's presigned URL S3 request.
+  string url = 2;
+  // The HTTP method from the user's presigned URL S3 request.
+  HTTPMethod http_method = 3;
+}
+
+// Response message for Presigned URL authentications.
+message AuthenticatePresignedURLResponse {
+  // The user ID of the signer. This will be set to an assumed user if STS was used.
+  string user_id = 1;
+  // The user ID of the signer. This will be set to the assuming user/service if STS was used. This will be omitted if
+  // STS was not used.
+  optional string original_user_id = 2;
+}

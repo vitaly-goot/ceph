@@ -211,9 +211,11 @@ struct rgw_bucket_dir_entry_meta {
   std::string user_data;
   std::string storage_class;
   bool appendable = false;
+  uint8_t restore_status = 0; // maps to RGWRestoreStatus enum
+  ceph::real_time restore_expiry_date; // zero when N/A
 
   void encode(ceph::buffer::list &bl) const {
-    ENCODE_START(7, 3, bl);
+    ENCODE_START(8, 3, bl);
     encode(category, bl);
     encode(size, bl);
     encode(mtime, bl);
@@ -225,11 +227,13 @@ struct rgw_bucket_dir_entry_meta {
     encode(user_data, bl);
     encode(storage_class, bl);
     encode(appendable, bl);
+    encode(restore_status, bl);
+    encode(restore_expiry_date, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(ceph::buffer::list::const_iterator &bl) {
-    DECODE_START_LEGACY_COMPAT_LEN(6, 3, 3, bl);
+    DECODE_START_LEGACY_COMPAT_LEN(8, 3, 3, bl);
     decode(category, bl);
     decode(size, bl);
     decode(mtime, bl);
@@ -248,6 +252,10 @@ struct rgw_bucket_dir_entry_meta {
       decode(storage_class, bl);
     if (struct_v >= 7)
       decode(appendable, bl);
+    if (struct_v >= 8) {
+      decode(restore_status, bl);
+      decode(restore_expiry_date, bl);
+    }
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
@@ -511,14 +519,20 @@ WRITE_CLASS_ENCODER(rgw_cls_bi_entry)
 
 enum OLHLogOp {
   CLS_RGW_OLH_OP_UNKNOWN         = 0,
+  // link OLH entry to a specific object version
   CLS_RGW_OLH_OP_LINK_OLH        = 1,
+  // deletes OLH object from the data pool and removes OLH entry from the bucket index
   CLS_RGW_OLH_OP_UNLINK_OLH      = 2, /* object does not exist */
+  // remove a specific instance of an object, such as <obj_name>.<obj_version>
   CLS_RGW_OLH_OP_REMOVE_INSTANCE = 3,
 };
 
 struct rgw_bucket_olh_log_entry {
   uint64_t epoch;
   OLHLogOp op;
+  // Once the OLH Log Entries are processed for a given epoch (by apply_olh_log()) the corresponding olh.pending.*
+  // xattrs are removed from the corresponding OLH object (in the data pool). The pending xattrs to be removed
+  // are those that match op_tag.
   std::string op_tag;
   cls_rgw_obj_key key;
   bool delete_marker;
@@ -555,8 +569,17 @@ WRITE_CLASS_ENCODER(rgw_bucket_olh_log_entry)
 struct rgw_bucket_olh_entry {
   cls_rgw_obj_key key;
   bool delete_marker;
+  // the epoch represents the latest modification timestamp for the S3 object identified by the key;
   uint64_t epoch;
+  // epoch -> op list mapping: stores pending modifications to the S3 object identified by the key;
+  // this is basically a per-S3-object WAL whose main purpose is crash safety and idempotency; operations
+  // PUT/DELETE that modify S3 object history write to this log first; it is being
+  // replayed by the apply_olh_log() on the same zone;
+  // usually there's only 1 op per epoch key but more than 1 op would be associated with an epoch in case
+  // of versioned DELETE for the current instance: [remove instance, link]
   std::map<uint64_t, std::vector<struct rgw_bucket_olh_log_entry> > pending_log;
+  // unique tag for this entry; it remains the same until the entry is deleted (like when versioning
+  // is suspended) and then re-created (by re-enabling versioning);
   std::string tag;
   bool exists;
   bool pending_removal;
@@ -1339,28 +1362,40 @@ struct cls_rgw_lc_entry {
   std::string bucket;
   uint64_t start_time; // if in_progress
   uint32_t status;
+  uint64_t mod_time; // last heartbeat/update time (epoch seconds)
+  std::string instance; // rgw daemon instance name handling this entry
 
   cls_rgw_lc_entry()
-    : start_time(0), status(0) {}
+    : start_time(0), status(0), mod_time(0) {}
 
   cls_rgw_lc_entry(const cls_rgw_lc_entry& rhs) = default;
 
-  cls_rgw_lc_entry(const std::string& b, uint64_t t, uint32_t s)
-    : bucket(b), start_time(t), status(s) {};
+  cls_rgw_lc_entry(const std::string& b, uint64_t t, uint32_t s, uint64_t m = 0,
+                   const std::string& inst = {})
+    : bucket(b), start_time(t), status(s), mod_time(m), instance(inst) {};
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(bucket, bl);
     encode(start_time, bl);
     encode(status, bl);
+    encode(mod_time, bl);
+    encode(instance, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(bucket, bl);
     decode(start_time, bl);
     decode(status, bl);
+    if (struct_v >= 2) {
+      decode(mod_time, bl);
+      decode(instance, bl);
+    } else {
+      mod_time = 0;
+      instance.clear();
+    }
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;

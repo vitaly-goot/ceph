@@ -2788,6 +2788,9 @@ int RadosObject::load_obj_state(const DoutPrefixProvider* dpp, optional_yield y,
 
   int ret = store->getRados()->get_obj_state(dpp, rados_ctx, bucket->get_info(), get_obj(), &pstate, &manifest, follow_olh, y);
   if (ret < 0) {
+    if (ret == -ENOENT) {
+      state.is_dm = pstate->is_dm;
+    }
     return ret;
   }
 
@@ -2850,8 +2853,10 @@ int RadosObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val, o
   /* Temporarily set target */
   state.obj = target;
   set_atomic(true);
-  state.attrset[attr_name] = attr_val;
-  r = set_obj_attrs(dpp, &state.attrset, nullptr, y, flags);
+
+  Attrs mattr;
+  mattr[attr_name] = attr_val;
+  r = set_obj_attrs(dpp, &mattr, nullptr, y, flags);
   /* Restore target */
   state.obj = save;
 
@@ -3059,8 +3064,18 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
   RGWAccessKey key = rtier->get_rt().t.s3.key;
   string region = rtier->get_rt().t.s3.region;
   HostStyle host_style = rtier->get_rt().t.s3.host_style;
-  string bucket_name = rtier->get_rt().t.s3.target_path;
   const rgw::sal::ZoneGroup& zonegroup = store->get_zone()->get_zonegroup();
+  // extract owner (user_id or account_id depending on ownership type)
+  std::string owner;
+  if (const auto* acct = std::get_if<rgw_account_id>(&bucket->get_owner()); acct) {
+    owner = *acct;
+  } else if (const auto* user = std::get_if<rgw_user>(&bucket->get_owner()); user) {
+    owner = user->id;
+  }
+  string bucket_name = rtier->get_rt().t.s3.make_target_bucket_name(
+      zonegroup.get_name(),
+      tier->get_storage_class(), bucket->get_name(),
+      bucket->get_tenant(), owner);
   int ret = 0;
 
   auto& attrs = get_attrs();
@@ -3082,12 +3097,6 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
   // update tier_config in case tier params are updated
   tier_config.tier_placement = rtier->get_rt();
 
-  if (bucket_name.empty()) {
-    bucket_name = "rgwx-" + zonegroup.get_name() + "-" + tier->get_storage_class() +
-                    "-cloud-bucket";
-    boost::algorithm::to_lower(bucket_name);
-  }
-
   rgw_bucket_dir_entry ent;
   ent.key.name = get_key().name;
   ent.key.instance = get_key().instance;
@@ -3104,13 +3113,15 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
   // save source cloudtier storage class
   RGWLCCloudTierCtx tier_ctx(cct, dpp, ent, store, bucket->get_info(),
            this, conn, bucket_name,
-           rtier->get_rt().t.s3.target_storage_class);
+           rtier->get_rt().t.s3.target_storage_class,
+           rtier->get_rt().t.s3.target_by_bucket);
   tier_ctx.acl_mappings = rtier->get_rt().t.s3.acl_mappings;
   tier_ctx.multipart_min_part_size = rtier->get_rt().t.s3.multipart_min_part_size;
   tier_ctx.multipart_sync_threshold = rtier->get_rt().t.s3.multipart_sync_threshold;
   tier_ctx.storage_class = tier->get_storage_class();
   tier_ctx.restore_storage_class = rtier->get_rt().restore_storage_class;
   tier_ctx.tier_type = rtier->get_rt().tier_type;
+  tier_ctx.location_constraint = rtier->get_rt().t.s3.location_constraint;
 
   ldpp_dout(dpp, 20) << "Restoring object(" << get_key() << ") from the cloud endpoint(" << endpoint << ")" << dendl;
 
@@ -3165,25 +3176,31 @@ int RadosObject::transition_to_cloud(Bucket* bucket,
   RGWAccessKey key = rtier->get_rt().t.s3.key;
   string region = rtier->get_rt().t.s3.region;
   HostStyle host_style = rtier->get_rt().t.s3.host_style;
-  string bucket_name = rtier->get_rt().t.s3.target_path;
   const rgw::sal::ZoneGroup& zonegroup = store->get_zone()->get_zonegroup();
-
-  if (bucket_name.empty()) {
-    bucket_name = "rgwx-" + zonegroup.get_name() + "-" + tier->get_storage_class() +
-                    "-cloud-bucket";
-    boost::algorithm::to_lower(bucket_name);
+  // extract owner (user_id or account_id depending on ownership type)
+  std::string owner;
+  if (const auto* acct = std::get_if<rgw_account_id>(&bucket->get_owner()); acct) {
+    owner = *acct;
+  } else if (const auto* user = std::get_if<rgw_user>(&bucket->get_owner()); user) {
+    owner = user->id;
   }
+  string bucket_name = rtier->get_rt().t.s3.make_target_bucket_name(
+      zonegroup.get_name(),
+      tier->get_storage_class(), bucket->get_name(),
+      bucket->get_tenant(), owner);
 
   /* Create RGW REST connection */
   S3RESTConn conn(cct, id, { endpoint }, key, zonegroup.get_id(), region, host_style);
 
   RGWLCCloudTierCtx tier_ctx(cct, dpp, o, store, bucket->get_info(),
 			     this, conn, bucket_name,
-			     rtier->get_rt().t.s3.target_storage_class);
+			     rtier->get_rt().t.s3.target_storage_class,
+			     rtier->get_rt().t.s3.target_by_bucket);
   tier_ctx.acl_mappings = rtier->get_rt().t.s3.acl_mappings;
   tier_ctx.multipart_min_part_size = rtier->get_rt().t.s3.multipart_min_part_size;
   tier_ctx.multipart_sync_threshold = rtier->get_rt().t.s3.multipart_sync_threshold;
   tier_ctx.storage_class = tier->get_storage_class();
+  tier_ctx.location_constraint = rtier->get_rt().t.s3.location_constraint;
 
   ldpp_dout(dpp, 0) << "Transitioning object(" << o.key << ") to the cloud endpoint(" << endpoint << ")" << dendl;
 
@@ -4505,6 +4522,8 @@ int RadosLifecycle::get_entry(const DoutPrefixProvider* dpp, optional_yield y,
   entry.bucket = std::move(cls_entry.bucket);
   entry.start_time = cls_entry.start_time;
   entry.status = cls_entry.status;
+  entry.mod_time = cls_entry.mod_time;
+  entry.instance = std::move(cls_entry.instance);
   return 0;
 }
 
@@ -4531,6 +4550,8 @@ int RadosLifecycle::get_next_entry(const DoutPrefixProvider* dpp, optional_yield
   entry.bucket = std::move(cls_entry.bucket);
   entry.start_time = cls_entry.start_time;
   entry.status = cls_entry.status;
+  entry.mod_time = cls_entry.mod_time;
+  entry.instance = std::move(cls_entry.instance);
   return 0;
 }
 
@@ -4542,6 +4563,8 @@ int RadosLifecycle::set_entry(const DoutPrefixProvider* dpp, optional_yield y,
   cls_entry.bucket = entry.bucket;
   cls_entry.start_time = entry.start_time;
   cls_entry.status = entry.status;
+  cls_entry.mod_time = entry.mod_time;
+  cls_entry.instance = entry.instance;
 
   librados::ObjectWriteOperation op;
   cls_rgw_lc_set_entry(op, cls_entry);
@@ -4573,7 +4596,7 @@ int RadosLifecycle::list_entries(const DoutPrefixProvider* dpp, optional_yield y
   }
 
   for (auto& entry : cls_entries) {
-    entries.push_back(LCEntry{entry.bucket, entry.start_time, entry.status});
+    entries.push_back(LCEntry{entry.bucket, entry.start_time, entry.status, entry.mod_time, entry.instance});
   }
 
   return ret;
@@ -4586,6 +4609,8 @@ int RadosLifecycle::rm_entry(const DoutPrefixProvider* dpp, optional_yield y,
   cls_entry.bucket = entry.bucket;
   cls_entry.start_time = entry.start_time;
   cls_entry.status = entry.status;
+  cls_entry.mod_time = entry.mod_time;
+  cls_entry.instance = entry.instance;
 
   librados::ObjectWriteOperation op;
   cls_rgw_lc_rm_entry(op, cls_entry);

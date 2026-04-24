@@ -1,0 +1,27 @@
+=============================================================================
+JIRA STOROBJ-1973 [RGW] Add validate only check for PutObjectLockConfiguration
+
+Developer: @vgoot
+Code Review: @sung @alucas
+
+[Description]
+RGWPutBucketObjectLock::execute() do validation only when HTTP_X_RGW_VALIDATE_ONLY is set
+
+
+[File Changed]
+src/rgw/rgw_op.cc
+
+
+=============================================================================
+JIRA STOROBJ-1932 [RGW] Add validate only check for PutBucketVersioning
+
+Developer: @vgoot
+Code Review: @sung @alucas
+
+[Description]
+RGWSetBucketVersioning::execute() do validation only when HTTP_X_RGW_VALIDATE_ONLY is set
+
+
+[File Changed]
+src/rgw/rgw_op.cc
+

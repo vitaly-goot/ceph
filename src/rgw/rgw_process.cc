@@ -270,7 +270,7 @@ int process_request(const RGWProcessEnv& penv,
                     const std::string& frontend_prefix,
                     RGWRestfulIO* const client_io,
                     optional_yield yield,
-		    rgw::dmclock::Scheduler *scheduler,
+                    rgw::dmclock::Scheduler* scheduler,
                     string* user,
                     ceph::coarse_real_clock::duration* latency,
                     int* http_ret)
@@ -291,6 +291,9 @@ int process_request(const RGWProcessEnv& penv,
 
   std::unique_ptr<rgw::sal::User> u = driver->get_user(rgw_user());
   s->set_user(u);
+
+  // Save the (possibly null) UBNS client pointer so we can issue gRPC requests.
+  s->ubns_client = penv.ubns_client;
 
   if (ret < 0) {
     s->cio = client_io;
@@ -404,7 +407,13 @@ int process_request(const RGWProcessEnv& penv,
     s->trace = tracing::rgw::tracer.start_trace(op->name(), s->trace_enabled);
     s->trace->SetAttribute(tracing::rgw::TRANS_ID, s->trans_id);
 
-    ret = rgw_process_authenticated(handler, op, req, s, yield, driver);
+    try {
+      ret = rgw_process_authenticated(handler, op, req, s, yield, driver);
+    } catch (rgw::io::Exception& e) {
+      dout(0) << "rgw_process_authenticated() threw exception: "
+              << e.what() << dendl;
+      ret = -e.code().value();
+    }
     if (ret < 0) {
       abort_early(s, op, ret, handler, yield);
       goto done;
@@ -489,6 +498,7 @@ done:
 
   if (op) {
     op_ret = op->get_ret();
+    req->uri_log_rewrite = op->get_uri_log_rewrite();
     ldpp_dout(op, 2) << "op status=" << op_ret << dendl;
     ldpp_dout(op, 2) << "http status=" << s->err.http_ret << dendl;
   } else {

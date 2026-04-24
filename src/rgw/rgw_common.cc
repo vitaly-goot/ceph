@@ -143,6 +143,10 @@ rgw_http_errors rgw_http_s3_errors({
     { ECANCELED, {409, "ConcurrentModification"}},
     { EDQUOT, {507, "InsufficientCapacity"}},
     { ENOSPC, {507, "InsufficientCapacity"}},
+
+    { ERR_UBNS_INVALID_OR_MISSING_PARAMETER, {400, "InvalidOrMissingParameter"}},
+    { ERR_UBNS_BUCKET_ALREADY_OWNED_BY_YOU, {409, "BucketAlreadyOwnedByYou"}},
+    { ERR_UBNS_BAD_REQUEST, {400, "BadRequest"}},
 });
 
 rgw_http_errors rgw_http_swift_errors({
@@ -407,7 +411,10 @@ void dump(req_state* s)
   if (!s->err.err_code.empty())
     s->formatter->dump_string("Code", s->err.err_code);
   s->formatter->dump_string("Message", s->err.message);
-  if (!s->bucket_name.empty())	// TODO: connect to expose_bucket
+  for (auto extraHeader : s->extra_headers) {
+    s->formatter->dump_string(extraHeader.first, extraHeader.second);
+  }
+  if (!s->bucket_name.empty()) // TODO: connect to expose_bucket
     s->formatter->dump_string("BucketName", s->bucket_name);
   if (!s->trans_id.empty())	// TODO: connect to expose_bucket or another toggle
     s->formatter->dump_string("RequestId", s->trans_id);

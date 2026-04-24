@@ -40,6 +40,13 @@ else
 fi
 
 test -f "ceph-$vers.tar.bz2" || ./make-dist $vers
+
+# Call trivy (Or anything on the command line, but the intent is trivy)
+if [[ -n "$2" ]]; then 
+    echo "** Running extra command '$2'" 
+    $2
+    echo "** Extra command '$2' completed"
+fi
 #
 # rename the tarball to match debian conventions and extract it
 #
@@ -67,15 +74,21 @@ if [ "$chvers" != "$dvers" ]; then
    DEBEMAIL="contact@ceph.com" dch -D $VERSION_CODENAME --force-distribution -b -v "$dvers" "new version"
 fi
 #
+# Add a -j option if $DEB_BUILD_OPTIONS doesn't have parallel=n in it.
+# Default: use half of the available processors
+PARALLEL="parallel"
+echo "DEB_BUILD_OPTIONS " $DEB_BUILD_OPTIONS
+if [[ ! $DEB_BUILD_OPTIONS =~ $PARALLEL ]] ; then
+   : ${NPROC:=$(($(nproc) / 2))}
+   if test $NPROC -gt 1 ; then
+      j=-j${NPROC}
+   fi
+fi
+#
 # create the packages
 # a) with ccache to speed things up when building repeatedly
 # b) do not sign the packages
-# c) use half of the available processors
 #
-: ${NPROC:=$(($(nproc) / 2))}
-if test $NPROC -gt 1 ; then
-    j=-j${NPROC}
-fi
 if [ "$SCCACHE" != "true" ] ; then
     PATH=/usr/lib/ccache:$PATH
 fi

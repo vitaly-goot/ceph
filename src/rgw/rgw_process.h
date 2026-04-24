@@ -7,6 +7,7 @@
 #include "rgw_acl.h"
 #include "rgw_user.h"
 #include "rgw_rest.h"
+#include "rgw_ubns.h"
 #include "include/ceph_assert.h"
 
 #include "common/WorkQueue.h"

@@ -152,6 +152,52 @@ static inline void read_attr(std::map<std::string, bufferlist>& attrs,
   }
 }
 
+/**
+ * Decode restore status and expiry date from an attrs map for the bucket index.
+ * Tries primary first; if a key is missing and fallback is non-null, tries fallback.
+ */
+static void decode_restore_index_fields(
+    const rgw::sal::Attrs& primary,
+    const rgw::sal::Attrs* fallback,
+    uint8_t& restore_status,
+    ceph::real_time& restore_expiry_date)
+{
+  restore_status = 0;
+  restore_expiry_date = {};
+
+  bufferlist rs_bl;
+  if (auto it = primary.find(RGW_ATTR_RESTORE_STATUS); it != primary.end()) {
+    rs_bl = it->second;
+  } else if (fallback) {
+    if (auto it2 = fallback->find(RGW_ATTR_RESTORE_STATUS); it2 != fallback->end()) {
+      rs_bl = it2->second;
+    }
+  }
+  if (rs_bl.length()) {
+    try {
+      rgw::sal::RGWRestoreStatus rs;
+      auto bl_iter = rs_bl.cbegin();
+      decode(rs, bl_iter);
+      restore_status = static_cast<uint8_t>(rs);
+    } catch (buffer::error&) {}
+  }
+
+  bufferlist re_bl;
+  if (auto it = primary.find(RGW_ATTR_RESTORE_EXPIRY_DATE); it != primary.end()) {
+    re_bl = it->second;
+  } else if (fallback) {
+    if (auto it2 = fallback->find(RGW_ATTR_RESTORE_EXPIRY_DATE); it2 != fallback->end()) {
+      re_bl = it2->second;
+    }
+  }
+  if (re_bl.length()) {
+    try {
+      auto bl_iter = re_bl.cbegin();
+      decode(restore_expiry_date, bl_iter);
+    } catch (buffer::error&) {}
+  }
+}
+
 rgw_raw_obj rgw_obj_select::get_raw_obj(RGWRados* store) const
 {
   if (!is_raw) {
@@ -1965,7 +2011,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
                                            shard_id,
 					   cur_marker,
 					   cur_prefix,
-					   params.delim,
+					   (params.ns == RGW_OBJ_NS_MULTIPART) ? "" : params.delim,
 					   read_ahead + 1 - count,
 					   params.list_versions,
 					   attempt,
@@ -2084,24 +2130,18 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	next_marker = index_key;
       }
 
-      if (params.access_list_filter &&
-	  !params.access_list_filter(obj.name, index_key.name)) {
-	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping past filtered out entry \"" << entry.key <<
-	  "\"" << dendl;
-        continue;
-      }
-
-      if (params.prefix.size() &&
-	  0 != obj.name.compare(0, params.prefix.size(), params.prefix)) {
-	ldpp_dout(dpp, 20) << __func__ <<
-	  ": skipping object \"" << entry.key <<
-	  "\" that doesn't match prefix \"" << params.prefix << "\"" << dendl;
-        continue;
-      }
-
+      std::string obj_name = obj.name;
       if (!params.delim.empty()) {
-	const int delim_pos = obj.name.find(params.delim, params.prefix.size());
+        if (params.ns == RGW_OBJ_NS_MULTIPART) {
+          RGWMPObj mp;
+          if(!mp.from_meta(obj.name)) {
+            ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+	    " could not parse mp object name: " << obj.name << dendl;
+            continue;
+	  }
+          obj_name = mp.get_key();
+        }
+	const int delim_pos = obj_name.find(params.delim, params.prefix.size());
 	if (delim_pos >= 0) {
 	  // run either the code where delimiter filtering is done a)
 	  // in the OSD/CLS or b) here.
@@ -2111,10 +2151,10 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	    // find one delimiter at the end if it finds any after the
 	    // prefix
 	    if (delim_pos !=
-		int(obj.name.length() - params.delim.length())) {
+		int(obj_name.length() - params.delim.length())) {
 	      ldpp_dout(dpp, 0) << "WARNING: " << __func__ <<
 		" found delimiter in place other than the end of "
-		"the prefix; obj.name=" << obj.name <<
+		"the prefix; obj_name=" << obj_name <<
 		", prefix=" << params.prefix << dendl;
 	    }
 	    if (common_prefixes) {
@@ -2127,14 +2167,9 @@ int RGWRados::Bucket::List::list_objects_ordered(
 		goto done;
 	      }
 
-	      (*common_prefixes)[obj.name] = true;
+	      (*common_prefixes)[obj_name] = true;
 	      count++;
 	    }
-
-	    ldpp_dout(dpp, 20) << __func__ <<
-	      ": finished entry with common prefix \"" << entry.key <<
-	      "\" so continuing loop (cls filtered)" << dendl;
-	    continue;
 	  } else {
 	    // NOTE: this condition is for older versions of the OSD
 	    // that do not filter on the CLS side, so the following code
@@ -2144,7 +2179,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
 	    /* extract key -with trailing delimiter- for CommonPrefix */
 	    string prefix_key =
-	      obj.name.substr(0, delim_pos + params.delim.length());
+	      obj_name.substr(0, delim_pos + params.delim.length());
 
 	    if (common_prefixes &&
 		common_prefixes->find(prefix_key) == common_prefixes->end()) {
@@ -2161,7 +2196,39 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
 	      count++;
 	    }
+	  } // if we're running an older OSD version
+	} // if a delimiter was found after prefix
+      } // if a delimiter was passed in
 
+      if (params.access_list_filter &&
+	  ! params.access_list_filter(obj.name, index_key.name)) {
+	ldpp_dout(dpp, 20) << __func__ <<
+	  ": skipping past access_list_filter objects, including \"" << entry.key 
+	  << "\" obj.name \"" << obj.name << "\" index_key.name \"" << index_key.name 
+	  << "\" params.delim \"" << params.delim << "\" params.prefix \"" << params.prefix <<
+	  "\"" << dendl;
+        continue;
+      }
+
+      if (params.prefix.size() &&
+	  0 != obj.name.compare(0, params.prefix.size(), params.prefix)) {
+	ldpp_dout(dpp, 20) << __func__ <<
+	  ": skipping object \"" << entry.key <<
+	  "\" that doesn't match prefix \"" << params.prefix << "\"" << dendl;
+        continue;
+      }
+
+      if (!params.delim.empty()) {
+	const int delim_pos = obj_name.find(params.delim, params.prefix.size());
+	if (delim_pos >= 0) {
+	  // run either the code where delimiter filtering is done a)
+	  // in the OSD/CLS or b) here.
+	  if (cls_filtered) {
+	    ldpp_dout(dpp, 20) << __func__ <<
+	      ": finished entry with common prefix \"" << entry.key <<
+	      "\" so continuing loop (cls filtered)" << dendl;
+	    continue;
+	  } else {
 	    ldpp_dout(dpp, 20) << __func__ <<
 	      ": finished entry with common prefix \"" << entry.key <<
 	      "\" so continuing loop (not cls filtered)" << dendl;
@@ -3393,6 +3460,12 @@ int RGWRados::Object::Write::_do_write_meta(uint64_t size, uint64_t accounted_si
     }
   }
 
+  // extract restore fields for bucket index
+  uint8_t idx_restore_status = 0;
+  ceph::real_time idx_restore_expiry_date;
+  decode_restore_index_fields(attrs, nullptr,
+                              idx_restore_status, idx_restore_expiry_date);
+
   if (!op.size())
     return 0;
 
@@ -3453,7 +3526,8 @@ int RGWRados::Object::Write::_do_write_meta(uint64_t size, uint64_t accounted_si
                         meta.set_mtime, etag, content_type,
                         storage_class, meta.owner,
 			 meta.category, meta.remove_objs, rctx.y,
-			 meta.user_data, meta.appendable, log_op);
+			 meta.user_data, meta.appendable, log_op,
+			 idx_restore_status, idx_restore_expiry_date);
   tracepoint(rgw_rados, complete_exit, req_id.c_str());
   if (r < 0)
     goto done_cancel;
@@ -4056,6 +4130,12 @@ int RGWRados::reindex_obj(rgw::sal::Driver* driver,
   read_attr(attr_set, RGW_ATTR_OLH_INFO, olh_info_bl, &found_olh_info);
   read_attr(attr_set, RGW_ATTR_APPEND_PART_NUM, part_num_bl, &appendable);
 
+  // extract restore fields for bucket index
+  uint8_t idx_restore_status = 0;
+  ceph::real_time idx_restore_expiry_date;
+  decode_restore_index_fields(attr_set, nullptr,
+                              idx_restore_status, idx_restore_expiry_date);
+
   // check for a pure OLH object and if so exit early
   if (found_olh_info) {
     try {
@@ -4101,7 +4181,10 @@ int RGWRados::reindex_obj(rgw::sal::Driver* driver,
 			    nullptr, // remove_objs list
 			    y,
 			    nullptr, // user data string
-			    appendable);
+			    appendable,
+			    true, // log_op
+			    idx_restore_status,
+			    idx_restore_expiry_date);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
       ": update index complete for " << p(head_obj) << " returned: " <<
@@ -4123,6 +4206,8 @@ int RGWRados::reindex_obj(rgw::sal::Driver* driver,
     meta.etag = etag;
     meta.content_type = content_type;
     meta.appendable = appendable;
+    meta.restore_status = idx_restore_status;
+    meta.restore_expiry_date = idx_restore_expiry_date;
 
     ret = link_helper(false, meta, "linking version");
   } // if bucket is versioned
@@ -5006,7 +5091,7 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   if (lh != attrs.end())
     src_attrs[RGW_ATTR_OBJECT_LEGAL_HOLD] = lh->second;
 
-  if (dest_bucket_info.flags & BUCKET_VERSIONS_SUSPENDED) {
+  if (!dest_bucket_info.versioning_enabled()) {
     src_attrs.erase(RGW_ATTR_OLH_ID_TAG);
     src_attrs.erase(RGW_ATTR_OLH_INFO);
     src_attrs.erase(RGW_ATTR_OLH_VER);
@@ -5020,6 +5105,19 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   attrs.erase(RGW_ATTR_ID_TAG);
   attrs.erase(RGW_ATTR_PG_VER);
   attrs.erase(RGW_ATTR_SOURCE_ZONE);
+  // When the target bucket isn't versioned or has versioning suspended,
+  // DO NOT copy OLH attributes.
+  if (!dest_bucket_info.versioned() ||
+      dest_bucket_info.flags & BUCKET_VERSIONS_SUSPENDED) {
+    auto iter = attrs.lower_bound(RGW_ATTR_OLH_PREFIX);
+    while (iter != attrs.end()) {
+      if (!boost::algorithm::starts_with(iter->first, RGW_ATTR_OLH_PREFIX)) {
+        break;
+      }
+      iter = attrs.erase(iter);
+    }
+  }
+
   map<string, bufferlist>::iterator cmp = src_attrs.find(RGW_ATTR_COMPRESSION);
   if (cmp != src_attrs.end())
     attrs[RGW_ATTR_COMPRESSION] = cmp->second;
@@ -6501,8 +6599,10 @@ int RGWRados::Object::Delete::delete_obj(optional_yield y,
     if (add_log) {
       r = add_datalog_entry(dpp, store->svc.datalog_rados,
 			    target->get_bucket_info(), bs->shard_id, y);
-      ldpp_dout(dpp, 0) << "failed to write datalog for object: r=" << r << dendl;
-      return r;
+      if (r < 0) {
+        ldpp_dout(dpp, 0) << "failed to write datalog for object: r=" << r << dendl;
+        return r;
+      }
     }
 
     return 0;
@@ -7000,11 +7100,11 @@ int RGWRados::get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
   RGWObjStateManifest* sm = nullptr;
   int r = get_obj_state(dpp, rctx, bucket_info, obj, &sm,
                         follow_olh, y, assume_noent);
-  if (r < 0) {
-    return r;
-  }
   if (pstate) {
     *pstate = &sm->state;
+  }
+  if (r < 0) {
+    return r;
   }
   if (pmanifest) {
     if (sm->manifest) {
@@ -7385,7 +7485,20 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
   if (!op.size())
     return 0;
 
+  // remove replication-trace attr to be able to re-replicate an object when metadata changes
   bufferlist bl;
+  const string replication_trace = RGW_ATTR_OBJ_REPLICATION_TRACE;
+  bool removed_attr{false};
+  r = state->get_attr(replication_trace, bl);
+  if (r < 0) {
+    ldpp_dout(dpp, 10) << "ERROR: cannot remove attr " << replication_trace.c_str() << dendl;
+  } else {
+    op.rmxattr(replication_trace.c_str());
+    removed_attr = true;
+  }
+
+  bl.clear();
+
   RGWRados::Bucket bop(this, bucket_info);
   RGWRados::Bucket::UpdateIndex index_op(&bop, obj);
 
@@ -7448,33 +7561,52 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
       }
       int64_t poolid = ioctx.get_id();
 
-      // Retain Object category as CloudTiered while restore is in
-      // progress or failed or if its temporarily restored copy
+      /*
+       * Retain Object category as CloudTiered while restore is in
+       * progress or failed or if its temporarily restored copy.
+       * Check new attrs first, fall back to existing attrs for partial updates.
+       */
       RGWObjCategory category = RGWObjCategory::Main;
-      auto r_iter = attrs.find(RGW_ATTR_RESTORE_STATUS);
-      auto t_iter = attrs.find(RGW_ATTR_RESTORE_TYPE);
-      if (r_iter != attrs.end()) {
-        rgw::sal::RGWRestoreStatus st = rgw::sal::RGWRestoreStatus::None;
-        auto iter = r_iter->second.cbegin();
-
+      bufferlist rs_bl, rt_bl;
+      if (auto it = attrs.find(RGW_ATTR_RESTORE_STATUS); it != attrs.end()) {
+        rs_bl = it->second;
+      } else if (auto it2 = state->attrset.find(RGW_ATTR_RESTORE_STATUS);
+                 it2 != state->attrset.end()) {
+        rs_bl = it2->second;
+      }
+      if (rs_bl.length()) {
         try {
           using ceph::decode;
-          decode(st, iter);
+          rgw::sal::RGWRestoreStatus st = rgw::sal::RGWRestoreStatus::None;
+          auto bl_iter = rs_bl.cbegin();
+          decode(st, bl_iter);
 
           if (st != rgw::sal::RGWRestoreStatus::CloudRestored) {
             category = RGWObjCategory::CloudTiered;
           } else { // check if its temporary copy
-            if (t_iter != attrs.end()) {
+            if (auto it = attrs.find(RGW_ATTR_RESTORE_TYPE); it != attrs.end()) {
+              rt_bl = it->second;
+            } else if (auto it2 = state->attrset.find(RGW_ATTR_RESTORE_TYPE);
+                       it2 != state->attrset.end()) {
+              rt_bl = it2->second;
+            }
+            if (rt_bl.length()) {
               rgw::sal::RGWRestoreType rt;
-              decode(rt, t_iter->second);
+              decode(rt, rt_bl);
 
               if (rt == rgw::sal::RGWRestoreType::Temporary) {
                 category = RGWObjCategory::CloudTiered;
                 // temporary restore; set storage-class to cloudtier storage class
-                auto c_iter = attrs.find(RGW_ATTR_CLOUDTIER_STORAGE_CLASS);
-
-                if (c_iter != attrs.end()) {
-                  storage_class = rgw_bl_str(c_iter->second);
+                bufferlist sc_bl;
+                if (auto it = attrs.find(RGW_ATTR_CLOUDTIER_STORAGE_CLASS);
+                    it != attrs.end()) {
+                  sc_bl = it->second;
+                } else if (auto it2 = state->attrset.find(RGW_ATTR_CLOUDTIER_STORAGE_CLASS);
+                           it2 != state->attrset.end()) {
+                  sc_bl = it2->second;
+                }
+                if (sc_bl.length()) {
+                  storage_class = rgw_bl_str(sc_bl);
                 }
               }
             }
@@ -7482,10 +7614,17 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
         } catch (buffer::error& err) {
         }
       }
+      // extract restore fields for index, with partial-update fallback
+      uint8_t idx_restore_status = 0;
+      ceph::real_time idx_restore_expiry_date;
+      decode_restore_index_fields(attrs, &state->attrset,
+                                  idx_restore_status, idx_restore_expiry_date);
+
 	    ldpp_dout(dpp, 20) << "Setting obj category:" << category << ", storage_class:" << storage_class << dendl;
       r = index_op.complete(dpp, poolid, epoch, state->size, state->accounted_size,
                             mtime, etag, content_type, storage_class, owner,
-                            category, nullptr, y, nullptr, false, log_op);
+                            category, nullptr, y, nullptr, false, log_op,
+                            idx_restore_status, idx_restore_expiry_date);
     } else {
       int ret = index_op.cancel(dpp, nullptr, y, log_op);
       if (ret < 0) {
@@ -7502,6 +7641,10 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
       for (iter = rmattrs->begin(); iter != rmattrs->end(); ++iter) {
         state->attrset.erase(iter->first);
       }
+    }
+
+    if (removed_attr) {
+        state->attrset.erase(replication_trace);
     }
 
     for (iter = attrs.begin(); iter != attrs.end(); ++iter) {
@@ -7893,7 +8036,9 @@ int RGWRados::Bucket::UpdateIndex::complete(const DoutPrefixProvider *dpp, int64
 					    optional_yield y,
 					    const string *user_data,
                                             bool appendable,
-                                            bool log_op)
+                                            bool log_op,
+					    uint8_t restore_status,
+					    ceph::real_time restore_expiry_date)
 {
   if (blind) {
     return 0;
@@ -7921,6 +8066,8 @@ int RGWRados::Bucket::UpdateIndex::complete(const DoutPrefixProvider *dpp, int64
   ent.meta.owner_display_name = owner.display_name;
   ent.meta.content_type = content_type;
   ent.meta.appendable = appendable;
+  ent.meta.restore_status = restore_status;
+  ent.meta.restore_expiry_date = restore_expiry_date;
 
   bool add_log = log_op && store->svc.zone->need_to_log_data();
 
@@ -9148,6 +9295,11 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
       ldpp_dout(dpp, 20) << "olh_log_entry: epoch=" << iter->first << " op=" << (int)entry.op
                      << " key=" << entry.key.name << "[" << entry.key.instance << "] "
                      << (entry.delete_marker ? "(delete)" : "") << dendl;
+
+      if (link_epoch == iter->first)
+        ldpp_dout(dpp, 1) << "apply_olh_log epoch collision detected for " << entry.key
+                          << "; incoming op: " << entry.op << "(" << entry.op_tag << ")" << dendl;
+
       switch (entry.op) {
       case CLS_RGW_OLH_OP_REMOVE_INSTANCE:
         remove_instances.push_back(entry.key);
@@ -9685,6 +9837,8 @@ int RGWRados::follow_olh(const DoutPrefixProvider *dpp, RGWBucketInfo& bucket_in
   }
 
   if (olh.removed) {
+    /* the object is a delete marker */
+    state->is_dm = true;
     return -ENOENT;
   }
 

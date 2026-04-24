@@ -75,6 +75,7 @@ extern "C" {
 #include "rgw_pubsub.h"
 #include "rgw_bucket_sync.h"
 #include "rgw_lua.h"
+#include "rgw_secret_encryption.h"
 #include "rgw_sal.h"
 #include "rgw_sal_config.h"
 #include "rgw_data_access.h"
@@ -4582,6 +4583,12 @@ int main(int argc, const char **argv)
        OPT::OBJECT_REWRITE
     };
 
+    // Must be initialized before creating the storage store object.
+    rgw::secret::init_encrypter(g_ceph_context,
+                                g_conf().get_val<bool>("rgw_secret_encrypt_enabled"),
+                                g_conf().get_val<std::string>("rgw_secret_encrypt_key_file"),
+                                g_conf().get_val<uint64_t>("rgw_secret_encrypt_key_reload_interval"));
+
     raw_storage_op = (raw_storage_ops_list.find(opt_cmd) != raw_storage_ops_list.end() ||
 			   raw_period_update || raw_period_pull);
     bool need_cache = readonly_ops_list.find(opt_cmd) == readonly_ops_list.end();
@@ -4881,41 +4888,22 @@ int main(int argc, const char **argv)
       break;
     case OPT::PERIOD_PULL:
       {
-        boost::optional<RGWRESTConn> conn;
-        RGWRESTConn *remote_conn = nullptr;
         if (url.empty()) {
-          // load current period for endpoints
-          RGWRealm realm;
-          int ret = rgw::read_realm(dpp(), null_yield, cfgstore.get(),
-                                    realm_id, realm_name, realm);
-          if (ret < 0 ) {
-            cerr << "failed to load realm: " << cpp_strerror(-ret) << std::endl;
-            return -ret;
-          }
-          period_id = realm.current_period;
-
-          RGWPeriod current_period;
-          ret = cfgstore->read_period(dpp(), null_yield, period_id,
-                                      std::nullopt, current_period);
-          if (ret < 0) {
-            cerr << "failed to load current period: " << cpp_strerror(-ret) << std::endl;
-            return -ret;
-          }
-          if (remote.empty()) {
-            // use realm master zone as remote
-            remote = current_period.get_master_zone().id;
-          }
-          conn = get_remote_conn(static_cast<rgw::sal::RadosStore*>(driver), current_period.get_map(), remote);
-          if (!conn) {
-            cerr << "failed to find a zone or zonegroup for remote "
-                << remote << std::endl;
-            return -ENOENT;
-          }
-          remote_conn = &*conn;
+          cerr << "A --url must be provided." << std::endl;
+          return EINVAL;
         }
+        // load realm for current period
+        RGWRealm realm;
+        int ret = rgw::read_realm(dpp(), null_yield, cfgstore.get(),
+                                  realm_id, realm_name, realm);
+        if (ret < 0 ) {
+          cerr << "failed to load realm: " << cpp_strerror(-ret) << std::endl;
+          return -ret;
+        }
+        period_id = realm.current_period;
 
         RGWPeriod period;
-        int ret = do_period_pull(cfgstore.get(), remote_conn, url,
+        ret = do_period_pull(cfgstore.get(), nullptr, url,
                                  opt_region, access_key, secret_key,
                                  realm_id, realm_name, period_id, period_epoch,
                                  &period);
@@ -9324,6 +9312,13 @@ next:
 	      "%a, %d %b %Y %T %Z", std::gmtime(&t))) {
 	  formatter->dump_string("started", exp_buf);
 	}
+        // heartbeat/mod_time human readable time
+        time_t mt = time_t(entry.mod_time);
+        if (std::strftime(exp_buf, sizeof(exp_buf), "%a, %d %b %Y %T %Z", std::gmtime(&mt))) {
+          formatter->dump_string("mod_time", exp_buf);
+        }
+        // instance (may be empty for legacy entries)
+        formatter->dump_string("instance", entry.instance);
         formatter->dump_string("status", LC_STATUS[entry.status]);
         formatter->close_section(); // objs
         formatter->flush(cout);
@@ -9750,8 +9745,8 @@ next:
         std::string err_msg;
         int ret = rgw::account::list_users(
             dpp(), driver, op_state, path_prefix, marker,
-            max_entries_specified, max_entries, err_msg,
-            stream_flusher, null_yield);
+            max_entries_specified, max_entries, account_root,
+            err_msg, stream_flusher, null_yield);
         if (ret < 0)  {
           cerr << "ERROR: " << err_msg << std::endl;
           return -ret;

@@ -458,6 +458,11 @@ rgw::auth::Strategy::authenticate(const DoutPrefixProvider* dpp, const req_state
       engine_result = engine.authenticate(dpp, s, y);
     } catch (const int err) {
       engine_result = result_t::deny(err);
+    } catch (...) {
+      /* STOROBJ-2831: Some exceptions are not being caught on Debian builds.
+       * This is a temporary measure to catch all exceptions and log them. */
+      ldpp_dout(dpp, 0) << "caught unknown exception type in rgw::auth::Strategy::authenticate, return deny(-EACCES)" << dendl;
+      engine_result = result_t::deny(-EACCES);
     }
 
     bool try_next = true;
@@ -522,9 +527,13 @@ rgw::auth::Strategy::apply(const DoutPrefixProvider *dpp, const rgw::auth::Strat
         result = result_t::deny(-EPERM);
         set_req_state_err(s, -EPERM, "Presigned URLs are disabled by admin");
       }
+
+      s->err.message = result.get_message();
+      for (const auto& extraHeader : result.get_extra_headers()) {
+          s->extra_headers.emplace_back(extraHeader.first, extraHeader.second);
+      }
       return result.get_reason();
     }
-
     try {
       rgw::auth::IdentityApplier::aplptr_t applier = result.get_applier();
       rgw::auth::Completer::cmplptr_t completer = result.get_completer();

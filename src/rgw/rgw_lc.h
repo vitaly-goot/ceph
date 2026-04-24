@@ -562,6 +562,8 @@ public:
 };
 WRITE_CLASS_ENCODER(RGWLifecycleConfiguration)
 
+namespace ceph::async { class spawn_throttle; }
+
 class RGWLC : public DoutPrefixProvider {
   CephContext *cct;
   rgw::sal::Driver* driver;
@@ -574,8 +576,6 @@ class RGWLC : public DoutPrefixProvider {
 
 public:
 
-  class WorkPool;
-
   class LCWorker : public Thread
   {
     const DoutPrefixProvider *dpp;
@@ -584,7 +584,6 @@ public:
     int ix;
     std::mutex lock;
     std::condition_variable cond;
-    WorkPool* workpool{nullptr};
     /* save the target bucket names created as part of object transition
      * to cloud. This list is maintained for the duration of each RGWLC::process()
      * post which it is discarded. */
@@ -612,7 +611,6 @@ public:
 
     friend class RGWRados;
     friend class RGWLC;
-    friend class WorkQ;
   }; /* LCWorker */
 
   friend class RGWRados;
@@ -642,11 +640,13 @@ public:
   int process(int index, int max_lock_secs, LCWorker* worker, bool once);
   int process_bucket(int index, int max_lock_secs, LCWorker* worker,
 		     const std::string& bucket_entry_marker, bool once);
-  bool expired_session(time_t started);
+  bool expired_session(time_t started, uint64_t mod_time = 0);
   time_t thread_stop_at();
   int list_lc_progress(std::string& marker, uint32_t max_entries,
 		       std::vector<rgw::sal::LCEntry>&,
 		       int& index);
+  int bucket_lc_process(std::string& shard_id, LCWorker* worker, time_t stop_at,
+			bool once, boost::asio::yield_context yield);
   int bucket_lc_process(std::string& shard_id, LCWorker* worker, time_t stop_at,
 			bool once);
   int bucket_lc_post(int index, int max_lock_sec,
@@ -673,6 +673,8 @@ public:
 
   int handle_multipart_expiration(rgw::sal::Bucket* target,
 				  const std::multimap<std::string, lc_op>& prefix_map,
+				  ceph::async::spawn_throttle& workpool,
+				  boost::asio::yield_context yield,
 				  LCWorker* worker, time_t stop_at, bool once);
 };
 

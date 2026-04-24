@@ -1,0 +1,7 @@
+Package: osd-debugger
+Version: 1.0-1
+Section: base
+Priority: optional
+Architecture: all
+Maintainer: Vitaly Goot <vgoot@akamai.com>
+Description: A collection of scripts for osd debugging.

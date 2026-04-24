@@ -189,6 +189,19 @@ target_link_libraries(ceph_test_rgw_obj
   )
 install(TARGETS ceph_test_rgw_obj DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+set(test_rgw_secret_encrypt_srcs test_rgw_secret_encrypt.cc)
+add_executable(unittest_rgw_secret_encrypt
+  ${test_rgw_secret_encrypt_srcs}
+  )
+add_ceph_unittest(unittest_rgw_secret_encrypt)
+target_link_libraries(unittest_rgw_secret_encrypt
+  ${rgw_libs}
+  global
+  ${CMAKE_DL_LIBS}
+  ${UNITTEST_LIBS}
+  ${CRYPTO_LIBS}
+  )
+
 set(test_rgw_crypto_srcs test_rgw_crypto.cc)
 add_executable(unittest_rgw_crypto
   ${test_rgw_crypto_srcs}
@@ -352,6 +365,15 @@ target_link_libraries(radosgw-cr-test ${rgw_libs} librados
   ${CURL_LIBRARIES} ${EXPAT_LIBRARIES} ${BLKID_LIBRARIES}
   GTest::GTest)
 
+add_executable(unittest_rgw_grpc
+  test_rgw_grpc.cc test_rgw_grpc_util.h
+)
+add_ceph_unittest(unittest_rgw_grpc)
+target_link_libraries(unittest_rgw_grpc
+  ${UNITTEST_LIBS}
+  ${rgw_libs}
+)
+
 if(WITH_RADOSGW_POSIX)
   # unittest_posix_bucket_cache
   add_executable(unittest_posix_bucket_cache
@@ -387,3 +409,14 @@ target_link_libraries(ceph_test_datalog
   ${UNITTEST_LIBS}
   ${rgw_libs})
 install(TARGETS ceph_test_datalog DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(unittest_rgw_expat_mitigations test_rgw_expat_mitigations.cc)
+add_ceph_unittest(unittest_rgw_expat_mitigations)
+target_link_libraries(unittest_rgw_expat_mitigations ${EXPAT_LIBRARIES} ${rgw_libs})
+
+add_executable(unittest_rgw_ubns test_rgw_ubns.cc test_rgw_grpc_util.h)
+add_ceph_unittest(unittest_rgw_ubns)
+target_link_libraries(unittest_rgw_ubns
+  ${UNITTEST_LIBS}
+  ${rgw_libs}
+)

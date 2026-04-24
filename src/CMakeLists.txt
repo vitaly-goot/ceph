@@ -478,6 +478,7 @@ target_compile_definitions(common-objs PRIVATE
 if(WITH_JAEGER)
   add_dependencies(common-objs jaeger_base)
   target_link_libraries(common-objs jaeger_base)
+  target_compile_definitions(common-objs INTERFACE HAVE_ABSEIL)
 endif()
 
 CHECK_C_COMPILER_FLAG("-fvar-tracking-assignments" HAS_VTA)

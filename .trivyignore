@@ -1,0 +1,11 @@
+# No impact in our settings (Critical CVE)
+CVE-2020-26892
+CVE-2017-5645
+CVE-2021-44228
+CVE-2021-45046
+CVE-2024-47561
+CVE-2024-45337 
+#CVE-2021-28834
+# No impact in our settings (High CVE)
+# We currently don't scan for High
+# but if we do, this is where to put ignore

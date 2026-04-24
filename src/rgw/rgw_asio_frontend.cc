@@ -289,8 +289,6 @@ void handle_connection(boost::asio::io_context& context,
       return;
     }
 
-    bool expect_continue = (message[http::field::expect] == "100-continue");
-
     {
       auto lock = pause_mutex.async_lock_shared(yield[ec]);
       if (ec == boost::asio::error::operation_aborted) {
@@ -346,10 +344,14 @@ void handle_connection(boost::asio::io_context& context,
                       scheduler, &user, &latency, &http_ret);
 
       if (cct->_conf->subsys.should_gather(ceph_subsys_rgw_access, 1)) {
+        const auto& uri = message.target();
+        std::string uri_str(uri.data(), uri.size());
+        std::string log_uri = req.uri_log_rewrite ? (*req.uri_log_rewrite)(uri_str) : uri_str;
         // access log line elements begin per Apache Combined Log Format with additions following
         lsubdout(cct, rgw_access, 1) << "beast: " << std::hex << &req << std::dec << ": "
             << remote_endpoint.address() << " - " << user << " [" << log_apache_time{started} << "] \""
-            << message.method_string() << ' ' << message.target() << ' '
+            << message.method_string() << ' ' 
+            << log_uri << ' '
             << http_version{message.version()} << "\" " << http_ret << ' '
             << client.get_bytes_sent() + client.get_bytes_received() << ' '
             << log_header{message, http::field::referer, "\""} << ' '
@@ -365,18 +367,14 @@ void handle_connection(boost::asio::io_context& context,
         return;
       }
 
-      if (real_client.sent_100_continue()) {
-        expect_continue = false;
+      if (!real_client.keep_alive()) {
+        return;
       }
-    }
-
-    if (!parser.keep_alive()) {
-      return;
     }
 
     // if we failed before reading the entire message, discard any remaining
     // bytes before reading the next
-    while (!expect_continue && !parser.is_done()) {
+    while (!parser.is_done()) {
       static std::array<char, 1024*1024> discard_buffer;
 
       auto& body = parser.get().body();

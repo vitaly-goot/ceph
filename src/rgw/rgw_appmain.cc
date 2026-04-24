@@ -59,6 +59,7 @@
 #include "rgw_kmip_client.h"
 #include "rgw_kmip_client_impl.h"
 #include "rgw_perf_counters.h"
+#include "rgw_secret_encryption.h"
 #include "rgw_signal.h"
 #ifdef WITH_ARROW_FLIGHT
 #include "rgw_flight_frontend.h"
@@ -245,6 +246,12 @@ int rgw::AppMain::init_storage()
   auto run_sync =
     (g_conf()->rgw_run_sync_thread &&
       ((!nfs) || (nfs && g_conf()->rgw_nfs_run_sync_thread)));
+
+  // Initialize before storage store is open
+  rgw::secret::init_encrypter(g_ceph_context,
+                              g_conf().get_val<bool>("rgw_secret_encrypt_enabled"),
+                              g_conf().get_val<std::string>("rgw_secret_encrypt_key_file"),
+                              g_conf().get_val<uint64_t>("rgw_secret_encrypt_key_reload_interval"));
 
   need_context_pool();
   DriverManager::Config cfg = DriverManager::get_config(false, g_ceph_context);
@@ -453,11 +460,32 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
   ratelimiter.reset(new ActiveRateLimiter{dpp->get_cct()});
   ratelimiter->start();
 
+  /* Initialise Akamai UBNS. We have to explicitly pass this pointer around a
+   * fair bit in v17, via process_request() and into req_state, the 's'
+   * pointer that all operations receive. We end up placing it in the
+   * ProcessEnv, because in v18 it's a tiny bit better due to
+   * process_request() already taking a ProcessEnv* rather than an explicit
+   * list of pointers to various items.
+   */
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
+  if (g_conf()->rgw_ubns_enabled) {
+    if (!rgw::ubns_validate_startup_configuration(g_conf()) != 0) {
+      derr << "FATAL: UBNS configuration is invalid" << dendl;
+      return EINVAL;
+    }
+    dout(1) << "Akamai UBNS enabled" << dendl;
+    ubns_client = std::make_shared<rgw::UBNSClient>();
+    ubns_client->init(dpp->get_cct(), "");
+  } else {
+    dout(1) << "Akamai UBNS present but disabled" << dendl;
+  }
+
   // initialize RGWProcessEnv
   env.rest = &rest;
   env.auth_registry = rgw::auth::StrategyRegistry::create(
       dpp->get_cct(), *implicit_tenant_context, env.driver);
   env.ratelimiting = ratelimiter.get();
+  env.ubns_client = ubns_client;
 
   int fe_count = 0;
   for (multimap<string, RGWFrontendConfig *>::iterator fiter = fe_map.begin();

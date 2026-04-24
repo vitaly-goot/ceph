@@ -49,6 +49,8 @@ struct RGWProcessEnv {
   RGWREST *rest = nullptr;
   std::unique_ptr<OpsLogSink> olog;
   std::unique_ptr<rgw::auth::StrategyRegistry> auth_registry;
+  // Point (optionally) to the ubns_client, with its persistent gRPC channel.
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
   ActiveRateLimiter* ratelimiting = nullptr;
 
 #ifdef WITH_ARROW_FLIGHT

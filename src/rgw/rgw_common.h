@@ -46,6 +46,7 @@
 #include "rgw_tag.h"
 #include "rgw_op_type.h"
 #include "rgw_sync_policy.h"
+#include "rgw_ubns.h"
 #include "cls/version/cls_version_types.h"
 #include "cls/user/cls_user_types.h"
 #include "cls/rgw/cls_rgw_types.h"
@@ -353,6 +354,11 @@ inline constexpr const char* RGW_REST_STS_XMLNS =
 #define ERR_BUSY_RESHARDING      2300 // also in cls_rgw_types.h, don't change!
 #define ERR_NO_SUCH_ENTITY       2301
 #define ERR_LIMIT_EXCEEDED       2302
+
+// UBNS-specific errors
+#define ERR_UBNS_INVALID_OR_MISSING_PARAMETER 12001
+#define ERR_UBNS_BUCKET_ALREADY_OWNED_BY_YOU 12002
+#define ERR_UBNS_BAD_REQUEST 12003
 
 // STS Errors
 #define ERR_PACKED_POLICY_TOO_LARGE 2400
@@ -1291,6 +1297,7 @@ struct req_state : DoutPrefixProvider {
   RGWRateLimitInfo bucket_ratelimit;
   std::string ratelimit_bucket_marker;
   std::string ratelimit_user_name;
+  std::shared_ptr<rgw::UBNSClient> ubns_client;
   bool content_started{false};
   RGWFormat format{RGWFormat::PLAIN};
   ceph::Formatter *formatter{nullptr};
@@ -1300,6 +1307,9 @@ struct req_state : DoutPrefixProvider {
   int64_t content_length{0};
   std::map<std::string, std::string> generic_attrs;
   rgw_err err;
+  // A place to hold stuff to be returned to the client
+  // This is most likely stuff for error responses, but could be anything.
+  std::vector<std::pair<std::string_view, std::string>> extra_headers;
   bool expect_cont{false};
   uint64_t obj_size{0};
   bool enable_ops_log;
