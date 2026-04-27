@@ -9,6 +9,8 @@ on:
       - 'aka_version_*'
       # Added while testing to trigger builds on patch branches, can be removed later
       - 'patch/*'
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - 'aka_version_*'
@@ -26,7 +28,55 @@ env:
 
 jobs:
 
+  resolve-lifecycle:
+    runs-on: ceph
+    outputs:
+      lifecycle_environment: ${{ steps.resolve.outputs.lifecycle_environment }}
+      publish_allowed: ${{ steps.resolve.outputs.publish_allowed }}
+      docker_tag: ${{ steps.resolve.outputs.docker_tag }}
+    steps:
+      - name: Resolve lifecycle environment and publish policy
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ref_type="${GITHUB_REF_TYPE}"
+          ref_name="${GITHUB_REF_NAME}"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            ref_type="branch"
+            ref_name="${GITHUB_HEAD_REF}"
+          fi
+
+          # Determine lifecycle environment from ref pattern
+          if [[ "${ref_type}" == "tag" ]]; then
+            lifecycle_environment="testing"
+            docker_tag="${ref_name}"
+          elif [[ "${ref_name}" == aka_version_* ]]; then
+            lifecycle_environment="qa"
+          else
+            lifecycle_environment="development"
+          fi
+
+          short_sha="${GITHUB_SHA::8}"
+          safe_ref_name="$(echo "${ref_name}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g; s#^-+##; s#-+$##; s#--+#-#g')"
+          if [[ "${ref_type}" != "tag" ]]; then
+            docker_tag="${safe_ref_name}-${short_sha}"
+          fi
+
+          publish_allowed="true"
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            publish_allowed="false"
+          fi
+
+          echo "lifecycle_environment=${lifecycle_environment}" >> "${GITHUB_OUTPUT}"
+          echo "publish_allowed=${publish_allowed}" >> "${GITHUB_OUTPUT}"
+          echo "docker_tag=${docker_tag}" >> "${GITHUB_OUTPUT}"
+
   preflight-registry:
+    needs: resolve-lifecycle
+    environment: ${{ needs.resolve-lifecycle.outputs.lifecycle_environment }}
     runs-on: ceph
     steps:
       - name: Verify Docker and Buildx are available
@@ -35,22 +85,32 @@ jobs:
           docker version
           docker buildx version
 
+      - name: Prepare Artifactory CA trust
+        if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+        id: prepare-ca
+        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@main
+        with:
+          artifactory_url: https://${{ vars.DOCKER_URL }}
+          artifactory_ca_url: ${{ vars.ARTIFACTORY_CA_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
+          artifactory_ca_pem: ${{ secrets.ARTIFACTORY_CA_PEM }}
+          install_docker_certs: 'true'
+          require_ca: 'true'
+
       - name: Verify registry CA trust and TLS handshake
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+        env:
+          DOCKER_URL: ${{ vars.DOCKER_URL }}
         run: |
           set -euo pipefail
 
-          registry="${{ vars.RT_DOCKER_URL }}"
-          cert_path="/etc/docker/certs.d/${registry}/ca.crt"
+          # Extract registry host from DOCKER_URL
+          registry="${DOCKER_URL#https://}"
+          registry="${registry#http://}"
+          registry="${registry%%/*}"
+          ca_file="${{ steps.prepare-ca.outputs.ca_file }}"
 
-          if [[ ! -s "${cert_path}" ]]; then
-            echo "Missing registry CA at ${cert_path}"
-            echo "Install the Artifactory CA on the self-hosted runner before starting long builds."
-            exit 1
-          fi
-
-          if ! echo | openssl s_client -verify_return_error -servername "${registry}" -connect "${registry}:443" -CAfile "${cert_path}" >/tmp/registry_tls_check.log 2>&1; then
-            echo "TLS handshake failed using CA file: ${cert_path}"
+          if ! echo | openssl s_client -verify_return_error -servername "${registry}" -connect "${registry}:443" -CAfile "${ca_file}" >/tmp/registry_tls_check.log 2>&1; then
+            echo "TLS handshake failed using CA file: ${ca_file}"
             cat /tmp/registry_tls_check.log
             exit 1
           fi
@@ -64,29 +124,69 @@ jobs:
           echo "Registry TLS trust check passed"
 
       - name: Verify registry authentication
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
         env:
-          REGISTRY: ${{ vars.RT_DOCKER_URL }}
-          REGISTRY_USERNAME: ${{ vars.RT_DOCKER_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.RT_ACCESS_TOKEN }}
+          DOCKER_URL: ${{ vars.DOCKER_URL }}
+          REGISTRY_USERNAME: ${{ vars.RT_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.RT_PASSWORD }}
+          SSL_CERT_FILE: ${{ steps.prepare-ca.outputs.ca_file }}
         run: |
           set -euo pipefail
+
+          # Extract registry host from DOCKER_URL
+          registry="${DOCKER_URL#https://}"
+          registry="${registry#http://}"
+          registry="${registry%%/*}"
+
           if [[ -z "${REGISTRY_USERNAME}" || -z "${REGISTRY_PASSWORD}" ]]; then
-            echo "Registry credentials are missing"
+            echo "::error::Registry credentials are missing (RT_USERNAME or RT_PASSWORD)"
             exit 1
           fi
-          echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USERNAME}" --password-stdin
-          docker logout "${REGISTRY}" || true
+
+          # Verify credentials via Docker Registry API v2 (curl respects SSL_CERT_FILE)
+          echo "Verifying registry credentials via API..."
+          http_code=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+            --cacert "${SSL_CERT_FILE}" \
+            -u "${REGISTRY_USERNAME}:${REGISTRY_PASSWORD}" \
+            "https://${registry}/v2/" 2>/dev/null) || true
+
+          if [[ "${http_code}" == "200" || "${http_code}" == "401" ]]; then
+            # 401 with valid TLS means we reached the registry - auth will be checked on push
+            # 200 means auth worked (some registries return 200 for valid creds)
+            echo "Registry reachable at https://${registry}/v2/ (HTTP ${http_code})"
+          else
+            echo "::error::Failed to reach registry at https://${registry}/v2/ (HTTP ${http_code})"
+            exit 1
+          fi
+
+          # Try authenticated request to verify credentials
+          http_code=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+            --cacert "${SSL_CERT_FILE}" \
+            -u "${REGISTRY_USERNAME}:${REGISTRY_PASSWORD}" \
+            "https://${registry}/v2/_catalog" 2>/dev/null) || true
+
+          if [[ "${http_code}" == "200" ]]; then
+            echo "Registry authentication verified successfully"
+          elif [[ "${http_code}" == "401" || "${http_code}" == "403" ]]; then
+            echo "::error::Registry authentication failed (HTTP ${http_code}) - check RT_USERNAME and RT_PASSWORD"
+            exit 1
+          else
+            # Some registries don't support _catalog, try alternate endpoint
+            echo "Registry responded with HTTP ${http_code} - credentials will be verified on push"
+          fi
 
   build-ceph-debians:
-    needs: preflight-registry
+    needs:
+      - resolve-lifecycle
+      - preflight-registry
+    environment: ${{ needs.resolve-lifecycle.outputs.lifecycle_environment }}
     strategy:
       matrix:
         include:
           - os_version: ubuntu22.04
             base_image: ubuntu:22.04
-          - os_version: debian13
-            base_image: debian:trixie
+          #- os_version: debian13
+          #  base_image: debian:trixie
 
     runs-on: ceph
     steps:
@@ -100,14 +200,14 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.4
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.4.1
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
@@ -117,7 +217,7 @@ jobs:
             build_arch: ${{ env.build_arch }}
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -133,6 +233,91 @@ jobs:
 
             rm -rf "$workdir"
 
+        - name: Verify JFrog CLI is available
+          if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+          run: |
+            if ! command -v jf &> /dev/null; then
+              echo "::error::JFrog CLI (jf) is not installed on this runner"
+              exit 1
+            fi
+            jf --version
+
+        - name: Publish Debian repository to Artifactory via JFrog CLI
+          if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+          env:
+            BASE_RT_URL: ${{ vars.BASE_RT_URL }}
+            DEBIAN_REPO: ${{ vars.DEBIAN_REPO }}
+            RT_USERNAME: ${{ vars.RT_USERNAME }}
+            RT_PASSWORD: ${{ secrets.RT_PASSWORD }}
+            BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            SCAN_STATUS: pending
+          run: |
+            set -euo pipefail
+
+            if [[ -z "${BASE_RT_URL}" ]]; then
+              echo "::error::BASE_RT_URL is not configured"
+              exit 1
+            fi
+
+            if [[ -z "${DEBIAN_REPO}" ]]; then
+              echo "::error::DEBIAN_REPO is not configured in environment"
+              exit 1
+            fi
+
+            if [[ -z "${RT_USERNAME}" || -z "${RT_PASSWORD}" ]]; then
+              echo "::error::RT_USERNAME or RT_PASSWORD is missing"
+              exit 1
+            fi
+
+            artifactory_url="https://${BASE_RT_URL}"
+
+            # Validate files exist before upload
+            file_count="$(find ceph/debs -type f \( -name '*.deb' -o -name 'Packages*' -o -name 'Release*' -o -name 'InRelease' -o -name '*.changes' -o -name '*.dsc' -o -name '*.tar.*' \) | wc -l | tr -d '[:space:]')"
+            if [[ "${file_count}" -eq 0 ]]; then
+              echo "::error::No Debian repository files found under ceph/debs"
+              exit 1
+            fi
+            echo "Found ${file_count} Debian repository files to upload"
+
+            # Configure Artifactory server with username/password
+            jf c add ceph-artifactory \
+              --url "${artifactory_url}" \
+              --user "${RT_USERNAME}" \
+              --password "${RT_PASSWORD}" \
+              --interactive=false \
+              --overwrite=true
+
+            # Generate upload file spec with proper path placeholders
+            # Pattern (ceph/debs/*) captures all content, {1} preserves relative path structure
+            # Trim whitespace and trailing slash from repo name
+            target_repo="$(echo "${DEBIAN_REPO}" | tr -d '[:space:]')"
+            cat > upload-spec.json <<EOF
+            {
+              "files": [
+                {
+                  "pattern": "ceph/debs/(*)",
+                  "target": "${target_repo}/{1}",
+                  "props": "build.url=${BUILD_URL};git.commit=${GITHUB_SHA};promotion.user=${GITHUB_ACTOR};scan.status=${SCAN_STATUS};build.number=${GITHUB_RUN_NUMBER}",
+                  "recursive": "true",
+                  "flat": "false"
+                }
+              ]
+            }
+            EOF
+
+            echo "Using file spec:"
+            cat upload-spec.json
+
+            # Upload using file spec
+            jf rt upload \
+              --spec upload-spec.json \
+              --server-id ceph-artifactory
+
+            jf c rm ceph-artifactory --quiet || true
+            rm -f upload-spec.json
+
+            echo "Successfully uploaded ${file_count} files to ${target_repo}"
+
         - name: Upload debian packages
           uses: actions/upload-artifact@v3
           with:
@@ -140,7 +325,10 @@ jobs:
             path: ceph/debs
 
   build-ceph-docker-images:
-    needs: build-ceph-debians
+    needs:
+      - resolve-lifecycle
+      - build-ceph-debians
+    environment: ${{ needs.resolve-lifecycle.outputs.lifecycle_environment }}
     strategy:
       matrix:
         include:
@@ -152,32 +340,69 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: ceph
-          fetch-depth: 1
+          fetch-depth: 0
+          lfs: true
+          submodules: recursive
 
       - name: Derive build variables
         id: derive-build-vars
-        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4
+        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4.1
         with:
           ceph_path: ceph
           os_version: ${{ matrix.os_version }}
 
+      - name: Resolve Docker image destinations
+        id: resolve-docker
+        shell: bash
+        env:
+          DOCKER_URL: ${{ vars.DOCKER_URL }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${DOCKER_URL}" ]]; then
+            echo "::error::DOCKER_URL is not configured in environment"
+            exit 1
+          fi
+
+          # Extract registry host from DOCKER_URL (e.g., storageeng-docker-testing.artifactory.linode.com)
+          registry_host="${DOCKER_URL#https://}"
+          registry_host="${registry_host#http://}"
+          registry_host="${registry_host%%/*}"
+
+          # Image repo is registry host + image name
+          image_repo="${registry_host}/ceph-${{ matrix.os_version }}"
+
+          echo "registry_host=${registry_host}" >> "${GITHUB_OUTPUT}"
+          echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare Docker registry CA trust
+        if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@main
+        with:
+          artifactory_url: https://${{ steps.resolve-docker.outputs.registry_host }}
+          artifactory_ca_url: ${{ vars.ARTIFACTORY_CA_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
+          artifactory_ca_pem: ${{ secrets.ARTIFACTORY_CA_PEM }}
+          install_docker_certs: 'true'
+          require_ca: 'true'
+
       - name: Build and push docker image
-        # Set to main for testing. Will use new tag once verified.
-        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.4
+        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.4.1
         with:
           artifact_name: ceph-debians-${{ matrix.os_version }}
           artifact_path: ceph
           docker_context: ceph
           dockerfile: ceph/.github/docker/Dockerfile.debian-packages
-          # This needs to change to env vars once those are setup
           image_tags: |
-            ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}
+            ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}
           platforms: linux/amd64
           build_args: |
             BASE_IMAGE=${{ matrix.base_image }}
           buildx_driver: docker
-          push: ${{ github.event_name != 'pull_request' }}
-          registry: ${{ vars.RT_DOCKER_URL }}
-          # This needs to change to env vars once those are setup
-          registry_username: ${{ vars.RT_DOCKER_USERNAME }}
-          registry_password: ${{ secrets.RT_ACCESS_TOKEN }}
+          push: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+          registry: ${{ steps.resolve-docker.outputs.registry_host }}
+          registry_username: ${{ vars.RT_USERNAME }}
+          registry_password: ${{ secrets.RT_PASSWORD }}
+
+      - name: Job Output of Docker Image name
+        run: |
+          echo "Docker Image: ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}"

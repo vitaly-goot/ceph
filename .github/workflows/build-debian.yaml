@@ -27,7 +27,46 @@ env:
 
 jobs:
 
+  resolve-lifecycle:
+    runs-on: ceph
+    outputs:
+      lifecycle_environment: ${{ steps.resolve.outputs.lifecycle_environment }}
+      publish_allowed: ${{ steps.resolve.outputs.publish_allowed }}
+    steps:
+      - name: Resolve lifecycle environment and publish policy
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ref_type="${GITHUB_REF_TYPE}"
+          ref_name="${GITHUB_REF_NAME}"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            ref_type="branch"
+            ref_name="${GITHUB_HEAD_REF}"
+          fi
+
+          # Determine lifecycle environment from ref pattern
+          if [[ "${ref_type}" == "tag" ]]; then
+            lifecycle_environment="testing"
+          elif [[ "${ref_name}" == aka_version_* ]]; then
+            lifecycle_environment="qa"
+          else
+            lifecycle_environment="development"
+          fi
+
+          publish_allowed="true"
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            publish_allowed="false"
+          fi
+
+          echo "lifecycle_environment=${lifecycle_environment}" >> "${GITHUB_OUTPUT}"
+          echo "publish_allowed=${publish_allowed}" >> "${GITHUB_OUTPUT}"
+
   build-ceph-debians:
+    needs: resolve-lifecycle
+    environment: ${{ needs.resolve-lifecycle.outputs.lifecycle_environment }}
     strategy:
       matrix:
         include:
@@ -40,19 +79,20 @@ jobs:
           with:
             path: ceph
             fetch-depth: 0
+            fetch-tags: true
             lfs: true
             submodules: recursive
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.4
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.4.1
           with:
             ceph_path: ceph
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
@@ -63,7 +103,7 @@ jobs:
             enable_ccache: ${{ env.enable_ccache }}
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -79,6 +119,91 @@ jobs:
             workdir="$(find ceph/debs -mindepth 2 -maxdepth 2 -type d -name WORKDIR -print -quit)"
 
             rm -rf "$workdir"
+
+        - name: Verify JFrog CLI is available
+          if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+          run: |
+            if ! command -v jf &> /dev/null; then
+              echo "::error::JFrog CLI (jf) is not installed on this runner"
+              exit 1
+            fi
+            jf --version
+
+        - name: Publish Debian repository to Artifactory via JFrog CLI
+          if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+          env:
+            BASE_RT_URL: ${{ vars.BASE_RT_URL }}
+            DEBIAN_REPO: ${{ vars.DEBIAN_REPO }}
+            RT_USERNAME: ${{ vars.RT_USERNAME }}
+            RT_PASSWORD: ${{ secrets.RT_PASSWORD }}
+            BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            SCAN_STATUS: pending
+          run: |
+            set -euo pipefail
+
+            if [[ -z "${BASE_RT_URL}" ]]; then
+              echo "::error::BASE_RT_URL is not configured"
+              exit 1
+            fi
+
+            if [[ -z "${DEBIAN_REPO}" ]]; then
+              echo "::error::DEBIAN_REPO is not configured in environment"
+              exit 1
+            fi
+
+            if [[ -z "${RT_USERNAME}" || -z "${RT_PASSWORD}" ]]; then
+              echo "::error::RT_USERNAME or RT_PASSWORD is missing"
+              exit 1
+            fi
+
+            artifactory_url="https://${BASE_RT_URL}"
+
+            # Validate files exist before upload
+            file_count="$(find ceph/debs -type f \( -name '*.deb' -o -name 'Packages*' -o -name 'Release*' -o -name 'InRelease' -o -name '*.changes' -o -name '*.dsc' -o -name '*.tar.*' \) | wc -l | tr -d '[:space:]')"
+            if [[ "${file_count}" -eq 0 ]]; then
+              echo "::error::No Debian repository files found under ceph/debs"
+              exit 1
+            fi
+            echo "Found ${file_count} Debian repository files to upload"
+
+            # Configure Artifactory server with username/password
+            jf c add ceph-artifactory \
+              --url "${artifactory_url}" \
+              --user "${RT_USERNAME}" \
+              --password "${RT_PASSWORD}" \
+              --interactive=false \
+              --overwrite=true
+
+            # Generate upload file spec with proper path placeholders
+            # Pattern (ceph/debs/*) captures all content, {1} preserves relative path structure
+            # Trim whitespace and trailing slash from repo name
+            target_repo="$(echo "${DEBIAN_REPO}" | tr -d '[:space:]')"
+            cat > upload-spec.json <<EOF
+            {
+              "files": [
+                {
+                  "pattern": "ceph/debs/(*)",
+                  "target": "${target_repo}/{1}",
+                  "props": "build.url=${BUILD_URL};git.commit=${GITHUB_SHA};promotion.user=${GITHUB_ACTOR};scan.status=${SCAN_STATUS};build.number=${GITHUB_RUN_NUMBER}",
+                  "recursive": "true",
+                  "flat": "false"
+                }
+              ]
+            }
+            EOF
+
+            echo "Using file spec:"
+            cat upload-spec.json
+
+            # Upload using file spec
+            jf rt upload \
+              --spec upload-spec.json \
+              --server-id ceph-artifactory
+
+            jf c rm ceph-artifactory --quiet || true
+            rm -f upload-spec.json
+
+            echo "Successfully uploaded ${file_count} files to ${target_repo}"
 
         - name: Upload debian packages
           uses: actions/upload-artifact@v3
