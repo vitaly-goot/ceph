@@ -118,12 +118,64 @@ public:
     return signing_key_;
   }
   bool has_signing_key() { return signing_key_.has_value(); }
+
   /**
    * @brief Set the signing key.
    *
-   * @param key The binary signing key.
+   * This is intended for the normal use case, where a signing key has been
+   * properly fetched from the Authenticator for use in authenticating a
+   * chunked upload.
+   *
+   * @param key The binary signing key as a vector of bytes.
    */
   void set_signing_key(const std::vector<uint8_t> key) { signing_key_ = key; }
+
+  /**
+   * @brief Return true if a signing key is stored and it's exactly 32 bytes
+   * long, i.e. the size of a SHA256 digest.
+   *
+   * This is used for the STREAMING-AWS4-HMAC-SHA256-PAYLOAD and
+   * STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER cases, where the signing key
+   * is fetched from the Authenticator.
+   *
+   * @return true The key is present and the correct size.
+   * @return false The key is not present or the size is incorrect.
+   */
+  bool signing_key_is_SHA256_sized() const
+  {
+    return signing_key_.has_value() && signing_key_->size() == 32;
+  }
+
+  /**
+   * @brief Set the signing key to an empty (but not null) value, to indicate
+   * 'no signing key'.
+   *
+   * This is used for the STREAMING-UNSIGNED-PAYLOAD-TRAILER case, where we
+   * don't need the real signing key and therefore don't fetch it, but we want
+   * to avoid the signing_key field of the result being std::nullopt as that
+   * indicates 'no key present' to later authentication code.
+   */
+  void set_signing_key_as_empty()
+  {
+    signing_key_ = std::vector<uint8_t>();
+  }
+
+  /**
+   * @brief Return true iff the signing key is present and empty.
+   *
+   * This is used to detect the placeholder value we  set in
+   * set_signing_key_as_empty(), which indicates 'no signing key'. We want to
+   * be able to distinguish this from the case where the signing key is not
+   * present at all.
+   *
+   * @return true The signing key is present and empty.
+   * @return false The signing key is not present, or it's present and
+   * non-empty.
+   */
+  bool signing_key_is_empty() const
+  {
+    return signing_key_.has_value() && signing_key_->empty();
+  }
 
   /// @brief Return the user ID for a success result. Throw EACCES on
   /// failure.

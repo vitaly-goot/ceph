@@ -59,6 +59,7 @@
 #include "include/ceph_assert.h"
 #include "rgw/rgw_client_io.h"
 #include "rgw/rgw_common.h"
+#include "rgw/rgw_auth_s3.h"
 
 // These are 'standard' protobufs for the 'Richer error model'
 // (https://grpc.io/docs/guides/error/).
@@ -842,40 +843,75 @@ HandoffAuthResult HandoffHelperImpl::auth(const DoutPrefixProvider* dpp_in,
   // client I can find (minio go) doesn't set it. We won't depend on it.
   //
   bool is_chunked = false;
+  bool placeholder_signing_key = false;
+  std::string content_value;
 
   auto aws_content = envmap.find("HTTP_X_AMZ_CONTENT_SHA256");
   if (aws_content != envmap.cend()) {
-    if (aws_content->second == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+    using namespace rgw::auth::s3;
+    content_value = aws_content->second;
+    if (content_value == AWS4_STREAMING_PAYLOAD_HASH ||
+        content_value == AWS4_STREAMING_UNSIGNED_PAYLOAD_TRAILER || 
+        content_value == AWS4_STREAMING_HMAC_SHA256_PAYLOAD_TRAILER) {
       is_chunked = true;
-      ldpp_dout(dpp, 5) << "chunked upload in progress" << dendl;
+      ldpp_dout(dpp, 5)
+          << fmt::format(FMT_STRING("chunked upload type {} in progress"), content_value)
+          << dendl;
+      if (content_value == AWS4_STREAMING_UNSIGNED_PAYLOAD_TRAILER) {
+        // We don't need the real signing key, but we don't want the
+        // signing_key field of the result to be std::nullopt as that
+        // indicates 'no key' to later authentication code. I'd prefer clearer
+        // signalling tbh, but this is a way to piggyback on the existing API
+        // without changing it.
+        placeholder_signing_key = true;
+      }
     }
   }
 
+  std::string upload_type_str = is_chunked ? fmt::format(FMT_STRING("chunked {}"), content_value) : "non-chunked";
+
   if (is_chunked && !enable_chunked_upload_) {
-    ldpp_dout(dpp, 5) << "chunked upload disabled - rejecting request" << dendl;
-    return HandoffAuthResult(EACCES, "chunked upload is disabled");
+    std::string err = fmt::format(FMT_STRING("{} requested but chunked uploads are disabled"), upload_type_str);
+    ldpp_dout(dpp, 5)
+        << fmt::format(FMT_STRING("{} - rejecting request"), err)
+        << dendl;
+    return HandoffAuthResult(EACCES, err);
   }
 
   // Perform the gRPC-specific parts of the auth* call.
   auto result = _grpc_auth(dpp, auth, authorization_param, session_token, access_key_id,
       string_to_sign, signature, s, y, is_presigned_request);
-
   if (result.is_err()) {
     return result;
   }
-  // If we're chunked, we need a signing key from the Authenticator.
+
+  // If we're not chunked we're done here, the HandoffAuthResult is fine.
+  // Otherwise, we need to set up the signing key (which may be a special null
+  // value) and add it to the HandoffAuthResult before returning it.
   if (!is_chunked) {
     return result;
+
   } else {
-    auto sk = get_signing_key(dpp, auth, s, y);
-    if (!sk.has_value()) {
-      ldpp_dout(dpp, 0) << "failed to fetch signing key for chunked upload"
-                        << dendl;
-      return HandoffAuthResult(
-          EACCES, "failed to fetch signing key for chunked upload");
+    if (placeholder_signing_key) {
+      // For STREAMING-UNSIGNED-PAYLOAD-TRAILER we add a special empty SHA256
+      // value.
+      ldpp_dout(dpp, 20) << fmt::format(FMT_STRING("{} skip signing key fetch"), upload_type_str) << dendl;
+      result.set_signing_key_as_empty();
+      ldpp_dout(dpp, 10) << fmt::format(FMT_STRING("{} placeholder signing key saved"), upload_type_str) << dendl;
+
+    } else {
+      // For other chunked upload types (we only support SHA256 for now) we
+      // need the actual signing key from the Authenticator.
+      auto sk = get_signing_key(dpp, auth, s, y);
+      if (!sk.has_value()) {
+        std::string err = fmt::format(FMT_STRING("{} failed to fetch signing key"), upload_type_str);
+        ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("{}"), err) << dendl;
+        return HandoffAuthResult(
+            EACCES, err);
+      }
+      result.set_signing_key(*sk);
+      ldpp_dout(dpp, 10) << fmt::format(FMT_STRING("{} signing key saved"), upload_type_str) << dendl;
     }
-    result.set_signing_key(*sk);
-    ldpp_dout(dpp, 10) << "chunked upload signing key saved" << dendl;
     return result;
   }
 };

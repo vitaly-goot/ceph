@@ -6580,20 +6580,41 @@ rgw::auth::s3::HandoffEngine::authenticate(
   auto apl = apl_factory->create_apl_remote(cct, s, get_acl_strategy(),
                                             get_creds_info(access_key_token));
 
-  // Check for a signing key. This will be present only for chunked uploads.
+  // Check for a signing key. This will be non-nullopt only for chunked uploads.
   std::optional<sha256_digest_t> cached_signing_key;
+
+  // We have a few of cases to handle:
+  // 1. No signing key provided: cached_signing_key remains nullopt.
+  // 2. Empty signing key provided: cached_signing_key is set to an empty
+  //    vector but is not nullopt.
+  // 3. Valid SHA256-based signing key provided: cached_signing_key is set to
+  //    a digest object created from the provided auth_result.
+  //
+  // The signing key is a vector of zero or more bytes, not a string, and not
+  // a key type.
+
   if (auth_result.has_signing_key()) {
-    // The signing key is raw bytes, not a string.
-    auto sk = auth_result.signing_key().value();
-    if (sk.size() != 32) {
+    if (auth_result.signing_key_is_empty()) {
+      // This is the placeholder value. Set the cached signing key to an empty
+      // (but NOT null) value.
+      //
+      // It's handy that the default constructor of sha256_digest_t creates an
+      // empty digest.
+      cached_signing_key = std::make_optional(sha256_digest_t { });
+
+    } else if (auth_result.signing_key_is_SHA256_sized()) {
+      // We've fetched an SHA256-based signing key from the authenticator.
+      auto sk = auth_result.signing_key().value();
+      // Luckily, sha_digest_t<> has a constructor that takes a char*.
+      sha256_digest_t digest(sk.data());
+      cached_signing_key = std::make_optional(digest);
+
+    } else {
       ldpp_dout(dpp, 1)
-          << __func__ << ": signing key SHA256 digest must be exactly 32 bytes"
+          << __func__ << ": signing key SHA256 digest is malformed"
           << dendl;
       return result_t::deny(-ERR_INTERNAL_ERROR);
     }
-    // Luckily, sha_digest_t<> has a constructor that takes raw bytes.
-    sha256_digest_t digest(sk.data());
-    cached_signing_key = std::make_optional(digest);
   }
 
   return result_t::grant(std::move(apl),
