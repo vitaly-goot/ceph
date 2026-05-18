@@ -81,14 +81,26 @@ function discover_compiler() {
     local compiler_env=""
     local cxx_compiler=g++
     local c_compiler=gcc
-    # ubuntu/debian ci builds prefer clang
-    for i in {19..12}; do
-        if type -t "clang-$i" > /dev/null; then
-            cxx_compiler="clang++-$i"
-            c_compiler="clang-$i"
-            break
-        fi
-    done
+    local distro_id=""
+    local distro_version=""
+    local use_clang=1
+    if [ -r /etc/os-release ]; then
+        distro_id="$(. /etc/os-release; echo "${ID}")"
+        distro_version="$(. /etc/os-release; echo "${VERSION_ID}")"
+    fi
+    if [ "${distro_id}" = "ubuntu" ] \
+      && { [ "${distro_version}" = "20.04" ] || [ "${distro_version}" = "22.04" ]; }; then
+        use_clang=0
+    fi
+    if [ "${use_clang}" -eq 1 ]; then
+        for i in {19..12}; do
+            if type -t "clang-$i" > /dev/null; then
+                cxx_compiler="clang++-$i"
+                c_compiler="clang-$i"
+                break
+            fi
+        done
+    fi
     # but if this is {centos,rhel} we need gcc-toolset
     if [ -f "/opt/rh/gcc-toolset-11/enable" ]; then
         ci_debug "Detected SCL gcc-toolset-11 environment file"

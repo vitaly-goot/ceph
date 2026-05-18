@@ -2,43 +2,30 @@ set(common_options_srcs build_options.cc)
 set(legacy_options_headers)
 set(options_yamls)
 
-# to mimic the behavior of file(CONFIGURE ...)
-file(GENERATE OUTPUT configure_file.cmake
-  CONTENT "configure_file(\${input_file} \${output_file} @ONLY)")
-function(file_configure input_file output_file)
-  set(cmake_defs
-    -D input_file=${input_file}
-    -D output_file=${output_file})
-  file(STRINGS ${input_file} subvars REGEX "@[^@]+@")
-  foreach(line ${subvars})
-    string(REGEX REPLACE ".*@([^@]+)@.*" "\\1"
-      var "${line}")
-    set(value ${${var}})
-    list(APPEND cmake_defs -D ${var}=${value})
-  endforeach()
-  add_custom_command(OUTPUT ${output_file}
-    COMMAND ${CMAKE_COMMAND} ${cmake_defs} -P configure_file.cmake
-    DEPENDS ${input_file}
-    VERBATIM)
-endfunction()
+set_property(DIRECTORY APPEND PROPERTY
+  CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/y2c.py)
 
+file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/include)
+
+# Generate at configure time so headers exist before any compile runs.
 function(add_options name)
   set(yaml_in_file ${CMAKE_CURRENT_SOURCE_DIR}/${name}.yaml.in)
   set(yaml_file ${CMAKE_CURRENT_BINARY_DIR}/${name}.yaml)
-  file_configure("${yaml_in_file}"
-    "${yaml_file}" @ONLY)
+  configure_file("${yaml_in_file}" "${yaml_file}" @ONLY)
   list(APPEND options_yamls ${yaml_file})
   set(options_yamls ${options_yamls} PARENT_SCOPE)
-  set(cc_file "${name}_options.cc")
+  set(cc_file "${CMAKE_CURRENT_BINARY_DIR}/${name}_options.cc")
   set(h_file "${PROJECT_BINARY_DIR}/include/${name}_legacy_options.h")
-  add_custom_command(
-    OUTPUT ${cc_file} ${h_file}
+  execute_process(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/y2c.py
       --input ${yaml_file}
       --output ${cc_file}
       --legacy ${h_file}
       --name ${name}
-      DEPENDS ${yaml_file})
+    RESULT_VARIABLE _rc)
+  if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR "y2c.py failed for ${name} (exit ${_rc})")
+  endif()
   list(APPEND common_options_srcs ${cc_file})
   set(common_options_srcs ${common_options_srcs} PARENT_SCOPE)
   list(APPEND legacy_options_headers ${h_file})

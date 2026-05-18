@@ -150,6 +150,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
   string(PREPEND CMAKE_CXX_FLAGS_DEBUG "-Og ")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wstrict-null-sentinel>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Woverloaded-virtual>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-error=maybe-uninitialized>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-error=mismatched-new-delete>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-error=odr>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-error=lto-type-mismatch>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-error=stringop-overflow>)
+  add_link_options(-Wno-error=odr -Wno-error=lto-type-mismatch -Wno-error=stringop-overflow)
   # cmake does not add '-pie' for executables even if
   # CMAKE_POSITION_INDEPENDENT_CODE is TRUE.
   if(EXE_LINKER_USE_PIE)
