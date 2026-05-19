@@ -393,7 +393,7 @@ jobs:
           docker_context: ceph
           dockerfile: ceph/.github/docker/Dockerfile.debian-packages
           image_tags: |
-            ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}
+            ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}
           platforms: linux/amd64
           build_args: |
             BASE_IMAGE=${{ matrix.base_image }}
@@ -405,4 +405,4 @@ jobs:
 
       - name: Job Output of Docker Image name
         run: |
-          echo "Docker Image: ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}"
+          echo "Docker Image: ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}"
