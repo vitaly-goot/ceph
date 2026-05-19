@@ -1,0 +1,65 @@
+# GitHub Action to build ceph with build-with-container.py
+
+name: Build Ceph Binaries
+
+on:
+  workflow_dispatch:
+  # Each push run is trivial. No need to restrict how often it runs. 
+  # It will be automatically cancelled if a new push happens before the previous one finishes.
+  push:
+  pull_request:
+    branches:
+      - 'aka_version_*'
+
+concurrency:
+  group: build-ceph-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  build_arch: "x86-64-v3"
+
+jobs:
+
+  build-ceph-binaries:
+    strategy:
+      matrix:
+        os_version: 
+          #- ubuntu20.04
+          - ubuntu22.04
+    runs-on: ceph
+    steps:
+        - name: Checkout ceph
+          uses: actions/checkout@v4
+          with:
+            path: ceph
+            fetch-depth: 0
+            lfs: true
+            submodules: recursive
+
+        - name: Derive build variables
+          id: derive-build-vars
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
+
+        - name: Create build vars config file
+          id: write-build-vars-config
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3.1
+          with:
+            ceph_path: ceph
+            redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
+            ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
+            cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
+            output_path: ceph/src/script/custom/build-vars.config
+            build_arch: ${{ env.build_arch }}
+
+        - name: Run Ceph
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
+          with:
+            ceph_path: ceph
+            os_version: ${{ matrix.os_version }}
+            build_target: build
+            env_file: src/script/custom/build-vars.config
+            custom_image_script: run-all.sh
+            patch_rocksdb_portable: 'true'
