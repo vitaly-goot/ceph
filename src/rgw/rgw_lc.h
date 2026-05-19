@@ -625,6 +625,11 @@ int fix_lc_shard_entry(const DoutPrefixProvider *dpp,
 		       rgw::sal::Lifecycle* sal_lc,
 		       rgw::sal::Bucket* bucket);
 
+int reset_lc_shard_entry(const DoutPrefixProvider *dpp,
+                         rgw::sal::Driver* driver,
+		         rgw::sal::Lifecycle* sal_lc,
+		         rgw::sal::Bucket* bucket);
+
 std::string s3_expiration_header(
   DoutPrefixProvider* dpp,
   const rgw_obj_key& obj_key,

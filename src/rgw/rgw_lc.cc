@@ -2856,6 +2856,37 @@ int fix_lc_shard_entry(const DoutPrefixProvider *dpp,
   return ret;
 }
 
+int reset_lc_shard_entry(const DoutPrefixProvider *dpp,
+                         rgw::sal::Driver* driver,
+		         rgw::sal::Lifecycle* sal_lc,
+		         rgw::sal::Bucket* bucket)
+{
+  if (auto aiter = bucket->get_attrs().find(RGW_ATTR_LC);
+      aiter == bucket->get_attrs().end()) {
+    ldpp_dout(dpp, 1) << "No lifecycle config on bucket=" << bucket
+                      << ", cannot reset" << dendl;
+    return -ENOENT;
+  }
+
+  auto bucket_lc_key = get_bucket_lc_key(bucket->get_key());
+  std::string lc_oid;
+  get_lc_oid(driver->ctx(), bucket_lc_key, &lc_oid);
+
+  char cookie_buf[COOKIE_LEN + 1];
+  gen_rand_alphanumeric(driver->ctx(), cookie_buf, sizeof(cookie_buf) - 1);
+  std::string cookie = cookie_buf;
+
+  int ret = guard_lc_modify(dpp,
+    driver, sal_lc, bucket->get_key(), cookie,
+    [&lc_oid](rgw::sal::Lifecycle* slc,
+              const string& oid,
+              rgw::sal::Lifecycle::LCEntry& entry) {
+      return slc->set_entry(lc_oid, entry);
+    });
+
+  return ret;
+}
+
 std::string s3_expiration_header(
   DoutPrefixProvider* dpp,
   const rgw_obj_key& obj_key,

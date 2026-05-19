@@ -270,6 +270,7 @@ void usage()
   cout << "  lc get                     get a lifecycle bucket configuration\n";
   cout << "  lc process                 manually process lifecycle\n";
   cout << "  lc reshard fix             fix LC for a resharded bucket\n";
+  cout << "  lc reset                   reset lifecycle entry for a bucket (requires --bucket)\n";
   cout << "  metadata get               get metadata info\n";
   cout << "  metadata put               put metadata info\n";
   cout << "  metadata rm                remove metadata info\n";
@@ -722,6 +723,7 @@ enum class OPT {
   LC_GET,
   LC_PROCESS,
   LC_RESHARD_FIX,
+  LC_RESET,
   ORPHANS_FIND,
   ORPHANS_FINISH,
   ORPHANS_LIST_JOBS,
@@ -950,6 +952,7 @@ static SimpleCmd::Commands all_cmds = {
   { "lc get", OPT::LC_GET },
   { "lc process", OPT::LC_PROCESS },
   { "lc reshard fix", OPT::LC_RESHARD_FIX },
+  { "lc reset", OPT::LC_RESET },
   { "orphans find", OPT::ORPHANS_FIND },
   { "orphans finish", OPT::ORPHANS_FINISH },
   { "orphans list jobs", OPT::ORPHANS_LIST_JOBS },
@@ -8602,6 +8605,27 @@ next:
       cerr << "ERROR: fixing lc shards: " << cpp_strerror(-ret) << std::endl;
     }
 
+  }
+
+  if (opt_cmd == OPT::LC_RESET) {
+    if (bucket_name.empty()) {
+      cerr << "ERROR: bucket not specified" << std::endl;
+      return EINVAL;
+    }
+
+    ret = init_bucket(user.get(), tenant, bucket_name, bucket_id, &bucket);
+    if (ret < 0) {
+      cerr << "ERROR: could not init bucket: " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+
+    ret = rgw::lc::reset_lc_shard_entry(dpp(), driver,
+                                         driver->get_rgwlc()->get_lc(),
+                                         bucket.get());
+    if (ret < 0) {
+      cerr << "ERROR: resetting lc entry for bucket: " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
   }
 
   if (opt_cmd == OPT::ORPHANS_FIND) {

@@ -372,6 +372,10 @@ as follows:
   --bucket_id or via --bucket and optional --tenant), only that bucket
   is processed.
 
+:command:`lc reset`
+  Reset bucket lifecycle processing status to UNINITIAL so it will be
+  re-evaluated in the next LC cycle. Requires --bucket.
+
 :command:`metadata get`
   Get metadata info.
 
