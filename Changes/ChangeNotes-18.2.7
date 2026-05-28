@@ -1,0 +1,57 @@
+=============================================================================
+JIRA CEPH-571 Reject late multipart parts after upload completion
+
+Developer: @vgoot
+Code Review: @schiu 
+
+[Description]
+Prevents lagged parts from being recorded after an MPU is finished, eliminating stale part leakage and index pollution.
+- Uses existing meta ref for the subsequent part-info update.
+- Ensure the multipart upload still exists before we persist any part state;
+- Guard multipart part uploads by stat’ing the multipart meta object before writing part data;
+- If the meta object is gone (completed/aborted), surface NoSuchUpload early and skip writing the part.
+- On rejection or error, the writer’s cleanup path purges any raw part objects created for the failed attempt.
+
+[Issue]
+MPU is created → MPU index entry exists
+Parts upload in parallel
+One part is slow and remains “in flight”
+Client retries the same part number
+Retry succeeds and is recorded as the valid part
+Client calls CompleteMultipartUpload
+RGW:
+- Finalizes the MPU
+- Removes MPU index entry
+- Commits final object
+But the original in-flight part object:
+- Get accepted on completion but it is no longer referenced by MPU index
+- Never gets cleaned up due to race timing,
+
+Result: a detached multipart part object that inflates disk usage and billing.
+
+{Repro]
+Script to create phantom part: mpu_lag.py
+1) Create MPU
+2) Upload N parts in parallel
+3) Make one part upload intentionally slow ("lagging")
+4) While slow upload is still running, retry SAME PartNumber with a fast upload
+5) Complete MPU using the fast retry's ETag for that PartNumber
+6) Let the original slow upload finish AFTER completion (to exercise inconsistent index / phantom-part behavior)
+
+Usage example:
+"""
+    # upload MPU in 4 chunks, each chunk of 6mb size, chunk 3 goes with slow and retry path 
+    python3 mpu_lag.py --endpoint $EP   --access-key $AK  --secret-key $SK --bucket $B --key $KEY --parts 4 --part-size-mb 6 --lag-part 3 --lag-sleep-ms 10 --retry-after-sec 1
+"""
+command to validate/fix invalid parts entries 
+"""
+  # validate 
+  radosgw-admin bucket check --bucket=vgoot-b-16  | jq .invalid_multipart_entries
+  # fix
+  radosgw-admin bucket check --bucket=$B --fix{code}
+"""
+
+[File Changed]
+src/rgw/driver/rados/rgw_putobj_processor.cc
+src/tools/akamai/qa/rgw/CEPH-571/mpu_lag.py
+

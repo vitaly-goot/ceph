@@ -495,7 +495,35 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
                                        bool *pcanceled, optional_yield y,
                                        uint32_t flags)
 {
-  int r = writer.drain();
+  // Ensure the multipart upload still exists before we persist any part state; if the
+  // meta object is gone (completed/aborted), surface NoSuchUpload early and skip
+  // writing the part.
+  rgw_obj meta_obj;
+  meta_obj.init_ns(bucket_info.bucket, mp.get_meta(), RGW_OBJ_NS_MULTIPART);
+  meta_obj.set_in_extra_data(true);
+
+  rgw_raw_obj meta_raw_obj;
+  store->obj_to_raw(bucket_info.placement_rule, meta_obj, &meta_raw_obj);
+
+  rgw_rados_ref meta_obj_ref;
+  int r = store->get_raw_obj_ref(dpp, meta_raw_obj, &meta_obj_ref);
+  if (r < 0) {
+    return r;
+  }
+
+  {
+    librados::ObjectReadOperation rop;
+    rop.stat(nullptr, nullptr, nullptr);
+    r = rgw_rados_operate(dpp, meta_obj_ref.pool.ioctx(), meta_obj_ref.obj.oid, &rop, nullptr, y);
+    if (r == -ENOENT) {
+      return -ERR_NO_SUCH_UPLOAD;
+    }
+    if (r < 0) {
+      return r;
+    }
+  }
+
+  r = writer.drain();
   if (r < 0) {
     return r;
   }
@@ -547,21 +575,10 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     return r;
   }
 
-  rgw_obj meta_obj;
-  meta_obj.init_ns(bucket_info.bucket, mp.get_meta(), RGW_OBJ_NS_MULTIPART);
-  meta_obj.set_in_extra_data(true);
-
-  rgw_raw_obj meta_raw_obj;
-  store->obj_to_raw(bucket_info.placement_rule, meta_obj, &meta_raw_obj); 
-
-  rgw_rados_ref meta_obj_ref;
-  r = store->get_raw_obj_ref(dpp, meta_raw_obj, &meta_obj_ref);
-  if (r < 0) {
-    ldpp_dout(dpp, -1) << "ERROR: failed to get obj ref of meta obj with ret=" << r << dendl;
-    return r;
-  }
-
   librados::ObjectWriteOperation op;
+  // If complete/abort removed the MPU meta object after our earlier stat,
+  // fail this update cleanly, typically with -ENOENT.
+  op.assert_exists();
   cls_rgw_mp_upload_part_info_update(op, p, info);
   r = rgw_rados_operate(dpp, meta_obj_ref.pool.ioctx(), meta_obj_ref.obj.oid, &op, y);
   ldpp_dout(dpp, 20) << "Update meta: " << meta_obj_ref.obj.oid << " part " << p << " prefix " << info.manifest.get_prefix() << " return " << r << dendl;
@@ -575,7 +592,9 @@ int MultipartObjectProcessor::complete(size_t accounted_size,
     m[p] = bl;
 
     op = librados::ObjectWriteOperation{};
-    op.assert_exists(); // detect races with abort
+    // Same existence precondition on the fallback path; fail cleanly,
+    // typically with -ENOENT, if the MPU was completed or aborted.
+    op.assert_exists();
     op.omap_set(m);
     r = rgw_rados_operate(dpp, meta_obj_ref.pool.ioctx(), meta_obj_ref.obj.oid, &op, y);
   }
