@@ -631,12 +631,15 @@ void RGWStoreQueryOp_ObjectList::Item::dump(Formatter* f) const
 
 // RGWStoreQueryOp_MPUploadList
 
-std::string RGWStoreQueryOp_MPUploadList::create_continuation_token(const DoutPrefixProvider* dpp, const std::string& marker, std::unique_ptr<rgw::sal::MultipartUpload> const& upload)
+std::string RGWStoreQueryOp_MPUploadList::create_continuation_token(const DoutPrefixProvider* dpp, std::unique_ptr<rgw::sal::MultipartUpload> const& upload)
 {
   bufferlist bl;
   ceph::JSONFormatter f;
   f.open_object_section("ContinuationToken");
-  f.dump_string("marker", marker);
+  // get_meta() returns the 'name of the object representing this upload in
+  // the backing store', which we use as the actual pagination marker.
+  f.dump_string("marker", upload->get_meta());
+  // These are convenience attributes, since we have them.
   f.dump_string("key", upload->get_key());
   f.dump_string("uploadId", upload->get_upload_id());
   f.close_section(); // ContinuationToken
@@ -703,7 +706,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
       op_ret = -EINVAL;
       return false;
     }
-    ldpp_dout(this, 10) << fmt::format(FMT_STRING("unpacked continuation token: marker='{}'"), *opt_marker)
+    ldpp_dout(this, 10) << fmt::format(FMT_STRING("continuation token '{}' decoded as marker='{}'"), *marker_, *opt_marker)
                         << dendl;
     marker = *opt_marker;
   }
@@ -720,7 +723,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
   seen_eof_ = false;
 
   // This will be set if we want to set a continuation token.
-  std::optional<std::string> next_marker;
+  std::optional<std::string> opt_ret_marker;
 
   // Reserve space for the maximum number of entries we might return. This is
   // a compromise - we could reallocate as we issue queries against the
@@ -731,9 +734,7 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
   items_.reserve(max_entries_);
 
   while (!seen_eof_ && items_.size() < max_entries_) {
-    // Re-initialise this every run. We can only see if the query is complete
-    // across multiple list_multiparts() by checking if this is empty.
-    // However, nothing in list_multiparts() clears it.
+    // Re-initialise this every run.
     uploads.clear();
 
     ldpp_dout(this, 20) << fmt::format(
@@ -741,11 +742,22 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
                         << dendl;
 
     // rgw::sal::Bucket::list_multiparts() notes:
-    // - marker is an inout parameter that we need for pagination.
-    // - is_truncated must not be null, the underlying implementation
-    //   doesn't do a nullptr check.
+    //
+    // - marker is an inout parameter that we need for pagination. Note this
+    //   isn't the one we return to the storequery caller, we use it to
+    //   paginate through the SAL results, and then if we need to return a
+    //   continuation token to the user we create that ourselves using the SAL
+    //   result where we left off. The RGWMultipartUpload object returns a
+    //   get_meta() function that according to the documentation represents
+    //   that upload in the backing store. This is what we pass to
+    //   list_multiparts() to get proper pagination.
+    //
+    // - is_truncated must not be a null pointer, the underlying
+    //   implementation doesn't do a nullptr check, at least not in v18.
+    //
     // - Don't make any assumptions about how many records will be returned,
     //   except that it will be <= query_max.
+
     int ret;
     if (list_multiparts_function_) {
       ret = (*list_multiparts_function_)(this, "", marker, "", query_max, uploads, nullptr, &is_truncated);
@@ -799,23 +811,25 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
           // We filled the user items list but there are more entries. Set the
           // marker to where we left off (NOT where the SAL query left off)
           // and exit the loop.
-          next_marker = create_continuation_token(this, marker, upload);
-          ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next={}"), *next_marker) << dendl;
+          opt_ret_marker = create_continuation_token(this, upload);
+          ldpp_dout(this, 10) << fmt::format(FMT_STRING("max_entries reached, next={}"), *opt_ret_marker)
+              << dendl;
           break;
         }
       }
+
     } // for each upload result
-  }
+  } // while !seen_eof && items_.size() < max_entries_
 
   ldpp_dout(this, 10) << fmt::format(FMT_STRING("loop exit: seen_eof={} next_marker={} items_.size={}"),
-      seen_eof_, next_marker.has_value() ? *next_marker : "<none>", items_.size())
+                                     seen_eof_, opt_ret_marker.has_value() ? *opt_ret_marker : "<none>", items_.size())
                       << dendl;
 
   if (op_ret < 0) {
     return false;
   }
 
-  if (next_marker.has_value()) {
+  if (opt_ret_marker.has_value()) {
     // If there are more results, we need to safely encode the continuation
     // marker and return it to the user. This is done by setting
     // return_marker_, which will be dumped in send_response_json().
@@ -825,15 +839,17 @@ bool RGWStoreQueryOp_MPUploadList::execute_query(optional_yield y)
     // wrap width is std::numeric_limits<int>::max().
     std::string encoded_marker;
     try {
-      encoded_marker = to_base64(*next_marker);
+      encoded_marker = to_base64(*opt_ret_marker);
     } catch (std::exception& e) {
       ldpp_dout(this, 0) << fmt::format(FMT_STRING("failed to encode continuation token: '{}'"), e.what())
                          << dendl;
       op_ret = -EINVAL;
       return false;
     }
-    ldpp_dout(this, 20) << fmt::format(FMT_STRING("EOF not reached, next_marker {}"), *next_marker)
+    // Level 20 shows the raw marker.
+    ldpp_dout(this, 20) << fmt::format(FMT_STRING("EOF not reached, next_marker {}"), *opt_ret_marker)
                         << dendl;
+    // Level 5 shows the base64'd marker that we return to the user.
     ldpp_dout(this, 5) << fmt::format(FMT_STRING("EOF not reached, continuation token {}"), encoded_marker)
                        << dendl;
     set_return_marker(encoded_marker);

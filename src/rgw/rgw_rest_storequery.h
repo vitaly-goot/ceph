@@ -1021,12 +1021,11 @@ public:
    * RGWStoreQueryOp_ObjectList::create_continuation_token().
    *
    * @param dpp The DoutPrefixProvider instance.
-   * @param marker The continuation token marker returned by list_multiparts().
    * @param upload Pointer to the multipart upload object.
    * @return std::string The JSON object representating the continuation
    * token. Will need to be base64 encoded before transmission.
    */
-  static std::string create_continuation_token(const DoutPrefixProvider* dpp, const std::string& marker, std::unique_ptr<rgw::sal::MultipartUpload> const& upload);
+  static std::string create_continuation_token(const DoutPrefixProvider* dpp, std::unique_ptr<rgw::sal::MultipartUpload> const& upload);
 
   /**
    * @brief Read a continuation token JSON object
