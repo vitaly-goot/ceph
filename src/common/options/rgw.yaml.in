@@ -497,6 +497,38 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_lc_counters_cache
+  type: bool
+  level: advanced
+  desc: Enable per-bucket lifecycle performance counters cache
+  long_desc: When enabled, RGW will create and update per-bucket lifecycle performance
+    counters and expose them via admin socket perf dump.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_counters_cache_size
+  type: uint
+  level: advanced
+  desc: Target size for lifecycle counters cache
+  long_desc: Maximum number of per-bucket LC counter entries to maintain in cache
+  default: 10000
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_counters_batch_size
+  type: uint
+  level: advanced
+  desc: Batch size for flushing LC per-bucket counters
+  long_desc: LC per-bucket counters are flushed to cache every N objects processed.
+    Lower values provide more frequent updates, higher values reduce overhead.
+  default: 5000
+  min: 1
+  services:
+  - rgw
+  see_also:
+  - rgw_lc_counters_cache
+  with_legacy: true
 - name: rgw_mp_lock_max_time
   type: int
   level: advanced
@@ -4095,7 +4127,7 @@ options:
   services:
   - rgw
 - name: rgw_kafka_connection_idle
-  type: uint 
+  type: uint
   level: advanced
   desc: Time in seconds to delete idle kafka connections
   long_desc: A conection will be considered "idle" if no messages
@@ -4107,7 +4139,7 @@ options:
   - rgw
   with_legacy: true
 - name: rgw_kafka_message_timeout
-  type: uint 
+  type: uint
   level: advanced
   desc: This is the maximum time in milliseconds to deliver a message (including retries)
   long_desc: Delivery error occurs when the message timeout is exceeded.
@@ -4320,4 +4352,48 @@ options:
   default: false
   services:
   - rgw
+  with_legacy: true
+- name: rgw_user_counters_cache
+  type: bool
+  level: dev
+  default: false
+  desc: enable a rgw perf counters cache for counters with user label
+  long desc: If set to true, rgw creates perf counters with a label for the user and stores them
+    in a perf counters cache. This perf counters cache contains only perf counters labeled by user.
+  see_also:
+  - rgw_user_counters_cache_size
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_user_counters_cache_size
+  type: uint
+  level: advanced
+  desc: Number of labeled perf counters the user perf counters cache can store
+  default: 10000
+  services:
+  - rgw
+  see_also:
+  - rgw_user_counters_cache
+  with_legacy: true
+- name: rgw_bucket_counters_cache
+  type: bool
+  level: dev
+  default: false
+  desc: enable a rgw perf counters cache for counters with bucket label
+  long desc: If set to true, rgw creates perf counters with a label for the bucket and stores them
+    in a perf counters cache. This perf counters cache contains only perf counters labeled by bucket.
+  see_also:
+  - rgw_bucket_counters_cache_size
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_bucket_counters_cache_size
+  type: uint
+  level: advanced
+  desc: Number of labeled perf counters the bucket perf counters cache can store
+  default: 10000
+  services:
+  - rgw
+  see_also:
+  - rgw_bucket_counters_cache
   with_legacy: true

@@ -1,4 +1,4 @@
-.. _Perf Counters: 
+.. _Perf Counters:
 
 ===============
  Perf counters

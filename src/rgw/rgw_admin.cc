@@ -857,6 +857,7 @@ enum class OPT {
   PUBSUB_NOTIFICATION_GET,
   PUBSUB_NOTIFICATION_RM,
   PUBSUB_TOPIC_DUMP,
+  PUBSUB_TOPIC_STATS,
   SCRIPT_PUT,
   SCRIPT_GET,
   SCRIPT_RM,
@@ -1096,6 +1097,7 @@ static SimpleCmd::Commands all_cmds = {
   { "notification get", OPT::PUBSUB_NOTIFICATION_GET },
   { "notification rm", OPT::PUBSUB_NOTIFICATION_RM },
   { "topic dump", OPT::PUBSUB_TOPIC_DUMP },
+  { "topic stats", OPT::PUBSUB_TOPIC_STATS },
   { "script put", OPT::SCRIPT_PUT },
   { "script get", OPT::SCRIPT_GET },
   { "script rm", OPT::SCRIPT_RM },
@@ -4266,6 +4268,7 @@ int main(int argc, const char **argv)
 			 OPT::PUBSUB_TOPIC_GET,
        OPT::PUBSUB_NOTIFICATION_GET,
        OPT::PUBSUB_TOPIC_DUMP  ,
+       OPT::PUBSUB_TOPIC_STATS  ,
 			 OPT::SCRIPT_GET,
     };
 
@@ -4357,7 +4360,8 @@ int main(int argc, const char **argv)
                           && opt_cmd != OPT::PUBSUB_NOTIFICATION_GET
                           && opt_cmd != OPT::PUBSUB_TOPIC_RM
                           && opt_cmd != OPT::PUBSUB_TOPIC_DUMP
-                          && opt_cmd != OPT::PUBSUB_NOTIFICATION_RM) {
+                          && opt_cmd != OPT::PUBSUB_NOTIFICATION_RM
+                          && opt_cmd != OPT::PUBSUB_TOPIC_STATS  ) {
         cerr << "ERROR: --tenant is set, but there's no user ID" << std::endl;
         return EINVAL;
       }
@@ -10665,7 +10669,8 @@ next:
       return EINVAL;
     }
 
-    ret = rgw::notify::remove_persistent_topic(dpp(), static_cast<rgw::sal::RadosStore*>(driver)->getRados()->get_notif_pool_ctx(), topic_name, null_yield);
+    ret = rgw::notify::remove_persistent_topic(
+        dpp(), static_cast<rgw::sal::RadosStore*>(driver)->getRados()->get_notif_pool_ctx(), topic_name, null_yield);
     if (ret < 0) {
       cerr << "ERROR: could not remove persistent topic: " << cpp_strerror(-ret) << std::endl;
       return -ret;
@@ -10751,8 +10756,8 @@ next:
         return -rc;
       }
 
-      std::for_each(queue_entries.cbegin(), 
-        queue_entries.cend(), 
+      std::for_each(queue_entries.cbegin(),
+        queue_entries.cend(),
         [&formatter](const auto& queue_entry) {
           rgw::notify::event_entry_t event_entry;
           bufferlist::const_iterator iter{&queue_entry.data};
@@ -10767,6 +10772,24 @@ next:
       marker = end_marker;
     }
     formatter->close_section();
+    formatter->flush(cout);
+  }
+
+  if (opt_cmd == OPT::PUBSUB_TOPIC_STATS) {
+    if (topic_name.empty()) {
+      cerr << "ERROR: topic name was not provided (via --topic)" << std::endl;
+      return EINVAL;
+    }
+
+    rgw::notify::rgw_topic_stats stats;
+    ret = rgw::notify::get_persistent_queue_stats_by_topic_name(
+        dpp(), static_cast<rgw::sal::RadosStore *>(driver)->getRados()->get_notif_pool_ctx(), topic_name,
+        stats, null_yield);
+    if (ret < 0) {
+      cerr << "ERROR: could not get persistent queue: " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+    encode_json("", stats, formatter.get());
     formatter->flush(cout);
   }
 

@@ -31,6 +31,9 @@ static std::string lc_index_lock_name = "lc_process";
 
 extern const char* LC_STATUS[];
 
+// Forward declaration
+struct LCBatchCounters;
+
 typedef enum {
   lc_uninitial = 0,
   lc_processing,
@@ -615,7 +618,8 @@ public:
 
   int handle_multipart_expiration(rgw::sal::Bucket* target,
 				  const std::map<std::string, std::vector<lc_op*>>& grouped_ops,
-				  LCWorker* worker, time_t stop_at, bool once);
+				  LCWorker* worker, LCBatchCounters* batch_counters,
+				  time_t stop_at, bool once);
 };
 
 namespace rgw::lc {

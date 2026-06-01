@@ -21,6 +21,7 @@
 namespace rgw::notify {
 
 using queues_t = std::set<std::string>;
+using rgw::persistent_topic_counters::CountersManager;
 
 // use mmap/mprotect to allocate 128k coroutine stacks
 auto make_stack_allocator() {
@@ -218,7 +219,9 @@ private:
     spawn::spawn(io_context, [this, queue_name](yield_context yield) {
             cleanup_queue(queue_name, yield);
             }, make_stack_allocator());
-    
+
+    CountersManager queue_counters_container(queue_name, this->get_cct());
+
     while (true) {
       // if queue was empty the last time, sleep for idle timeout
       if (is_idle) {
@@ -280,6 +283,7 @@ private:
       is_idle = false;
       auto has_error = false;
       auto remove_entries = false;
+      uint64_t entries_to_remove = 0;
       auto entry_idx = 1U;
       tokens_waiter waiter(io_context);
       for (auto& entry : entries) {
@@ -288,12 +292,13 @@ private:
           break;
         }
         // TODO pass entry pointer instead of by-value
-        spawn::spawn(yield, [this, &queue_name, entry_idx, total_entries, &end_marker, &remove_entries, &has_error, &waiter, entry](yield_context yield) {
+        spawn::spawn(yield, [this, &queue_name, entry_idx, total_entries, &end_marker, &remove_entries, &entries_to_remove, &has_error, &waiter, entry](yield_context yield) {
             const auto token = waiter.make_token();
             if (process_entry(entry, yield)) {
               ldpp_dout(this, 20) << "INFO: processing of entry: " << 
                 entry.marker << " (" << entry_idx << "/" << total_entries << ") from: " << queue_name << " ok" << dendl;
               remove_entries = true;
+              ++entries_to_remove;
             }  else {
               if (set_min_marker(end_marker, entry.marker) < 0) {
                 ldpp_dout(this, 1) << "ERROR: cannot determin minimum between malformed markers: " << end_marker << ", " << entry.marker << dendl;
@@ -319,7 +324,7 @@ private:
           ClsLockType::EXCLUSIVE,
           lock_cookie, 
           "" /*no tag*/);
-        cls_2pc_queue_remove_entries(op, end_marker); 
+        cls_2pc_queue_remove_entries(op, end_marker, entries_to_remove);
         // check ownership and deleted entries in one batch
         const auto ret = rgw_rados_operate(this, rados_ioctx, queue_name, &op, optional_yield(io_context, yield)); 
         if (ret == -ENOENT) {
@@ -339,6 +344,17 @@ private:
           ldpp_dout(this, 20) << "INFO: removed entries up to: " << end_marker <<  " from queue: " 
           << queue_name << dendl;
         }
+      }
+
+      // updating perfcounters with topic stats
+      uint64_t entries_size;
+      uint32_t entries_number;
+      const auto ret = cls_2pc_queue_get_topic_stats(rados_ioctx, queue_name, entries_number, entries_size);
+      if (ret < 0) {
+        ldpp_dout(this, 1) << "ERROR: topic stats for topic: " << queue_name << ". error: " << ret << dendl;
+      } else {
+        queue_counters_container.set(l_rgw_persistent_topic_len, entries_number);
+        queue_counters_container.set(l_rgw_persistent_topic_size, entries_size);
       }
     }
   }
@@ -956,6 +972,26 @@ int publish_abort(reservation_t& res) {
   return 0;
 }
 
+int get_persistent_queue_stats_by_topic_name(const DoutPrefixProvider *dpp, librados::IoCtx &rados_ioctx,
+                                             const std::string &topic_name, rgw_topic_stats &stats, optional_yield y)
+{
+  cls_2pc_reservations reservations;
+  auto ret = cls_2pc_queue_list_reservations(rados_ioctx, topic_name, reservations);
+  if (ret < 0) {
+    ldpp_dout(dpp, 1) << "ERROR: failed to read queue list reservation: " << ret << dendl;
+    return ret;
+  }
+  stats.queue_reservations = reservations.size();
+
+  ret = cls_2pc_queue_get_topic_stats(rados_ioctx, topic_name, stats.queue_entries, stats.queue_size);
+  if (ret < 0) {
+    ldpp_dout(dpp, 1) << "ERROR: failed to get the queue size or the number of entries: " << ret << dendl;
+    return ret;
+  }
+
+  return 0;
+}
+
 reservation_t::reservation_t(const DoutPrefixProvider* _dpp,
 			     rgw::sal::RadosStore* _store,
 			     const req_state* _s,
@@ -997,6 +1033,14 @@ reservation_t::reservation_t(const DoutPrefixProvider* _dpp,
 
 reservation_t::~reservation_t() {
   publish_abort(*this);
+}
+
+void rgw_topic_stats::dump(Formatter *f) const {
+  f->open_object_section("Topic Stats");
+  f->dump_int("Reservations", queue_reservations);
+  f->dump_int("Size", queue_size);
+  f->dump_int("Entries", queue_entries);
+  f->close_section();
 }
 
 } // namespace rgw::notify

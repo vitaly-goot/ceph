@@ -23,6 +23,7 @@
 #include "common/static_ptr.h"
 #include "common/utf8.h"
 #include "include/scope_guard.h"
+#include "common/perf_counters_key.h"
 #include "rgw_tracer.h"
 
 #include "rgw_rados.h"
@@ -1879,7 +1880,8 @@ int RGWGetObj::read_user_manifest_part(rgw::sal::Bucket* bucket,
     return 0;
   }
 
-  perfcounter->inc(l_rgw_get_b, cur_end - cur_ofs);
+  auto counters = rgw::op_counters::get(s);
+  rgw::op_counters::inc(counters, l_rgw_op_get_obj_b, cur_end - cur_ofs);
   filter->fixup_range(cur_ofs, cur_end);
   op_ret = read_op->iterate(this, cur_ofs, cur_end, filter, s->yield);
   if (op_ret >= 0)
@@ -1952,8 +1954,9 @@ static int iterate_user_manifest_parts(const DoutPrefixProvider *dpp,
 	found_end = true;
       }
 
-      perfcounter->tinc(l_rgw_get_lat,
-			(ceph_clock_now() - start_time));
+      rgw::op_counters::CountersContainer counters;
+      rgw::op_counters::tinc(counters, l_rgw_op_get_obj_lat,
+                            (ceph_clock_now() - start_time));
 
       if (found_start && !handled_end) {
         len_count += end_ofs - start_ofs;
@@ -2048,8 +2051,9 @@ static int iterate_slo_parts(const DoutPrefixProvider *dpp,
       found_end = true;
     }
 
-    perfcounter->tinc(l_rgw_get_lat,
-		      (ceph_clock_now() - start_time));
+    rgw::op_counters::CountersContainer counters;
+    rgw::op_counters::tinc(counters, l_rgw_op_get_obj_lat,
+                          (ceph_clock_now() - start_time));
 
     if (found_start) {
       if (cb) {
@@ -2396,7 +2400,8 @@ void RGWGetObj::execute(optional_yield y)
   std::unique_ptr<RGWGetObj_Filter> run_lua;
   map<string, bufferlist>::iterator attr_iter;
 
-  perfcounter->inc(l_rgw_get);
+  auto counters = rgw::op_counters::get(s);
+  rgw::op_counters::inc(counters, l_rgw_op_get_obj, 1);
 
   std::unique_ptr<rgw::sal::Object::ReadOp> read_op(s->object->get_read_op());
 
@@ -2610,14 +2615,15 @@ void RGWGetObj::execute(optional_yield y)
     return;
   }
 
-  perfcounter->inc(l_rgw_get_b, end - ofs);
+  rgw::op_counters::inc(counters, l_rgw_op_get_obj_b, end-ofs);
 
   op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
 
   if (op_ret >= 0)
     op_ret = filter->flush();
 
-  perfcounter->tinc(l_rgw_get_lat, s->time_elapsed());
+  rgw::op_counters::tinc(counters, l_rgw_op_get_obj_lat, s->time_elapsed());
+
   if (op_ret < 0) {
     goto done_err;
   }
@@ -2697,6 +2703,9 @@ void RGWListBuckets::execute(optional_yield y)
   uint64_t total_count = 0;
 
   const uint64_t max_buckets = s->cct->_conf->rgw_list_buckets_max_chunk;
+
+  auto counters = rgw::op_counters::get(s);
+  rgw::op_counters::inc(counters, l_rgw_op_list_buckets, 1);
 
   op_ret = get_params(y);
   if (op_ret < 0) {
@@ -2781,6 +2790,8 @@ send_end:
     send_response_begin(false);
   }
   send_response_end();
+
+  rgw::op_counters::tinc(counters, l_rgw_op_list_buckets_lat, s->time_elapsed());
 }
 
 void RGWGetUsage::execute(optional_yield y)
@@ -3321,6 +3332,10 @@ void RGWListBucket::execute(optional_yield y)
     objs = std::move(results.objs);
     common_prefixes = std::move(results.common_prefixes);
   }
+
+  auto counters = rgw::op_counters::get(s);
+  rgw::op_counters::inc(counters, l_rgw_op_list_obj, 1);
+  rgw::op_counters::tinc(counters, l_rgw_op_list_obj_lat, s->time_elapsed());
 }
 
 int RGWGetBucketLogging::verify_permission(optional_yield y)
@@ -3967,6 +3982,10 @@ void RGWDeleteBucket::execute(optional_yield y)
     // deleter state is DELETE_RPC_SUCCEEDED or DELETE_RPC_FAILED.
   }
 
+  auto counters = rgw::op_counters::get(s);
+  rgw::op_counters::inc(counters, l_rgw_op_del_bucket, 1);
+  rgw::op_counters::tinc(counters, l_rgw_op_del_bucket_lat, s->time_elapsed());
+
   return;
 }
 
@@ -4401,11 +4420,14 @@ void RGWPutObj::execute(optional_yield y)
   off_t fst;
   off_t lst;
 
+  auto counters = rgw::op_counters::get(s);
+
   bool need_calc_md5 = (dlo_manifest == NULL) && (slo_info == NULL);
-  perfcounter->inc(l_rgw_put);
+  rgw::op_counters::inc(counters, l_rgw_op_put_obj, 1);
+
   // report latency on return
   auto put_lat = make_scope_guard([&] {
-      perfcounter->tinc(l_rgw_put_lat, s->time_elapsed());
+      rgw::op_counters::tinc(counters, l_rgw_op_put_obj_lat, s->time_elapsed());
     });
 
   op_ret = -EINVAL;
@@ -4683,7 +4705,7 @@ void RGWPutObj::execute(optional_yield y)
   s->obj_size = ofs;
   s->object->set_obj_size(ofs);
 
-  perfcounter->inc(l_rgw_put_b, s->obj_size);
+  rgw::op_counters::inc(counters, l_rgw_op_put_obj_b, s->obj_size);
 
   op_ret = do_aws4_auth_completion();
   if (op_ret < 0) {
@@ -5708,6 +5730,11 @@ void RGWDeleteObj::execute(optional_yield y)
       op_ret = 0;
     }
 
+    auto counters = rgw::op_counters::get(s);
+    rgw::op_counters::inc(counters, l_rgw_op_del_obj, 1);
+    rgw::op_counters::inc(counters, l_rgw_op_del_obj_b, obj_size);
+    rgw::op_counters::tinc(counters, l_rgw_op_del_obj_lat, s->time_elapsed());
+
     // send request to notification manager
     int ret = res->publish_commit(this, obj_size, ceph::real_clock::now(), etag, version_id);
     if (ret < 0) {
@@ -6193,6 +6220,11 @@ void RGWCopyObj::execute(optional_yield y)
     ldpp_dout(this, 1) << "ERROR: publishing notification failed, with error: " << ret << dendl;
     // too late to rollback operation, hence op_ret is not set here
   }
+
+  auto counters = rgw::op_counters::get(s);
+  rgw::op_counters::inc(counters, l_rgw_op_copy_obj, 1);
+  rgw::op_counters::inc(counters, l_rgw_op_copy_obj_b, obj_size);
+  rgw::op_counters::tinc(counters, l_rgw_op_copy_obj_lat, s->time_elapsed());
 }
 
 int RGWGetACLs::verify_permission(optional_yield y)
