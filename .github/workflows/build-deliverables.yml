@@ -7,8 +7,6 @@ on:
   push:
     branches:
       - 'aka_version_*'
-      # Temporarily adding branch for testing
-      - 'chsmith/set-cpu-percentage'
     tags:
       - 'v*'
   pull_request:
