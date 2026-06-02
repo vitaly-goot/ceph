@@ -1,0 +1,80 @@
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+#ARG CEPH_PACKAGES="ceph-common"
+ARG INSTALL_ALL_FROM_REPO="1"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Debian artifacts from build-ceph-debians are expected under .artifacts/Ubuntu/ in build context.
+# Supported layouts:
+# - .artifacts/debs/dists + .artifacts/debs/pool
+# - .artifacts/debs/Ubuntu/dists + .artifacts/debs/Ubuntu/pool
+COPY ubuntu/ /opt/ceph-artifacts/Ubuntu
+
+# Base packages and runtime/debugging utilities
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends software-properties-common; \
+    add-apt-repository universe; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        gdisk hostname procps sg3-utils e2fsprogs lvm2 nvme-cli smartmontools \
+        attr kmod udev \
+        python3-sklearn ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+
+# lvm cannot reach udev from inside the container
+RUN sed -i -e 's/udev_rules = 1/udev_rules = 0/' \
+           -e 's/udev_sync = 1/udev_sync = 0/' \
+           -e 's/obtain_device_list_from_udev = 1/obtain_device_list_from_udev = 0/' \
+        /etc/lvm/lvm.conf && \
+    grep -q "udev_sync = 0" /etc/lvm/lvm.conf && \
+    grep -q "udev_rules = 0" /etc/lvm/lvm.conf && \
+    grep -q "obtain_device_list_from_udev = 0" /etc/lvm/lvm.conf
+
+RUN set -eux; \
+    if [ -d /opt/ceph-artifacts/dists ] && [ -d /opt/ceph-artifacts/pool ]; then \
+        repo_root=/opt/ceph-artifacts; \
+    elif [ -d /opt/ceph-artifacts/Ubuntu/dists ] && [ -d /opt/ceph-artifacts/Ubuntu/pool ]; then \
+        repo_root=/opt/ceph-artifacts/Ubuntu; \
+    else \
+        echo "No apt repo root found (expected dists/ and pool/ under artifact payload)"; \
+        exit 1; \
+    fi; \
+    codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"; \
+    echo "deb [trusted=yes] file:${repo_root} ${codename} main" > /etc/apt/sources.list.d/ceph-local.list
+
+RUN set -eux; \
+    if [ -d /opt/ceph-artifacts/dists ] && [ -d /opt/ceph-artifacts/pool ]; then \
+        repo_root=/opt/ceph-artifacts; \
+    elif [ -d /opt/ceph-artifacts/Ubuntu/dists ] && [ -d /opt/ceph-artifacts/Ubuntu/pool ]; then \
+        repo_root=/opt/ceph-artifacts/Ubuntu; \
+    else \
+        echo "No apt repo root found (expected dists/ and pool/ under artifact payload)"; \
+        exit 1; \
+    fi; \
+    codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"; \
+    apt-get update; \
+    if [ "${INSTALL_ALL_FROM_REPO}" = "1" ]; then \
+        pkg_file="${repo_root}/dists/${codename}/main/binary-amd64/Packages"; \
+        pkg_file_gz="${pkg_file}.gz"; \
+        if [ -f "${pkg_file}" ]; then \
+            packages="$(awk '/^Package: / { print $2 }' "${pkg_file}" | sort -u | tr '\n' ' ')"; \
+        elif [ -f "${pkg_file_gz}" ]; then \
+            packages="$(zcat "${pkg_file_gz}" | awk '/^Package: / { print $2 }' | sort -u | tr '\n' ' ')"; \
+        else \
+            echo "No Packages or Packages.gz found at ${repo_root}/dists/${codename}/main/binary-amd64"; \
+            exit 1; \
+        fi; \
+        if [ -z "${packages}" ]; then \
+            echo "No binary packages found in repository metadata"; \
+            exit 1; \
+        fi; \
+        apt-get install -y --no-install-recommends ${packages}; \
+    elif [ -n "${CEPH_PACKAGES}" ]; then \
+        apt-get install -y --no-install-recommends ${CEPH_PACKAGES}; \
+    fi; \
+    rm -rf /var/lib/apt/lists/* /opt/ceph-artifacts
+
+CMD ["bash"]

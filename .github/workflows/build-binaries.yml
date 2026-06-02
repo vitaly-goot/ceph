@@ -17,6 +17,9 @@ concurrency:
 
 env:
   build_arch: "x86-64-v3"
+  percentage_of_cpus_to_use: "50"
+  enable_ccache: "false"
+  enable_sccache: "true"
 
 jobs:
 
@@ -38,24 +41,28 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.2
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.6.0
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
+            percentage_of_cpus_to_use: ${{ env.percentage_of_cpus_to_use }}
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.3.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.6.0
           with:
             ceph_path: ceph
+            enable_ccache: ${{ env.enable_ccache }}
+            enable_sccache: ${{ env.enable_sccache }}
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
             ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
             cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
+            number_of_cpus: ${{ steps.derive-build-vars.outputs.nprocesses }}
             output_path: ceph/src/script/custom/build-vars.config
             build_arch: ${{ env.build_arch }}
 
         - name: Run Ceph
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.2
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.6.0
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -63,3 +70,5 @@ jobs:
             env_file: src/script/custom/build-vars.config
             custom_image_script: run-all.sh
             patch_rocksdb_portable: 'true'
+            enable_ccache: ${{ env.enable_ccache }}
+            enable_sccache: ${{ env.enable_sccache }}

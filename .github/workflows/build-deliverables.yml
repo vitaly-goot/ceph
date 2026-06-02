@@ -7,13 +7,18 @@ on:
   push:
     branches:
       - 'aka_version_*'
-      # Added while testing to trigger builds on patch branches, can be removed later
-      - 'patch/*'
+      # Temporarily adding branch for testing
+      - 'chsmith/set-cpu-percentage'
     tags:
       - 'v*'
   pull_request:
     branches:
       - 'aka_version_*'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
 
 concurrency:
   group: build-ceph-deliverables-${{ github.ref }}
@@ -25,10 +30,15 @@ permissions:
 
 env:
   build_arch: "x86-64-v3"
+  # LTO builds OOM kill if we use more than 
+  percentage_of_cpus_to_use: "25"
+  enable_ccache: "false"
+  enable_sccache: "true"
 
 jobs:
 
   resolve-lifecycle:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'build-debian') || contains(github.event.pull_request.labels.*.name, 'build-rpm') || contains(github.event.pull_request.labels.*.name, 'build-ubuntu') }}
     runs-on: ceph
     outputs:
       lifecycle_environment: ${{ steps.resolve.outputs.lifecycle_environment }}
@@ -200,24 +210,28 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4.1
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.6.0
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
+            percentage_of_cpus_to_use: ${{ env.percentage_of_cpus_to_use }}
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.4.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.6.0
           with:
             ceph_path: ceph
+            enable_ccache: ${{ env.enable_ccache }}
+            enable_sccache: ${{ env.enable_sccache }}
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
             ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
             cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
+            number_of_cpus: ${{ steps.derive-build-vars.outputs.nprocesses }}
             output_path: ceph/src/script/custom/build-vars.config
             build_arch: ${{ env.build_arch }}
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.4.1
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.6.0
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -225,6 +239,7 @@ jobs:
             env_file: src/script/custom/build-vars.config
             custom_image_script: run-all.sh
             patch_rocksdb_portable: 'true'
+            enable_ccache: ${{ env.enable_ccache }}
 
         - name: Cleanup Working dir in debs
           run: |
@@ -232,6 +247,13 @@ jobs:
             workdir="$(find ceph/debs -mindepth 2 -maxdepth 2 -type d -name WORKDIR -print -quit)"
 
             rm -rf "$workdir"
+
+            # Remove large source tarballs that are not required for artifact upload.
+            tar_gz_count="$(find ceph/debs -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
+            if [[ "${tar_gz_count}" -gt 0 ]]; then
+              echo "Removing ${tar_gz_count} .tar.gz file(s) from ceph/debs"
+              find ceph/debs -type f -name '*.tar.gz' -delete
+            fi
 
         - name: Verify JFrog CLI is available
           if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
@@ -393,7 +415,7 @@ jobs:
           docker_context: ceph
           dockerfile: ceph/.github/docker/Dockerfile.debian-packages
           image_tags: |
-            ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}
+            ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}
           platforms: linux/amd64
           build_args: |
             BASE_IMAGE=${{ matrix.base_image }}
@@ -405,4 +427,4 @@ jobs:
 
       - name: Job Output of Docker Image name
         run: |
-          echo "Docker Image: ${{ vars.RT_DOCKER_URL }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}"
+          echo "Docker Image: ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}"
