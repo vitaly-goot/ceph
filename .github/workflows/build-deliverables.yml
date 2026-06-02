@@ -1,5 +1,4 @@
-# GitHub Action to build ceph with build-with-container.py
-
+# GitHub Action to build ceph debians & docker images with build-with-container.py
 name: Build Ceph Deliverables
 
 on:
@@ -251,6 +250,13 @@ jobs:
             if [[ "${tar_gz_count}" -gt 0 ]]; then
               echo "Removing ${tar_gz_count} .tar.gz file(s) from ceph/debs"
               find ceph/debs -type f -name '*.tar.gz' -delete
+            fi
+
+            # Debug package artifacts are large and not needed for deliverable builds.
+            dbg_deb_count="$(find ceph/debs -type f \( -name '*-dbg_*.deb' -o -name '*-dbgsym_*.deb' \) | wc -l | tr -d '[:space:]')"
+            if [[ "${dbg_deb_count}" -gt 0 ]]; then
+              echo "Removing ${dbg_deb_count} debug .deb file(s) from ceph/debs"
+              find ceph/debs -type f \( -name '*-dbg_*.deb' -o -name '*-dbgsym_*.deb' \) -delete
             fi
 
         - name: Verify JFrog CLI is available

@@ -60,9 +60,9 @@ RUN set -eux; \
         pkg_file="${repo_root}/dists/${codename}/main/binary-amd64/Packages"; \
         pkg_file_gz="${pkg_file}.gz"; \
         if [ -f "${pkg_file}" ]; then \
-            packages="$(awk '/^Package: / { print $2 }' "${pkg_file}" | sort -u | tr '\n' ' ')"; \
+            packages="$(awk '/^Package: / { print $2 }' "${pkg_file}" | grep -Ev -- '-dbg$|-dbgsym$' | sort -u | tr '\n' ' ')"; \
         elif [ -f "${pkg_file_gz}" ]; then \
-            packages="$(zcat "${pkg_file_gz}" | awk '/^Package: / { print $2 }' | sort -u | tr '\n' ' ')"; \
+            packages="$(zcat "${pkg_file_gz}" | awk '/^Package: / { print $2 }' | grep -Ev -- '-dbg$|-dbgsym$' | sort -u | tr '\n' ' ')"; \
         else \
             echo "No Packages or Packages.gz found at ${repo_root}/dists/${codename}/main/binary-amd64"; \
             exit 1; \
