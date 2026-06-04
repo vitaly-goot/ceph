@@ -11,6 +11,7 @@ on:
       - 'patch/*'
     tags:
       - 'v*'
+      - 'release_*'
   pull_request:
     branches:
       - 'aka_version_*'
