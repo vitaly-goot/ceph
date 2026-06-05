@@ -945,6 +945,7 @@ class Object {
         rgw_zone_set* zones_trace{nullptr};
 	bool abortmp{false};
 	uint64_t parts_accounted_size{0};
+        bool defer_gc{false};
       } params;
 
       struct Result {

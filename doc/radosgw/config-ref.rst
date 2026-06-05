@@ -83,6 +83,18 @@ per bucket you would consider increasing :confval:`rgw_lc_max_wp_worker` from th
 .. note:: When looking to tune either of these specific values please validate the
    current Cluster performance and Ceph Object Gateway utilization before increasing.
 
+.. confval:: rgw_lc_defer_delete
+
+   When true (default false), lifecycle also queues object heads to GC (not just tails).
+   The bucket index entry is removed immediately; GC later deletes the data. While the
+   head is queued, GET/HEAD requests return "not found" since the index entry is already
+   gone. If GC is unavailable, lifecycle falls back to synchronous deletion.
+
+   Lifecycle emits two perf counters in ``radosgw`` to track this feature:
+
+   * ``lc_defer_queued`` -- heads successfully queued to GC
+   * ``lc_defer_inline`` -- heads processed inline because GC was unavailable or enqueue failed
+
 Garbage Collection Settings
 ===========================
 

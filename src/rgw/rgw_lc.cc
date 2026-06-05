@@ -755,6 +755,9 @@ struct lc_op_ctx {
 
   std::unique_ptr<rgw::sal::PlacementTier> tier;
 
+  // Deferred deletion support
+  bool defer_delete_enabled{false};
+
   lc_op_ctx(op_env& env, rgw_bucket_dir_entry& o,
 	    boost::optional<std::string> next_key_name,
 	    ceph::real_time effective_mtime,
@@ -873,7 +876,12 @@ static int remove_expired_obj(
     return ret;
   }
 
-  uint32_t flags = (!remove_indeed || !zonegroup_lc_check(dpp, oc.driver->get_zone()))
+  const bool zonegroup_ok = zonegroup_lc_check(dpp, oc.driver->get_zone());
+  if (oc.defer_delete_enabled && remove_indeed && zonegroup_ok) {
+    del_op->params.defer_gc = true;
+  }
+
+  uint32_t flags = (!remove_indeed || !zonegroup_ok)
                    ? rgw::sal::FLAG_LOG_OP : 0;
   ret =  del_op->delete_obj(dpp, y, flags);
   if (ret < 0) {
@@ -1873,6 +1881,7 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
 		      WorkQ* wq, optional_yield y)
 {
   lc_op_ctx ctx(env, o, next_key_name, effective_mtime, dpp, batch_counters, wq);
+  ctx.defer_delete_enabled = ctx.cct->_conf->rgw_lc_defer_delete;
   shared_ptr<const LCOpAction> *selected = nullptr; // n.b., req'd by sharing
   real_time exp;
 
