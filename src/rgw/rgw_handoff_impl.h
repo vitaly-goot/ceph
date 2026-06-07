@@ -1475,6 +1475,9 @@ std::string proto_to_JSON(const T& proto)
   }
 }
 
+} /* namespace rgw */
+
+namespace authorizer::v1 {
 /// Output stream operator for ::authorizer::v1:AuthorizeRequest.
 extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::AuthorizeV2Request& res);
 /// Output stream operator for ::authorizer::v1::AuthorizeResponse.
@@ -1483,9 +1486,6 @@ extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::Author
 extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraData& res);
 /// Output stream operator for ::authorizer::v1::ExtraDataSpecification.
 extern std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraDataSpecification& res);
-
-/****************************************************************************/
-
-} /* namespace rgw */
+} // namespace authorizer::v1
 
 #endif // RGW_HANDOFF_IMPL_H
