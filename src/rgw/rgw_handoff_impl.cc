@@ -1724,30 +1724,6 @@ template std::string proto_to_JSON<authorizer::v1::AuthorizeV2Response>(const au
 template std::string proto_to_JSON<authorizer::v1::ExtraData>(const authorizer::v1::ExtraData& res);
 template std::string proto_to_JSON<authorizer::v1::ExtraDataSpecification>(const authorizer::v1::ExtraDataSpecification& res);
 
-std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::AuthorizeV2Request& res)
-{
-  // os << fmt_AuthorizeV2Request(res);
-  os << proto_to_JSON<::authorizer::v1::AuthorizeV2Request>(res);
-  return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::AuthorizeV2Response& res)
-{
-  os << proto_to_JSON<::authorizer::v1::AuthorizeV2Response>(res);
-  return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraData& res)
-{
-  os << proto_to_JSON<::authorizer::v1::ExtraData>(res);
-  return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraDataSpecification& res)
-{
-  os << proto_to_JSON<::authorizer::v1::ExtraDataSpecification>(res);
-  return os;
-}
 
 /****************************************************************************/
 
@@ -1781,3 +1757,30 @@ std::ostream& operator<<(std::ostream& os, const AuthorizerClient::AuthorizeResu
 /****************************************************************************/
 
 } // namespace rgw
+
+namespace authorizer::v1 {
+
+std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::AuthorizeV2Request& res)
+{
+  os << rgw::proto_to_JSON<::authorizer::v1::AuthorizeV2Request>(res);
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::AuthorizeV2Response& res)
+{
+  os << rgw::proto_to_JSON<::authorizer::v1::AuthorizeV2Response>(res);
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraData& res)
+{
+  os << rgw::proto_to_JSON<::authorizer::v1::ExtraData>(res);
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const ::authorizer::v1::ExtraDataSpecification& res)
+{
+  os << rgw::proto_to_JSON<::authorizer::v1::ExtraDataSpecification>(res);
+  return os;
+}
+} // namespace authorizer::v1
