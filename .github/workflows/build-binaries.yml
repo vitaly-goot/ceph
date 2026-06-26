@@ -61,6 +61,24 @@ jobs:
             output_path: ceph/src/script/custom/build-vars.config
             build_arch: ${{ env.build_arch }}
 
+        - name: Match the Ceph build compiler to the custom dependencies
+          # run-all.sh builds the custom gRPC/abseil dependencies with the
+          # compiler from src/script/custom/config.env (GCC 13). The generated
+          # build-vars.config does not set CC/CXX, so without this step the main
+          # Ceph build falls back to the distro-default GCC and mixes toolchains
+          # against those GCC 13-built dependencies. Derive CC/CXX from
+          # config.env so both use the same compiler.
+          run: |
+            (
+              # Leading blank line guards against build-vars.config not ending
+              # in a newline; blank lines are ignored by the env-file parser.
+              echo ""
+              set -a
+              . ceph/src/script/custom/config.env
+              echo "CC=${AKCEPH_C_COMPILER:-gcc}"
+              echo "CXX=${AKCEPH_CXX_COMPILER:-g++}"
+            ) >> ceph/src/script/custom/build-vars.config
+
         - name: Run Ceph
           uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.6.0
           with:
