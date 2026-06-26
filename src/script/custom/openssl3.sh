@@ -26,7 +26,8 @@ cd "$tmpdir"
 git clone git://git.openssl.org/openssl.git
 cd openssl
 git checkout -b openssl-3.2.1 tags/openssl-3.2.1
-env CC="gcc" "CFLAGS=-march=$AKCEPH_GCC_TARGET_ARCH" \
+OPENSSL_CFLAGS="${AKCEPH_OPENSSL_CFLAGS:--march=${AKCEPH_GCC_TARGET_ARCH:-x86-64}}"
+env CC="${AKCEPH_C_COMPILER:-gcc}" "CFLAGS=${OPENSSL_CFLAGS}" \
     ./Configure --prefix="$INSTALL_DIR" --openssldir="$INSTALL_DIR" --libdir="$INSTALL_DIR/lib"
 make -j"$(( $(nproc)/2 ))"
 # install_sw doesn't build manpages.

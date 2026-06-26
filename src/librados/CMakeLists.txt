@@ -22,8 +22,17 @@ if(ENABLE_SHARED)
       LINK_FLAGS " -Wl,--exclude-libs,ALL")
   endif()
   if(HAVE_LINK_VERSION_SCRIPT AND NOT WIN32)
+    set(librados_version_script_flags
+      " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/librados.map")
+    # librados uses empty-version symver aliases (for example, "foo@@")
+    # to preserve the legacy unversioned C ABI. lld rejects those aliases,
+    # so keep Clang/IPO for the objects but link this shared library with
+    # GNU ld when the global build selected lld.
+    if(CMAKE_SHARED_LINKER_FLAGS MATCHES "-fuse-ld=([^ ]*/)?lld")
+      string(APPEND librados_version_script_flags " -fuse-ld=bfd")
+    endif()
     set_property(TARGET librados APPEND_STRING PROPERTY
-      LINK_FLAGS " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/librados.map")
+      LINK_FLAGS "${librados_version_script_flags}")
   endif()
   if(WITH_STATIC_LIBSTDCXX)
     set_property(TARGET librados APPEND_STRING PROPERTY

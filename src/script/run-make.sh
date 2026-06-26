@@ -126,7 +126,7 @@ EOM
     cmake_opts+=" -DWITH_FIO=ON"
     cmake_opts+=" -DWITH_CEPHFS_SHELL=ON"
     cmake_opts+=" -DWITH_GRAFANA=ON"
-    cmake_opts+=" -DWITH_SPDK=ON"
+    cmake_opts+=" -DWITH_SPDK=${WITH_SPDK:-ON}"
     cmake_opts+=" -DWITH_RBD_MIRROR=ON"
     if [ $WITH_CRIMSON ]; then
         cmake_opts+=" -DWITH_CRIMSON=ON"
@@ -135,7 +135,7 @@ EOM
         cmake_opts+=" -DWITH_RBD_RWL=ON"
     fi
     cmake_opts+=" -DWITH_RBD_SSD_CACHE=ON"
-    cmake_opts+=" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
+    cmake_opts+=" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=${CMAKE_INTERPROCEDURAL_OPTIMIZATION:-ON}"
 
     cmake_opts+=" $(detect_ceph_dev_pkgs)"
 

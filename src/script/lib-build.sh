@@ -84,6 +84,26 @@ function discover_compiler() {
     local distro_id=""
     local distro_version=""
     local use_clang=1
+
+    if [ -n "${CC:-}" ] || [ -n "${CXX:-}" ]; then
+        if [ -z "${CC:-}" ] || [ -z "${CXX:-}" ]; then
+            echo "CC and CXX must both be set to override compiler discovery" >&2
+            return 1
+        fi
+        if ! command -v "${CC}" > /dev/null; then
+            echo "C compiler not found: ${CC}" >&2
+            return 1
+        fi
+        if ! command -v "${CXX}" > /dev/null; then
+            echo "C++ compiler not found: ${CXX}" >&2
+            return 1
+        fi
+        export discovered_c_compiler="${CC}"
+        export discovered_cxx_compiler="${CXX}"
+        export discovered_compiler_env=""
+        return 0
+    fi
+
     if [ -r /etc/os-release ]; then
         distro_id="$(. /etc/os-release; echo "${ID}")"
         distro_version="$(. /etc/os-release; echo "${VERSION_ID}")"

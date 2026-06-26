@@ -41,7 +41,16 @@ namespace ceph {
     virtual ~Plugin() {}
   };
 
-  class PluginRegistry {
+#ifdef WITH_CRIMSON
+#define CEPH_PLUGIN_REGISTRY_IMPL CrimsonPluginRegistry
+#else
+#define CEPH_PLUGIN_REGISTRY_IMPL PluginRegistry
+#endif
+
+  // The classic and Crimson variants use different CephContext and mutex
+  // types. Give the Crimson implementation a distinct symbol name so both
+  // variants can be linked into crimson-osd when AlienStore is enabled.
+  class CEPH_PLUGIN_REGISTRY_IMPL {
   public:
     CephContext *cct;
     ceph::mutex lock = ceph::make_mutex("PluginRegistery::lock");
@@ -49,8 +58,8 @@ namespace ceph {
     bool disable_dlclose;
     std::map<std::string,std::map<std::string,Plugin*> > plugins;
 
-    explicit PluginRegistry(CephContext *cct);
-    ~PluginRegistry();
+    explicit CEPH_PLUGIN_REGISTRY_IMPL(CephContext *cct);
+    ~CEPH_PLUGIN_REGISTRY_IMPL();
 
     int add(const std::string& type, const std::string& name,
 	    Plugin *factory);
@@ -63,6 +72,12 @@ namespace ceph {
     int preload();
     int preload(const std::string& type);
   };
+
+#ifdef WITH_CRIMSON
+  using PluginRegistry = CrimsonPluginRegistry;
+#endif
+
+#undef CEPH_PLUGIN_REGISTRY_IMPL
 }
 
 #endif

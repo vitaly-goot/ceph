@@ -47,15 +47,23 @@ macro(build_spdk)
   ExternalProject_Add(spdk-ext
     DEPENDS dpdk-ext
     SOURCE_DIR ${source_dir}
-    CONFIGURE_COMMAND ./configure
+    CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
+      CC=${CMAKE_C_COMPILER}
+      CXX=${CMAKE_CXX_COMPILER}
+      ./configure
       --with-dpdk=${DPDK_DIR}
       --without-isal
       --without-vhost
+      # Ceph consumes the SPDK libraries, not its functional test binaries.
+      --disable-tests
       --target-arch=${target_arch}
     # unset $CFLAGS, otherwise it will interfere with how SPDK sets
     # its include directory.
     # unset $LDFLAGS, otherwise SPDK will fail to mock some functions.
-    BUILD_COMMAND env -i PATH=$ENV{PATH} CC=${CMAKE_C_COMPILER} ${make_cmd} EXTRA_CFLAGS=${spdk_CFLAGS}
+    BUILD_COMMAND env -i PATH=$ENV{PATH}
+      CC=${CMAKE_C_COMPILER}
+      CXX=${CMAKE_CXX_COMPILER}
+      ${make_cmd} EXTRA_CFLAGS=${spdk_CFLAGS}
     BUILD_IN_SOURCE 1
     BUILD_BYPRODUCTS ${spdk_libs}
     INSTALL_COMMAND ""

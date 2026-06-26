@@ -59,7 +59,12 @@ namespace ceph::common {
 }
 
 namespace ceph {
+#ifdef WITH_CRIMSON
+  class CrimsonPluginRegistry;
+  using PluginRegistry = CrimsonPluginRegistry;
+#else
   class PluginRegistry;
+#endif
   class HeartbeatMap;
   namespace logging {
     class Log;

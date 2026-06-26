@@ -213,7 +213,7 @@ _CONTAINER_SOURCES = [
     "Dockerfile.build",
     "src/script/lib-build.sh",
     "src/script/run-make.sh",
-    "src/script/custom"
+    "src/script/custom",
     "ceph.spec.in",
     "do_cmake.sh",
     "install-deps.sh",

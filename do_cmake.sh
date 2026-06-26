@@ -72,16 +72,33 @@ elif type ccache > /dev/null 2>&1 ; then
     ARGS+=" -DWITH_CCACHE=ON"
 fi
 
-cxx_compiler="g++"
-c_compiler="gcc"
-# 20 is used for more future-proof
-for i in $(seq 20 -1 11); do
-  if type -t gcc-$i > /dev/null; then
-    cxx_compiler="g++-$i"
-    c_compiler="gcc-$i"
-    break
+if [ -n "${CC:-}" ] || [ -n "${CXX:-}" ]; then
+  if [ -z "${CC:-}" ] || [ -z "${CXX:-}" ]; then
+    echo "CC and CXX must both be set to override compiler discovery" >&2
+    exit 1
   fi
-done
+  command -v "$CC" > /dev/null || {
+    echo "C compiler not found: $CC" >&2
+    exit 1
+  }
+  command -v "$CXX" > /dev/null || {
+    echo "C++ compiler not found: $CXX" >&2
+    exit 1
+  }
+  c_compiler="$CC"
+  cxx_compiler="$CXX"
+else
+  cxx_compiler="g++"
+  c_compiler="gcc"
+  # 20 is used for more future-proof
+  for i in $(seq 20 -1 11); do
+    if type -t gcc-$i > /dev/null; then
+      cxx_compiler="g++-$i"
+      c_compiler="gcc-$i"
+      break
+    fi
+  done
+fi
 ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
 ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
 
@@ -121,4 +138,3 @@ WARNING: do_cmake.sh now creates RelWithDebInfo builds by default when .git is a
 "
     fi
 fi
-

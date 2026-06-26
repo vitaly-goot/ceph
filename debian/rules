@@ -12,7 +12,13 @@ ifneq (,$(findstring WITH_STATIC_LIBSTDCXX,$(CEPH_EXTRA_CMAKE_ARGS)))
   # see http://tracker.ceph.com/issues/25209
   export DEB_LDFLAGS_MAINT_STRIP = -Wl,-Bsymbolic-functions
 endif
-ifeq (,$(findstring WITH_CRIMSON,$(CEPH_EXTRA_CMAKE_ARGS)))
+ifneq (,$(findstring WITH_CRIMSON,$(CEPH_EXTRA_CMAKE_ARGS)))
+  crimson_enabled = true
+endif
+ifneq ($(WITH_CRIMSON),)
+  crimson_enabled = true
+endif
+ifeq ($(crimson_enabled),)
   export CEPH_OSD_BASENAME = ceph-osd
 else
   export CEPH_OSD_BASENAME = crimson-osd
@@ -42,6 +48,21 @@ extraopts += -DCMAKE_INSTALL_LIBDIR=/usr/lib
 extraopts += -DCMAKE_INSTALL_LIBEXECDIR=/usr/libexec
 extraopts += -DCMAKE_INSTALL_SYSCONFDIR=/etc
 extraopts += -DCMAKE_BUILD_TYPE=RelWithDebInfo
+ifneq ($(WITH_CRIMSON),)
+  extraopts += -DWITH_CRIMSON=ON
+endif
+ifneq ($(WITH_SPDK),)
+  extraopts += -DWITH_SPDK=$(WITH_SPDK)
+endif
+ifneq ($(CMAKE_INTERPROCEDURAL_OPTIMIZATION),)
+  extraopts += -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=$(CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+endif
+ifneq (,$(filter environment command line file,$(origin CC)))
+  extraopts += -DCMAKE_C_COMPILER=$(CC)
+endif
+ifneq (,$(filter environment command line file,$(origin CXX)))
+  extraopts += -DCMAKE_CXX_COMPILER=$(CXX)
+endif
 ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
   NUMJOBS = $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
   extraopts += -DBOOST_J=$(NUMJOBS)

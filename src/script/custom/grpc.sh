@@ -39,19 +39,37 @@ cd "$tmpdir"
 git clone --recurse-submodules --shallow-submodules --depth=1 \
     -c advice.detachedHead=false \
     -b "v${AKCEPH_GRPC_VERSION}" https://github.com/grpc/grpc.git
-cd grpc/cmake
+cd grpc
+
+# gRPC 1.59.3 prefixes the non-template CallSeqFactory member with the
+# dependent-template disambiguator. GCC accepts it, but Clang 19 rejects it.
+basic_seq_header=src/core/lib/promise/detail/basic_seq.h
+if [[ "${AKCEPH_CXX_COMPILER:-}" == clang++-19 ]]; then
+    if ! grep -q 'Traits::template CallSeqFactory' "${basic_seq_header}"; then
+        echo "Clang 19 gRPC compatibility patch no longer applies" >&2
+        exit 1
+    fi
+    sed -i 's/Traits::template CallSeqFactory/Traits::CallSeqFactory/' \
+        "${basic_seq_header}"
+fi
+
+cd cmake
 rm -rf build
 mkdir -p build
 cd build
 declare -a disable_plugins; disable_plugins=()
 for p in CSHARP NODE OBJECTIVE_C PHP RUBY; do disable_plugins+=("-DgRPC_BUILD_GRPC_${p}_PLUGIN=OFF"); done
 
-COMMON_FLAGS="-march=$AKCEPH_GCC_TARGET_ARCH -flto=auto -ffat-lto-objects"
+COMMON_FLAGS="${AKCEPH_COMMON_FLAGS:--march=${AKCEPH_GCC_TARGET_ARCH:-x86-64}}"
+LINKER_FLAGS="${AKCEPH_LINKER_FLAGS:-}"
 cmake -GNinja \
-    -DCMAKE_C_COMPILER=gcc-11 \
-    -DCMAKE_CXX_COMPILER=g++-11 \
+    -DCMAKE_C_COMPILER="${AKCEPH_C_COMPILER:-gcc}" \
+    -DCMAKE_CXX_COMPILER="${AKCEPH_CXX_COMPILER:-g++}" \
     -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
     -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$LINKER_FLAGS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_FLAGS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$LINKER_FLAGS" \
     -DgRPC_INSTALL=ON \
     -DgRPC_ABSL_PROVIDER=package \
     -DgRPC_SSL_PROVIDER=package \

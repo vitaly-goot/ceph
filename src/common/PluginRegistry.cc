@@ -32,16 +32,22 @@
 using std::map;
 using std::string;
 
+#ifdef WITH_CRIMSON
+#define CEPH_PLUGIN_REGISTRY_IMPL CrimsonPluginRegistry
+#else
+#define CEPH_PLUGIN_REGISTRY_IMPL PluginRegistry
+#endif
+
 namespace ceph {
 
-PluginRegistry::PluginRegistry(CephContext *cct) :
+CEPH_PLUGIN_REGISTRY_IMPL::CEPH_PLUGIN_REGISTRY_IMPL(CephContext *cct) :
   cct(cct),
   loading(false),
   disable_dlclose(false)
 {
 }
 
-PluginRegistry::~PluginRegistry()
+CEPH_PLUGIN_REGISTRY_IMPL::~CEPH_PLUGIN_REGISTRY_IMPL()
 {
   if (disable_dlclose)
     return;
@@ -59,7 +65,8 @@ PluginRegistry::~PluginRegistry()
   }
 }
 
-int PluginRegistry::remove(const std::string& type, const std::string& name)
+int CEPH_PLUGIN_REGISTRY_IMPL::remove(const std::string& type,
+				      const std::string& name)
 {
   ceph_assert(ceph_mutex_is_locked(lock));
 
@@ -82,9 +89,9 @@ int PluginRegistry::remove(const std::string& type, const std::string& name)
   return 0;
 }
 
-int PluginRegistry::add(const std::string& type,
-			const std::string& name,
-			Plugin* plugin)
+int CEPH_PLUGIN_REGISTRY_IMPL::add(const std::string& type,
+				   const std::string& name,
+				   Plugin* plugin)
 {
   ceph_assert(ceph_mutex_is_locked(lock));
   if (plugins.count(type) &&
@@ -97,8 +104,8 @@ int PluginRegistry::add(const std::string& type,
   return 0;
 }
 
-Plugin *PluginRegistry::get_with_load(const std::string& type,
-          const std::string& name)
+Plugin *CEPH_PLUGIN_REGISTRY_IMPL::get_with_load(const std::string& type,
+						 const std::string& name)
 {
   std::lock_guard l(lock);
   Plugin* ret = get(type, name);
@@ -110,8 +117,8 @@ Plugin *PluginRegistry::get_with_load(const std::string& type,
   return ret;
 }
 
-Plugin *PluginRegistry::get(const std::string& type,
-			    const std::string& name)
+Plugin *CEPH_PLUGIN_REGISTRY_IMPL::get(const std::string& type,
+				       const std::string& name)
 {
   ceph_assert(ceph_mutex_is_locked(lock));
   Plugin *ret = 0;
@@ -132,8 +139,8 @@ Plugin *PluginRegistry::get(const std::string& type,
   return ret;
 }
 
-int PluginRegistry::load(const std::string &type,
-			 const std::string &name)
+int CEPH_PLUGIN_REGISTRY_IMPL::load(const std::string &type,
+				    const std::string &name)
 {
   ceph_assert(ceph_mutex_is_locked(lock));
   ldout(cct, 1) << __func__ << " " << type << " " << name << dendl;
@@ -210,6 +217,8 @@ int PluginRegistry::load(const std::string &type,
   return 0;
 }
 }
+
+#undef CEPH_PLUGIN_REGISTRY_IMPL
 
 /*
 int ErasureCodePluginRegistry::preload(const std::string &plugins,
