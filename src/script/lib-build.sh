@@ -104,6 +104,28 @@ function discover_compiler() {
         return 0
     fi
 
+    # If the custom dependencies (Abseil/gRPC) were built with a specific
+    # compiler, recorded in src/script/custom/config.env, build the main tree
+    # with that same compiler. Those dependency archives carry GCC LTO
+    # bytecode, so a mismatched compiler makes the final link fail with an
+    # "LTO version" error. Only applies when that compiler is installed, so
+    # stock images that lack it fall through to the normal discovery below.
+    local custom_config="${AKCEPH_CUSTOM_CONFIG:-src/script/custom/config.env}"
+    if [ -r "${custom_config}" ]; then
+        local custom_cc custom_cxx
+        custom_cc="$(. "${custom_config}" > /dev/null 2>&1; printf '%s' "${AKCEPH_C_COMPILER:-}")"
+        custom_cxx="$(. "${custom_config}" > /dev/null 2>&1; printf '%s' "${AKCEPH_CXX_COMPILER:-}")"
+        if [ -n "${custom_cc}" ] && [ -n "${custom_cxx}" ] \
+            && command -v "${custom_cc}" > /dev/null \
+            && command -v "${custom_cxx}" > /dev/null; then
+            ci_debug "Using custom dependency compiler ${custom_cc}/${custom_cxx} from ${custom_config}"
+            export discovered_c_compiler="${custom_cc}"
+            export discovered_cxx_compiler="${custom_cxx}"
+            export discovered_compiler_env=""
+            return 0
+        fi
+    fi
+
     if [ -r /etc/os-release ]; then
         distro_id="$(. /etc/os-release; echo "${ID}")"
         distro_version="$(. /etc/os-release; echo "${VERSION_ID}")"
