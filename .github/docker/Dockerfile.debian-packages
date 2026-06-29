@@ -3,6 +3,17 @@ FROM ${BASE_IMAGE}
 
 #ARG CEPH_PACKAGES="ceph-common"
 ARG INSTALL_ALL_FROM_REPO="1"
+# When STRICT_INSTALL=1, a failure to install ANY package from the repo aborts
+# the build (original all-or-nothing behavior). When 0 (default), the build
+# first tries to install every package atomically; if that fails it falls back
+# to installing packages one-by-one, reporting each package that cannot be
+# satisfied, and only fails the build if a core runtime package fails.
+ARG STRICT_INSTALL="0"
+# Space-separated globs of packages that are optional for a runtime image and
+# may be skipped when their dependencies are not satisfiable on the base image
+# (dev headers, test tooling, cluster RA glue, and orchestrator modules that
+# depend on packages outside the base image's enabled components).
+ARG OPTIONAL_PACKAGE_GLOBS="*-dev *-dbg *-dbgsym ceph-test ceph-test-* ceph-resource-agents ceph-mgr-rook ceph-mgr-k8sevents ceph-mgr-cephadm"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -33,6 +44,7 @@ RUN sed -i -e 's/udev_rules = 1/udev_rules = 0/' \
     grep -q "udev_rules = 0" /etc/lvm/lvm.conf && \
     grep -q "obtain_device_list_from_udev = 0" /etc/lvm/lvm.conf
 
+# Detect the apt repo root once and record it for later steps.
 RUN set -eux; \
     if [ -d /opt/ceph-artifacts/dists ] && [ -d /opt/ceph-artifacts/pool ]; then \
         repo_root=/opt/ceph-artifacts; \
@@ -43,19 +55,43 @@ RUN set -eux; \
         exit 1; \
     fi; \
     codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"; \
+    printf 'CEPH_REPO_ROOT=%s\nCEPH_REPO_CODENAME=%s\n' "${repo_root}" "${codename}" > /etc/ceph-local-repo.env; \
     echo "deb [trusted=yes] file:${repo_root} ${codename} main" > /etc/apt/sources.list.d/ceph-local.list
 
-RUN set -eux; \
-    if [ -d /opt/ceph-artifacts/dists ] && [ -d /opt/ceph-artifacts/pool ]; then \
-        repo_root=/opt/ceph-artifacts; \
-    elif [ -d /opt/ceph-artifacts/Ubuntu/dists ] && [ -d /opt/ceph-artifacts/Ubuntu/pool ]; then \
-        repo_root=/opt/ceph-artifacts/Ubuntu; \
-    else \
-        echo "No apt repo root found (expected dists/ and pool/ under artifact payload)"; \
-        exit 1; \
-    fi; \
-    codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-jammy}")"; \
+ARG INSTALL_ALL_FROM_REPO
+ARG STRICT_INSTALL
+ARG OPTIONAL_PACKAGE_GLOBS
+RUN set -eu; \
+    . /etc/ceph-local-repo.env; \
+    repo_root="${CEPH_REPO_ROOT}"; \
+    codename="${CEPH_REPO_CODENAME}"; \
     apt-get update; \
+    \
+    is_optional() { \
+        pkg="$1"; \
+        for glob in ${OPTIONAL_PACKAGE_GLOBS}; do \
+            case "${pkg}" in ${glob}) return 0;; esac; \
+        done; \
+        return 1; \
+    }; \
+    \
+    install_one() { \
+        pkg="$1"; \
+        if apt-get install -y --no-install-recommends "${pkg}"; then \
+            echo "INSTALLED ${pkg}"; \
+            return 0; \
+        fi; \
+        if is_optional "${pkg}"; then \
+            echo "::warning:: skipping optional package that failed to install: ${pkg}"; \
+            skipped="${skipped} ${pkg}"; \
+            return 0; \
+        fi; \
+        echo "::error:: required package failed to install: ${pkg}"; \
+        failed="${failed} ${pkg}"; \
+        return 1; \
+    }; \
+    \
+    skipped=""; failed=""; \
     if [ "${INSTALL_ALL_FROM_REPO}" = "1" ]; then \
         pkg_file="${repo_root}/dists/${codename}/main/binary-amd64/Packages"; \
         pkg_file_gz="${pkg_file}.gz"; \
@@ -71,10 +107,32 @@ RUN set -eux; \
             echo "No binary packages found in repository metadata"; \
             exit 1; \
         fi; \
-        apt-get install -y --no-install-recommends ${packages}; \
-    elif [ -n "${CEPH_PACKAGES}" ]; then \
-        apt-get install -y --no-install-recommends ${CEPH_PACKAGES}; \
+        echo "Packages discovered in local repo:"; \
+        for p in ${packages}; do echo "  ${p}"; done; \
+        if apt-get install -y --no-install-recommends ${packages}; then \
+            echo "All packages installed in a single transaction."; \
+        else \
+            if [ "${STRICT_INSTALL}" = "1" ]; then \
+                echo "::error:: atomic install failed and STRICT_INSTALL=1; not falling back to per-package install"; \
+                exit 100; \
+            fi; \
+            echo "Atomic install failed; retrying package-by-package to identify the offender(s)."; \
+            apt-get install -y --no-install-recommends --fix-broken || true; \
+            for pkg in ${packages}; do \
+                install_one "${pkg}" || true; \
+            done; \
+        fi; \
+    elif [ -n "${CEPH_PACKAGES:-}" ]; then \
+        for pkg in ${CEPH_PACKAGES}; do \
+            install_one "${pkg}" || true; \
+        done; \
     fi; \
-    rm -rf /var/lib/apt/lists/* /opt/ceph-artifacts
+    \
+    if [ -n "${skipped# }" ]; then echo "Skipped optional packages:${skipped}"; fi; \
+    if [ -n "${failed# }" ]; then \
+        echo "::error:: required packages that could not be installed:${failed}"; \
+        exit 100; \
+    fi; \
+    rm -rf /var/lib/apt/lists/* /opt/ceph-artifacts /etc/ceph-local-repo.env
 
 CMD ["bash"]
