@@ -19,8 +19,8 @@ The short version is:
   ``WITH_CRIMSON``, ``WITH_SPDK``, ``CC``, ``CXX``, and
   ``CMAKE_INTERPROCEDURAL_OPTIMIZATION``;
 * keep ``RelWithDebInfo`` as the default build type;
-* keep IPO/LTO configurable, but enable it for the validated OSD and Crimson
-  configs;
+* keep IPO/LTO configurable, and enable it for the validated OSD, Crimson, and
+  Debian package defaults;
 * keep SPDK enabled for classic OSD builds and disabled for Crimson builds.
 
 The config files are:
@@ -57,7 +57,8 @@ The current approach makes the selected build knobs explicit and shared:
 * ``src/script/ccache.osd.config`` selects GCC 13, keeps SPDK enabled, enables
   IPO, and pins ``RelWithDebInfo`` for classic OSD;
 * ``src/script/custom/config.env`` selects the compiler and flags used for
-  custom Abseil/gRPC/OpenSSL dependency builds;
+  custom Abseil/gRPC/OpenSSL dependency builds, and provides default package
+  build policy for ``make-debs.sh``;
 * ``debian/rules`` derives Debian package CMake arguments from the same
   ``WITH_CRIMSON``, ``WITH_SPDK``, ``CC``, ``CXX``, and
   ``CMAKE_INTERPROCEDURAL_OPTIMIZATION`` environment variables.
@@ -95,6 +96,13 @@ Current config matrix
      - GCC default linker, normally GNU ``ld.bfd``
      - On
      - On
+     - ``RelWithDebInfo``
+   * - Debian packages
+     - ``src/script/custom/config.env`` plus the supplied ``--env-file``
+     - GCC 13
+     - GCC default linker, normally GNU ``ld.bfd``
+     - On by default
+     - On by default
      - ``RelWithDebInfo``
 
 Example Crimson build:
@@ -158,8 +166,29 @@ The two paths reach CMake differently:
 * ``-e debs`` goes through ``make-debs.sh``, ``dpkg-buildpackage``, and
   ``debian/rules``.  It does not consume ``ARGS`` directly.
 
-To keep those paths aligned, ``debian/rules`` now derives the package CMake
-arguments from the same environment variables:
+To keep those paths aligned, ``make-debs.sh`` sources the live checkout's
+``src/script/custom/config.env`` before creating/extracting the source tarball
+and exports default package-build values when the caller did not already
+provide them.  The downstream defaults are:
+
+* ``CC=gcc-13`` and ``CXX=g++-13``;
+* ``WITH_SPDK=ON``;
+* ``CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON``;
+* ``AKCEPH_PACKAGE_NPROC_MAX=4``.
+
+``RelWithDebInfo`` still comes from ``debian/rules``.  The package build is
+therefore optimized with debug info.  Callers can still opt out of package IPO
+explicitly with ``CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF`` in the env file or
+command environment.
+
+For package builds with IPO/LTO enabled, ``make-debs.sh`` caps ``NPROC`` to
+``AKCEPH_PACKAGE_NPROC_MAX=4`` by default unless the caller overrides that
+policy.  This does not change optimization or generated code; it only lowers
+concurrent build jobs so late RGW, gRPC, Abseil, and Arrow links are less
+likely to be killed by memory pressure.
+
+``debian/rules`` derives the package CMake arguments from these environment
+variables:
 
 .. list-table::
    :header-rows: 1
@@ -180,6 +209,40 @@ arguments from the same environment variables:
 ``CEPH_EXTRA_CMAKE_ARGS`` is still supported for ad hoc extra package-build
 arguments, but the common Crimson/SPDK/toolchain/IPO choices should come from
 the env file instead of being duplicated there.
+
+Avoiding unshipped helper links in package builds
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``dbstore`` is RGW's database-backed storage driver plumbing.  The package
+build still builds and links the real RGW dbstore libraries, including
+``dbstore_lib``, ``sqlite_db``, and ``dbstore``.  RGW support is not disabled.
+
+The only target excluded from the default package build is ``dbstore-bin``.  It
+is a standalone helper executable from
+``src/rgw/driver/dbstore/dbstore_main.cc``; the CMake file labels it "testing
+purpose", and it is not installed by the Debian package manifests.  With
+IPO/LTO enabled it also pulls in a large RGW/dbstore/sqlite/gRPC/Abseil link
+graph without producing a package artifact.
+
+The package default still keeps GCC 13, SPDK, ``RelWithDebInfo``, and IPO/LTO
+enabled.  Excluding ``dbstore-bin`` from the default ``all`` target avoids
+building an unshipped helper while leaving it buildable explicitly for
+developers:
+
+.. code-block:: console
+
+   ninja dbstore-bin
+
+This matters in CI because the workflow passes a generated
+``src/script/custom/build-vars.config`` to ``build-with-container.py``.  That
+file carries cache and parallelism settings, but it is not the same as
+``ccache.osd.config`` or ``ccache.crimson.config``.  Sourcing
+``src/script/custom/config.env`` early in ``make-debs.sh`` keeps package builds
+on the same GCC 13 compiler, package defaults, and package parallelism cap as
+the custom Abseil/gRPC dependency image.  The generated package-build env can
+still set operational settings such as ccache remote storage and a requested
+``NPROC``; the downstream cap reduces it when needed for IPO/LTO memory
+headroom.
 
 On Ubuntu/Debian, ``-e packages`` routes to ``-e debs``.  On RPM-based distros,
 it routes to the RPM path.
@@ -214,8 +277,9 @@ Before and after
        not those test binaries.
    * - IPO/LTO
      - Forced on by ``run-make.sh``.
-     - Controlled by ``CMAKE_INTERPROCEDURAL_OPTIMIZATION`` from the env file
-       for both ``-e build`` and ``-e debs``.
+     - Controlled by ``CMAKE_INTERPROCEDURAL_OPTIMIZATION`` from the env file.
+       The normal ``-e build`` OSD/Crimson configs and package defaults enable
+       it; callers can opt out explicitly.
    * - Linker
      - Upstream Clang builds use the default system linker unless callers pass
        linker flags.  Downstream env files forced LLD globally, exposing
@@ -228,8 +292,10 @@ Before and after
    * - Debian packages
      - Package builds required separate ``CEPH_EXTRA_CMAKE_ARGS`` duplication
        for common Crimson/toolchain settings.
-     - ``debian/rules`` derives Crimson, SPDK, IPO, and compiler settings from
-       the same env variables used by ``-e build``.
+     - ``make-debs.sh`` exports package defaults for compiler, SPDK, and CMake
+       IPO before ``debian/rules`` configures CMake.  Uninstalled helper
+       binaries such as ``dbstore-bin`` are kept out of the default package
+       ``all`` build.
    * - Crimson/AlienStore link
      - Hit a ``PluginRegistry`` symbol collision when linking ``crimson-osd``.
      - Crimson uses a separate implementation name while preserving the public
@@ -274,6 +340,9 @@ It defaults to GCC 13 and GCC LTO flags:
 
    AKCEPH_C_COMPILER=gcc-13
    AKCEPH_CXX_COMPILER=g++-13
+   AKCEPH_WITH_SPDK=ON
+   AKCEPH_CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+   AKCEPH_PACKAGE_NPROC_MAX=4
    AKCEPH_COMMON_FLAGS="-march=x86-64 -flto=auto -ffat-lto-objects"
    AKCEPH_LINKER_FLAGS=
    AKCEPH_OPENSSL_CFLAGS="-march=x86-64"

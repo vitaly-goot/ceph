@@ -39,6 +39,31 @@ else
     dvers=${vers}-1${VERSION_CODENAME}
 fi
 
+#
+# Align Debian package builds with the custom dependency image.  The normal
+# build path discovers the compiler from src/script/custom/config.env, but
+# dpkg-buildpackage goes directly through debian/rules.  Export the same
+# defaults here so CMake does not build Ceph with a different compiler than
+# the Abseil/gRPC archives produced by the custom image script.
+#
+if [ -r src/script/custom/config.env ]; then
+   # shellcheck disable=SC1091
+   . src/script/custom/config.env
+   if [ -z "${CC:-}" ] && [ -n "${AKCEPH_C_COMPILER:-}" ]; then
+      export CC="${AKCEPH_C_COMPILER}"
+   fi
+   if [ -z "${CXX:-}" ] && [ -n "${AKCEPH_CXX_COMPILER:-}" ]; then
+      export CXX="${AKCEPH_CXX_COMPILER}"
+   fi
+   if [ -z "${WITH_SPDK:-}" ] && [ -n "${AKCEPH_WITH_SPDK:-}" ]; then
+      export WITH_SPDK="${AKCEPH_WITH_SPDK}"
+   fi
+   if [ -z "${CMAKE_INTERPROCEDURAL_OPTIMIZATION:-}" ] &&
+      [ -n "${AKCEPH_CMAKE_INTERPROCEDURAL_OPTIMIZATION:-}" ]; then
+      export CMAKE_INTERPROCEDURAL_OPTIMIZATION="${AKCEPH_CMAKE_INTERPROCEDURAL_OPTIMIZATION}"
+   fi
+fi
+
 test -f "ceph-$vers.tar.bz2" || ./make-dist $vers
 
 # Call trivy (Or anything on the command line, but the intent is trivy)
@@ -73,6 +98,13 @@ chvers=$(head -1 debian/changelog | perl -ne 's/.*\(//; s/\).*//; print')
 if [ "$chvers" != "$dvers" ]; then
    DEBEMAIL="contact@ceph.com" dch -D $VERSION_CODENAME --force-distribution -b -v "$dvers" "new version"
 fi
+
+echo "Package build CC=${CC:-unset}"
+echo "Package build CXX=${CXX:-unset}"
+echo "Package build WITH_SPDK=${WITH_SPDK:-unset}"
+echo "Package build CMAKE_INTERPROCEDURAL_OPTIMIZATION=${CMAKE_INTERPROCEDURAL_OPTIMIZATION:-unset}"
+echo "Package build AKCEPH_PACKAGE_NPROC_MAX=${AKCEPH_PACKAGE_NPROC_MAX:-unset}"
+
 #
 # Add a -j option if $DEB_BUILD_OPTIONS doesn't have parallel=n in it.
 # Default: use half of the available processors
@@ -80,6 +112,15 @@ PARALLEL="parallel"
 echo "DEB_BUILD_OPTIONS " $DEB_BUILD_OPTIONS
 if [[ ! $DEB_BUILD_OPTIONS =~ $PARALLEL ]] ; then
    : ${NPROC:=$(($(nproc) / 2))}
+   if [[ -n "${AKCEPH_PACKAGE_NPROC_MAX:-}" &&
+         "${AKCEPH_PACKAGE_NPROC_MAX}" =~ ^[0-9]+$ &&
+         "${AKCEPH_PACKAGE_NPROC_MAX}" -gt 0 &&
+         "${NPROC}" =~ ^[0-9]+$ &&
+         "${NPROC}" -gt "${AKCEPH_PACKAGE_NPROC_MAX}" ]]; then
+      echo "Package build NPROC capped from ${NPROC} to ${AKCEPH_PACKAGE_NPROC_MAX}"
+      NPROC="${AKCEPH_PACKAGE_NPROC_MAX}"
+   fi
+   echo "Package build NPROC=${NPROC}"
    if test $NPROC -gt 1 ; then
       j=-j${NPROC}
    fi

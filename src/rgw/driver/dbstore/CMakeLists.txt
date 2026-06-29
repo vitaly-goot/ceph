@@ -66,6 +66,6 @@ set(dbstore_main_srcs
     dbstore_main.cc)
 
 set (CMAKE_LINK_LIBRARIES ${CMAKE_LINK_LIBRARIES} dbstore)
-add_executable(dbstore-bin ${dbstore_main_srcs})
+add_executable(dbstore-bin EXCLUDE_FROM_ALL ${dbstore_main_srcs})
 add_dependencies(dbstore-bin dbstore)
 target_link_libraries(dbstore-bin ${CMAKE_LINK_LIBRARIES})
