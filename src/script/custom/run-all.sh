@@ -88,6 +88,7 @@ scripts=(
     "${SCRIPT_DIR}/abseil.sh"
     "${SCRIPT_DIR}/openssl3.sh"
     "${SCRIPT_DIR}/grpc.sh"
+    "${SCRIPT_DIR}/runtime-libstdcxx.sh"
 )
 
 total="${#scripts[@]}"

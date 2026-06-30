@@ -147,6 +147,17 @@ if [ ! -e conf ]; then
 fi
 reprepro --basedir $(pwd) include $VERSION_CODENAME WORKDIR/*.changes
 #
+# Pick up the runtime libstdc++6/libgcc-s1 package built at image-build time
+# (src/script/custom/runtime-libstdcxx.sh, run via run-all.sh) so it rides
+# through the same local repo as the rest of the ceph packages. Built as a
+# plain .deb (no source/.changes), so it's added with includedeb rather than
+# include.
+#
+runtime_libstdcxx_deb=/usr/local/akceph-runtime/akceph-runtime-libstdcxx6.deb
+if [ "${AKCEPH_BUNDLE_RUNTIME_LIBSTDCXX:-1}" = 1 ] && [ -f "$runtime_libstdcxx_deb" ]; then
+    reprepro --basedir $(pwd) includedeb $VERSION_CODENAME "$runtime_libstdcxx_deb"
+fi
+#
 # teuthology needs the version in the version file
 #
 echo $dvers > $VERSION_CODENAME/version

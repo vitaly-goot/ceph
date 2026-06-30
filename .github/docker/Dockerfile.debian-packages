@@ -135,4 +135,16 @@ RUN set -eu; \
     fi; \
     rm -rf /var/lib/apt/lists/* /opt/ceph-artifacts /etc/ceph-local-repo.env
 
+# Smoke test: catch a missing/too-old runtime libstdc++6 (or any other
+# missing shared library) at image-build time instead of at first daemon
+# start. Does not catch CPU-microarchitecture (e.g. -march) mismatches -
+# ldd only resolves symbols, it doesn't execute code.
+RUN set -eu; \
+    if [ -x /usr/bin/ceph-osd ]; then \
+        if ldd /usr/bin/ceph-osd 2>&1 | grep -i "not found"; then \
+            echo "::error:: /usr/bin/ceph-osd has unresolved shared library dependencies"; \
+            exit 1; \
+        fi; \
+    fi
+
 CMD ["bash"]

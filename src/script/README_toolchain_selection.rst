@@ -565,3 +565,127 @@ This document's validated matrix is Ubuntu 22.04.  Ubuntu 24.04 should follow
 the same single-toolchain principle, but it should be treated as a separate
 validation target because distro package versions and dependency behavior can
 change.
+
+
+Runtime libstdc++ on deployment targets
+----------------------------------------
+
+Building with GCC 13 (see `Toolchain choice`_) fixes the *build*, but it
+creates a second, separate problem on the *deployment* side: a plain Ubuntu
+22.04 target (for example a stock ``ubuntu:22.04`` image, or a host that never
+had ``ppa:ubuntu-toolchain-r/test`` enabled) ships a ``libstdc++6`` built for
+GCC 11/12.  The package install itself succeeds -- ``dh_shlibdeps`` does not
+always capture the real minimum version a GCC 13 binary needs -- but the
+binary aborts on first run:
+
+.. code-block:: text
+
+   $ ldd /usr/bin/ceph-osd
+   /usr/bin/ceph-osd: ... libstdc++.so.6: version `GLIBCXX_3.4.31' not found
+   /usr/bin/ceph-osd: ... libstdc++.so.6: version `GLIBCXX_3.4.32' not found
+
+This is unrelated to the SPDK/IPO/linker choices above: those are all
+compile-time decisions, this is a runtime shared-library version problem on
+the *target* machine, which may never have had any part of this build's
+toolchain installed.
+
+The real fix is the deployment OS, not a bundled library
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All of the bundling described below exists only because Ubuntu 22.04's
+*native* ``libstdc++6`` predates GCC 13.  A distro whose default toolchain is
+already GCC 13+ has none of this problem: its own ``libstdc++6`` already
+provides the GLIBCXX symbol versions GCC 13 emits, with no PPA, no
+repackaging step, and no separate runtime package to keep in sync.
+
+Two candidates ship GCC 13+ by default:
+
+* **Ubuntu 24.04 (noble)** -- ``gcc``/``g++`` *are* GCC 13.2 by default, no
+  PPA needed even for the build itself.  This is likely the easier move of
+  the two: it stays in the Ubuntu family (same package naming, same apt
+  tooling, same support/compliance story this fork already relies on), and
+  ``build-with-container.py`` already has a ``-d ubuntu24.04`` distro entry.
+  See the `Ubuntu 24.04 note`_ above for the one thing that already bit this
+  tree on noble (``g++-11`` isn't installable there) -- that was a build-side
+  hardcoded-compiler bug, already fixed by this same toolchain-selection
+  work, not a reason to avoid noble.
+* **Debian trixie** -- ships GCC 14 by default.  ``build-with-container.py``/
+  ``DistroKind`` already support it (``-d debian13``/``-d trixie``), and
+  ``.github/workflows/build-deliverables.yml`` has a commented-out
+  ``debian13``/``debian:trixie`` matrix entry for exactly this reason.  A
+  bigger platform jump than noble if the rest of this fork's tooling assumes
+  Ubuntu/apt conventions that happen to differ on Debian.
+
+Either way, this is a deployment-OS decision, not a rebuild-the-toolchain
+decision -- it does not require dropping GCC 13, only choosing a base image
+that already ships it.
+
+The bundling approach below stays useful for two cases that won't go away:
+deployment targets that must stay on Ubuntu 22.04 for other reasons, and any
+older system libstdc++6 in general (the same GLIBCXX-version-not-found
+failure mode applies anywhere the deployment OS is older than the build
+toolchain, not just on Ubuntu 22.04).  But if the deployment target is free to
+move, switching the base/runtime image to a GCC-13-or-newer distro like
+Ubuntu 24.04 or trixie removes the need for this workaround entirely rather
+than working around it.
+
+Why not bundle a newer distro's libstdc++ (e.g. Debian trixie)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The obvious-looking fix is to grab ``libstdc++.so.6`` from a newer distro
+release and drop it in.  This was tried with Debian trixie and fails one
+level down: trixie's ``libstdc++.so.6.0.33`` itself requires
+``GLIBC_2.36``/``2.38``, which Ubuntu 22.04 does not have
+(``GLIBC_2.35``).  Swapping in that library trades a GLIBCXX-version crash
+for a GLIBC-version crash, and "fix" by upgrading glibc system-wide is a far
+larger blast radius than the original bug -- glibc underlies every process on
+the machine, not just Ceph's.
+
+The fix: repackage the same PPA already used for the compiler
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ppa:ubuntu-toolchain-r/test`` -- the PPA already used to install
+``gcc-13``/``g++-13`` for this distro (see `Toolchain choice`_) -- also
+publishes a ``libstdc++6`` build, built specifically for this distro's own
+glibc.  It satisfies the GLIBCXX requirement without raising the glibc floor,
+because it is built against the same glibc the target already has.
+
+``src/script/custom/runtime-libstdcxx.sh`` repackages that PPA's
+``libstdc++6``/``libgcc-s1`` into a standalone package,
+``akceph-runtime-libstdcxx6``, at image-build time (it needs root and a fresh
+``apt`` index, which the package-build step does not have).  It runs as one
+of the ``run-all.sh`` custom-image scripts, gated by
+``AKCEPH_BUNDLE_RUNTIME_LIBSTDCXX`` (default on) in
+``src/script/custom/config.env``.  The package:
+
+* ``Provides:``/``Replaces:`` ``libstdc++6``/``libgcc-s1``, so it upgrades the
+  real system libraries in place via normal ``dpkg``/``apt`` mechanics rather
+  than a private, easy-to-miss search path;
+* keeps the PPA package's own ``Depends: libc6 (>= X)``, so a target whose
+  glibc really is too old fails clearly at ``apt install`` time instead of
+  crashing later at first daemon start.
+
+``make-debs.sh`` adds the prebuilt ``.deb`` to the same local repo as the rest
+of the Ceph packages via ``reprepro includedeb`` (no source package or
+``.changes`` needed for a single binary package).  ``.github/docker/Dockerfile.debian-packages``
+picks it up for free through its existing "install everything found in the
+repo" logic, and that Dockerfile now runs a build-time smoke test
+(``ldd /usr/bin/ceph-osd | grep -i "not found"``) so a regression here fails
+the image build instead of shipping silently broken packages.
+
+For non-Docker deployment targets, ship ``akceph-runtime-libstdcxx6_*.deb``
+as a normal companion artifact alongside the other release ``.deb``\ s and
+install it the same way, before or together with the Ceph packages.
+
+Not covered by this fix
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+A GCC-13-built binary can still hit an unrelated ``Illegal instruction``
+(SIGILL) on hosts whose CPU does not support every instruction
+``-march=x86-64-v3`` assumes is always present (in particular ``lzcnt``).
+That is a CPU-microarchitecture question -- whether the real target fleet
+supports ``x86-64-v3``, or whether ``build_arch`` needs a lower baseline for
+some hosts -- and is independent of the libstdc++ version problem this
+section fixes.  ``ldd`` cannot catch it: resolving symbol versions doesn't
+execute any code, so a passing smoke test here does not guarantee the binary
+runs on every target CPU.

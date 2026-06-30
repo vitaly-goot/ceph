@@ -774,6 +774,12 @@ endif()
 option(WITH_CRIMSON "Build seastar components")
 set(HAVE_SEASTAR ${WITH_CRIMSON})
 
+if(WITH_CRIMSON)
+  set(CEPH_OSD_BASENAME crimson-osd)
+else()
+  set(CEPH_OSD_BASENAME ceph-osd)
+endif()
+
 # Boost
 option(WITH_SYSTEM_BOOST "require and build with system Boost" OFF)
 
