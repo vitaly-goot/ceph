@@ -32,7 +32,19 @@ rm -fr $(dirname $releasedir)
 # an argument to this script.
 #
 if [ -z "${2}" ]; then
-    vers=$(git describe --match "v*" | sed s/^v//)
+    # Prefer git describe: unique per commit, ordered, human readable. Use --tags
+    # so a lightweight tag is sufficient, and fall back to the debian/changelog
+    # version when the checkout carries no tags at all (e.g. a tagless CI clone).
+    # Without this fallback an empty $vers builds a "ceph-.tar.bz2" and later runs
+    # "dch -v -1", which aborts with "-1 is not a valid version".
+    vers=$(git describe --tags --match "v*" 2>/dev/null | sed s/^v//)
+    if [ -z "$vers" ]; then
+        vers=$(perl -ne 'if (/\(([^)]+)\)/) { my $v=$1; $v=~s/-[^-]*$//; print $v; exit }' debian/changelog)
+    fi
+    if [ -z "$vers" ]; then
+        echo "make-debs.sh: cannot determine version (no v* git tag and no debian/changelog version)" >&2
+        exit 1
+    fi
     dvers=${vers}-1
 else
     vers=${2}
@@ -66,11 +78,15 @@ fi
 
 test -f "ceph-$vers.tar.bz2" || ./make-dist $vers
 
-# Call trivy (Or anything on the command line, but the intent is trivy)
-if [[ -n "$2" ]]; then 
-    echo "** Running extra command '$2'" 
-    $2
-    echo "** Extra command '$2' completed"
+# Optionally run an extra command after the source tarball exists (intended for
+# trivy or similar). This historically reused $2 -- which is the *version*
+# argument -- so passing a version (e.g. build-with-container.py --ceph-version)
+# executed it as a shell command ("20.2.1: command not found"). Use a dedicated
+# variable so the version argument is never run.
+if [[ -n "${MAKE_DEBS_EXTRA_CMD:-}" ]]; then
+    echo "** Running extra command '${MAKE_DEBS_EXTRA_CMD}'"
+    ${MAKE_DEBS_EXTRA_CMD}
+    echo "** Extra command '${MAKE_DEBS_EXTRA_CMD}' completed"
 fi
 #
 # rename the tarball to match debian conventions and extract it
