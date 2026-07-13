@@ -1255,8 +1255,11 @@ seastar::future<> OSD::committed_osd_maps(
 	    old_map->is_up(osd_id) &&
 	    osdmap->is_down(osd_id)) {
 	  DEBUG("osd.{}: mark osd.{} down", whoami, osd_id);
+	  // osd_id came from old_map->get_all_osds(); if it was purged in the new
+	  // osdmap, osdmap->get_cluster_addrs(osd_id) would ceph_assert(exists()).
+	  // old_map is guaranteed to contain osd_id and holds its last-known addr.
 	  return cluster_msgr->mark_down(
-	    osdmap->get_cluster_addrs(osd_id).front());
+	    old_map->get_cluster_addrs(osd_id).front());
 	}
 	return seastar::now();
       }).then([this, o=std::move(o)]() mutable {
