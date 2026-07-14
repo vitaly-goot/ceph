@@ -1,65 +1,48 @@
-
-
-
-
 <!--
   - Please give your pull request a title like
-
-      [component]: [short description]
-
-  - Please use this format for each git commit message:
-
-      [component]: [short description]
-
-      [A longer multiline description]
-
-      Fixes: [ticket URL on tracker.ceph.com, create one if necessary]
-      Signed-off-by: [Your Name] <[your email]>
-
-    For examples, use "git log".
+    [component]: [short description]
 -->
 
-## Contribution Guidelines
-- To sign and title your commits, please refer to [Submitting Patches to Ceph](https://github.com/ceph/ceph/blob/main/SubmittingPatches.rst).
+## Summary
 
-- If you are submitting a fix for a stable branch (e.g. "quincy"), please refer to [Submitting Patches to Ceph - Backports](https://github.com/ceph/ceph/blob/master/SubmittingPatches-backports.rst) for the proper workflow.
+<!-- Briefly describe what changed and why. -->
 
-- When filling out the below checklist, you may click boxes directly in the GitHub web UI.  When entering or editing the entire PR message in the GitHub web UI editor, you may also select a checklist item by adding an `x` between the brackets: `[x]`.  Spaces and capitalization matter when checking off items this way.
+## Build / CI Notes
 
-## Checklist
-- Tracker (select at least one)
-  - [ ] References tracker ticket
-  - [ ] Very recent bug; references commit where it was introduced
-  - [ ] New feature (ticket optional)
-  - [ ] Doc update (no ticket needed)
-  - [ ] Code cleanup (no ticket needed)
-- Component impact
-  - [ ] Affects [Dashboard](https://tracker.ceph.com/projects/dashboard/issues/new), opened tracker ticket
-  - [ ] Affects [Orchestrator](https://tracker.ceph.com/projects/orchestrator/issues/new), opened tracker ticket
-  - [ ] No impact that needs to be tracked
-- Documentation (select at least one)
-  - [ ] Updates relevant documentation
-  - [ ] No doc update is appropriate
-- Tests (select at least one)
-  - [ ] Includes [unit test(s)](https://docs.ceph.com/en/latest/dev/developer_guide/tests-unit-tests/)
-  - [ ] Includes [integration test(s)](https://docs.ceph.com/en/latest/dev/developer_guide/testing_integration_tests/)
-  - [ ] Includes bug reproducer
-  - [ ] No tests
+For pull requests targeting an `aka_version_*` branch:
 
-<details>
-<summary>Show available Jenkins commands</summary>
+- **Build Ceph Binaries** (`build-binaries.yaml`) — always runs
+- **Build Ceph Debian Deliverables** (`build-debian.yaml`) — only runs if the PR
+  has the `build-debian` label
+- **Build Ceph Deliverables** (`build-deliverables.yaml`) — only runs if the PR
+  has the `build-ubuntu` or `build-image` label. It builds the Debian packages. 
+  If it has the `build-image` label, it then builds the Docker/build image from them
 
-- `jenkins test classic perf` [Jenkins Job](https://jenkins.ceph.com/view/all/job/ceph-perf-classic/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-perf-pull-requests/config/definitions/ceph-perf-pull-requests.yml)
-- `jenkins test crimson perf` [Jenkins Job](https://jenkins.ceph.com/view/all/job/ceph-perf-crimson/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-perf-pull-requests/config/definitions/ceph-perf-pull-requests.yml)
-- `jenkins test signed` [Jenkins Job](https://jenkins.ceph.com/job/ceph-pr-commits/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-pr-commits/config/definitions/ceph-pr-commits.yml)
-- `jenkins test make check` [Jenkins Job](https://jenkins.ceph.com/job/ceph-pull-requests/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-pull-requests/config/definitions/ceph-pull-requests.yml)
-- `jenkins test make check arm64` [Jenkins Job](https://jenkins.ceph.com/job/ceph-pull-requests-arm64/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-pull-requests-arm64/config/definitions/ceph-pull-requests-arm64.yml)
-- `jenkins test submodules` [Jenkins Job](https://jenkins.ceph.com/view/all/job/ceph-pr-submodules/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-pr-submodules/config/definitions/ceph-pr-commits.yml)
-- `jenkins test dashboard` [Jenkins Job](https://jenkins.ceph.com/view/all/job/ceph-dashboard-pull-requests/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-dashboard-pull-requests/config/definitions/ceph-dashboard-pull-requests.yml)
-- `jenkins test dashboard cephadm` [Jenkins Job](https://jenkins.ceph.com/view/all/job/ceph-dashboard-cephadm-e2e/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-dashboard-cephadm-e2e/config/definitions/ceph-dashboard-cephadm-e2e.yml)
-- `jenkins test api` [Jenkins Job](https://jenkins.ceph.com/view/all/job/ceph-api/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-pr-api/config/definitions/ceph-pr-api.yml)
-- `jenkins test docs` [ReadTheDocs](https://readthedocs.org/projects/ceph/) | [Github Workflow Definition](https://github.com/ceph/ceph/blob/main/.readthedocs.yml)
-- `jenkins test ceph-volume all` [Jenkins Jobs](https://jenkins.ceph.com/view/ceph-volume%20PR/) | [Jenkins Jobs Definition](https://github.com/ceph/ceph-build/blob/main/ceph-volume-cephadm-prs/config/definitions/ceph-volume-pr.yml)
-- `jenkins test windows` [Jenkins Job](https://jenkins.ceph.com/job/ceph-windows-pull-requests/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-windows-pull-requests/config/definitions/ceph-windows-pull-requests.yml)
-- `jenkins test rook e2e` [Jenkins Job](https://jenkins.ceph.com/view/all/job/ceph-orchestrator-rook-e2e/) | [Jenkins Job Definition](https://github.com/ceph/ceph-build/blob/main/ceph-rook-e2e/config/definitions/ceph-orchestrator-rook-e2e.yml)
-</details>
+Add the relevant label when opening the PR, or add it afterward (which
+re-triggers the workflow), if you need these to run.
+
+These PR runs validate the build but do not publish it:
+
+- Debian packages are uploaded as workflow artifacts, not published to Artifactory
+- The Docker/build image is built but not pushed to the registry
+- Publishing to Artifactory and the image registry only happens on non-PR refs
+  (e.g. pushes to `aka_version_*`/`patch/*` or tags)
+
+Note: some of these jobs run under a GitHub environment (`development`/`qa`/
+`testing`) that may have its own approval or protection rules configured in
+the repo settings; those aren't reflected here.
+
+<!-- Add links when reviewers should inspect these outputs. -->
+- Debian artifact run: <!-- link or N/A -->
+- Build image run: <!-- link or N/A -->
+
+## Testing
+
+<!-- List tests performed, or explain why testing was not needed. -->
+
+## Notes For Reviewers
+
+<!-- Call out review priorities, risks, follow-up work, or anything else useful. -->
+
+
+

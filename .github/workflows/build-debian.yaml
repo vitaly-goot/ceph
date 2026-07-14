@@ -12,6 +12,11 @@ on:
   pull_request:
     branches:
       - 'aka_version_*'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
 
 concurrency:
   group: build-ceph-debian-deliverables-${{ github.ref }}
@@ -28,6 +33,7 @@ env:
 jobs:
 
   resolve-lifecycle:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'build-debian') }}
     runs-on: ceph
     outputs:
       lifecycle_environment: ${{ steps.resolve.outputs.lifecycle_environment }}
