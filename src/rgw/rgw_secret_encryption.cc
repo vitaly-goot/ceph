@@ -67,7 +67,11 @@ protected:
 
   CryptoKeyHandler *get_key_handler(const bufferptr &secret)
   {
-    auto* cryptohandler = cct->get_crypto_handler(CEPH_CRYPTO_AES);
+    auto cryptohandler = cct->get_crypto_manager()->get_handler(CEPH_CRYPTO_AES);
+    if (!cryptohandler) {
+      ldout(cct, 1) << "ERROR: No AES crypto handler found" << dendl;
+      return nullptr;
+    }
 
     if (cryptohandler->validate_secret(secret) < 0) {
       ldout(cct, 1) << "ERROR: Invalid rgw secret encryption key, please ensure its length is 16" << dendl;
@@ -276,7 +280,7 @@ std::tuple<bool, uint32_t, bufferlist> RGWSecretEncrypterImpl::decrypt(uint32_t 
 
   bufferlist out;
   std::string error;
-  int ret = keyhandler->decrypt(secret, out, iv, &error);
+  int ret = keyhandler->decrypt(cct, secret, out, iv, &error);
   if (ret < 0) {
     ldout(cct, 1) << "ERROR: fail to decrypt secret: " << ret << " error " << error << dendl;
     return std::make_tuple(false, 0, std::move(secret));
@@ -315,7 +319,7 @@ std::tuple<uint32_t, std::string, bufferlist> RGWSecretEncrypterImpl::encrypt(co
   bufferlist out;
   std::string error;
   bufferptr iv_buf(iv, AES_BLOCK_LEN);
-  int ret = keyhandler->encrypt(secret, out, iv_buf, &error);
+  int ret = keyhandler->encrypt(cct, secret, out, iv_buf, &error);
   if (ret < 0) {
     ldout(cct, 1) << "ERROR: fail to encrypt secret: " << error << dendl;
     return std::make_tuple(0, "", std::move(secret));

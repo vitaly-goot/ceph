@@ -114,6 +114,24 @@ public:
                           const ceph::buffer::list& in,
                           ceph::buffer::list& out, std::string *error) const = 0;
 
+  /* IV-parameterized variants. Used by RGW user-secret encryption, which
+   * generates a random IV per record and persists it alongside the
+   * ciphertext; that exact IV must be supplied again to decrypt. Handlers
+   * that do not support a caller-supplied IV fall back to the fixed-IV
+   * variants above. */
+  virtual int encrypt(CephContext *cct,
+                      const ceph::buffer::list& in,
+                      ceph::buffer::list& out,
+                      ceph::buffer::ptr& iv, std::string *error) const {
+    return encrypt(cct, in, out, error);
+  }
+  virtual int decrypt(CephContext *cct,
+                      const ceph::buffer::list& in,
+                      ceph::buffer::list& out,
+                      ceph::buffer::ptr& iv, std::string *error) const {
+    return decrypt(cct, in, out, error);
+  }
+
   virtual std::size_t enc_size(const in_slice_t& in,
                        const in_slice_t *confounder) const {
     return 0;
