@@ -329,6 +329,7 @@ public:
 
   using CryptoKeyHandler::encrypt;
   using CryptoKeyHandler::encrypt_ext;
+  using CryptoKeyHandler::decrypt;
   using CryptoKeyHandler::decrypt_ext;
 
   int init(const bufferptr& s, ostringstream& err) {
@@ -349,6 +350,78 @@ public:
       err << "cannot set OpenSSL decrypt key for AES: " << dec_key_ret;
       return -1;
     }
+
+    return 0;
+  }
+
+  /* Caller-supplied-IV variants. RGW user-secret encryption generates a random
+   * IV per record and stores it with the ciphertext; that IV must be passed
+   * back in to decrypt. Format is AES-CBC + PKCS#7, unchanged. */
+  int encrypt(CephContext *cct, const ceph::bufferlist& in,
+              ceph::bufferlist& out,
+              ceph::bufferptr& iv,
+              std::string* error) const override {
+    // we need to take into account the PKCS#7 padding. There *always* will
+    // be at least one byte of padding. This stays even to input aligned to
+    // AES_BLOCK_LEN. Otherwise we would face ambiguities during decryption.
+    ceph::bufferptr out_tmp{static_cast<unsigned>(
+      AES_BLOCK_LEN + p2align<std::size_t>(in.length(), AES_BLOCK_LEN))};
+
+    // let's pad the data
+    std::uint8_t pad_len = out_tmp.length() - in.length();
+    ceph::bufferptr pad_buf{pad_len};
+    // FIPS zeroization audit 20191115: this memset is not intended to
+    // wipe out a secret after use.
+    memset(pad_buf.c_str(), pad_len, pad_len);
+
+    // form contiguous buffer for block cipher. The ctor copies shallowly.
+    ceph::bufferlist incopy(in);
+    incopy.append(std::move(pad_buf));
+    const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
+
+    if (iv.length() != AES_BLOCK_LEN) {
+      if (error) *error = "Invalid IV";
+      return -EINVAL;
+    }
+
+    AES_cbc_encrypt(in_buf, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
+                    out_tmp.length(), &enc_key,
+                    reinterpret_cast<unsigned char*>(iv.c_str()), AES_ENCRYPT);
+
+    out.append(out_tmp);
+    return 0;
+  }
+
+  int decrypt(CephContext *cct, const ceph::bufferlist& in,
+              ceph::bufferlist& out,
+              ceph::bufferptr& iv,
+              std::string* error) const override {
+    // PKCS#7 padding enlarges even empty plain-text to take 16 bytes.
+    if (in.length() < AES_BLOCK_LEN || in.length() % AES_BLOCK_LEN) {
+      return -1;
+    }
+
+    // needed because of .c_str() on const. It's a shallow copy.
+    ceph::bufferlist incopy(in);
+    const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
+
+    if (iv.length() != AES_BLOCK_LEN) {
+      if (error) *error = "Invalid IV";
+      return -EINVAL;
+    }
+
+    ceph::bufferptr out_tmp{in.length()};
+    AES_cbc_encrypt(in_buf, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
+                    in.length(), &dec_key,
+                    reinterpret_cast<unsigned char *>(iv.c_str()), AES_DECRYPT);
+
+    // BE CAREFUL: we cannot expose any single bit of information about
+    // the cause of failure. Otherwise we'll face padding oracle attack.
+    // See: https://en.wikipedia.org/wiki/Padding_oracle_attack.
+    const auto pad_len = \
+      std::min<std::uint8_t>(out_tmp[in.length() - 1], AES_BLOCK_LEN);
+    out_tmp.set_length(in.length() - pad_len);
+    out.append(std::move(out_tmp));
 
     return 0;
   }
