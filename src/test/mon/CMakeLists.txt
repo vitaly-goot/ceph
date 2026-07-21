@@ -47,6 +47,14 @@ add_executable(unittest_mon_montypes
 add_ceph_unittest(unittest_mon_montypes)
 target_link_libraries(unittest_mon_montypes mon global)
 
+# unittest_mon_cephx_key_revocation
+add_executable(unittest_mon_cephx_key_revocation
+  test_cephx_key_revocation.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_mon_cephx_key_revocation)
+target_link_libraries(unittest_mon_cephx_key_revocation mon global)
+
 # ceph_test_mon_memory_target
 add_executable(ceph_test_mon_memory_target
   test_mon_memory_target.cc)
