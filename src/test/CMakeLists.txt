@@ -829,6 +829,14 @@ add_executable(unittest_crypto_init
 add_ceph_unittest(unittest_crypto_init)
 target_link_libraries(unittest_crypto_init global)
 
+# unittest_rgw_sts_key_truncation
+add_executable(unittest_rgw_sts_key_truncation
+  test_rgw_sts_key_truncation.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_rgw_sts_key_truncation)
+target_link_libraries(unittest_rgw_sts_key_truncation global)
+
 # unittest_perf_counters
 add_executable(unittest_perf_counters
   perf_counters.cc
