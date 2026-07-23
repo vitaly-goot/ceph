@@ -7,7 +7,17 @@
 #include "include/encoding.h"
 
 #ifdef HAVE_JAEGER
+// Keep OpenTelemetry STL mode local to this header to avoid leaking
+// HAVE_CPP_STDLIB into unrelated Ceph translation units.
+#ifndef HAVE_CPP_STDLIB
+#define HAVE_CPP_STDLIB
+#define CEPH_TRACER_UNDEF_HAVE_CPP_STDLIB
+#endif
 #include "opentelemetry/trace/provider.h"
+#ifdef CEPH_TRACER_UNDEF_HAVE_CPP_STDLIB
+#undef HAVE_CPP_STDLIB
+#undef CEPH_TRACER_UNDEF_HAVE_CPP_STDLIB
+#endif
 
 using jspan = opentelemetry::trace::Span;
 using jspan_ptr = opentelemetry::nostd::shared_ptr<jspan>;

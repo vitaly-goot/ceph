@@ -11,7 +11,11 @@ function(build_opentelemetry)
   set(opentelemetry_cpp_targets opentelemetry_trace opentelemetry_exporter_jaeger_trace)
   set(opentelemetry_CMAKE_ARGS -DCMAKE_POSITION_INDEPENDENT_CODE=ON
                                -DWITH_JAEGER=ON
+                               -DWITH_STL=ON
                                -DBUILD_TESTING=OFF
+                               -DCMAKE_CXX_STANDARD=20
+                               -DCMAKE_CXX_STANDARD_REQUIRED=ON
+                               -DCMAKE_CXX_EXTENSIONS=OFF
                                -DCMAKE_BUILD_TYPE=Release
                                -DWITH_EXAMPLES=OFF)
 

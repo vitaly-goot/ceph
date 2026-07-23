@@ -18,6 +18,7 @@ usr/share/ceph/mgr/psi
 usr/share/ceph/mgr/rbd_support
 usr/share/ceph/mgr/rgw
 usr/share/ceph/mgr/selftest
+usr/share/ceph/mgr/smb
 usr/share/ceph/mgr/snap_schedule
 usr/share/ceph/mgr/stats
 usr/share/ceph/mgr/status
