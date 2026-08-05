@@ -12,6 +12,8 @@
  *
  */
 #include "common/mime.h"
+#include "rgw/rgw_http_fields.h"
+#include "rgw/rgw_xattr.h"
 #include "gtest/gtest.h"
 
 #include <stdint.h>
@@ -63,6 +65,82 @@ TEST(MimeTests, EncodeOutOfSpace) {
   len = mime_encode_as_qp("a=b", output, 3);
   ASSERT_EQ(len, 6);
   ASSERT_EQ(string("a"), string(output));
+}
+
+TEST(MimeTests, LengthAwareEncodeAllControls) {
+  std::string input;
+  for (int c = 0; c < 0x20; ++c) {
+    input.push_back(static_cast<char>(c));
+  }
+  input.push_back('\x7f');
+
+  const std::string expected =
+      "=00=01=02=03=04=05=06=07=08=09=0A=0B=0C=0D=0E=0F"
+      "=10=11=12=13=14=15=16=17=18=19=1A=1B=1C=1D=1E=1F=7F";
+  char output[128] = {};
+
+  int len = mime_encode_as_qp_len(input.data(), input.size(), nullptr, 0);
+  ASSERT_EQ(expected.size() + 1, static_cast<size_t>(len));
+  ASSERT_EQ(len, mime_encode_as_qp_len(input.data(), input.size(), output,
+                                       sizeof(output)));
+  EXPECT_EQ(expected, std::string(output));
+}
+
+TEST(MimeTests, LengthAwareEncodeMixedNullAndControls) {
+  const std::string input("A\0B\rC", 5);
+  const std::string expected = "A=00B=0DC";
+  char output[32] = {};
+
+  const int len = mime_encode_as_qp_len(input.data(), input.size(), output,
+                                        sizeof(output));
+  ASSERT_EQ(expected.size() + 1, static_cast<size_t>(len));
+  EXPECT_EQ(expected, std::string(output));
+}
+
+TEST(MimeTests, FormatXattrPreservesMixedNullAndControls) {
+  std::string mixed("A\0B\rC", 5);
+  format_xattr(mixed);
+  EXPECT_EQ("=?UTF-8?Q?A=00B=0DC?=", mixed);
+
+  std::string null_only(1, '\0');
+  format_xattr(null_only);
+  EXPECT_EQ("=?UTF-8?Q?=00?=", null_only);
+}
+
+TEST(HttpFieldTests, NamesRequireAsciiTchar) {
+  EXPECT_FALSE(rgw::http::is_valid_field_name(""));
+  EXPECT_TRUE(rgw::http::is_valid_field_name(
+      "AZaz09!#$%&'*+-.^_`|~"));
+  EXPECT_TRUE(rgw::http::is_valid_field_name("x-amz-meta-safe_name"));
+
+  for (int c = 0; c <= 0xff; ++c) {
+    const std::string name(1, static_cast<char>(c));
+    EXPECT_EQ(rgw::http::is_tchar(static_cast<unsigned char>(c)),
+              rgw::http::is_valid_field_name(name)) << "byte " << c;
+  }
+
+  EXPECT_FALSE(rgw::http::is_valid_field_name("bad name"));
+  EXPECT_FALSE(rgw::http::is_valid_field_name("bad\tname"));
+  EXPECT_FALSE(rgw::http::is_valid_field_name("bad:name"));
+  EXPECT_FALSE(rgw::http::is_valid_field_name("bad/name"));
+  EXPECT_FALSE(rgw::http::is_valid_field_name(std::string("bad\0name", 8)));
+  EXPECT_FALSE(rgw::http::is_valid_field_name("bad\xc3\xa9"));
+}
+
+TEST(HttpFieldTests, ValuesReplaceAllForbiddenControls) {
+  std::string input;
+  std::string expected;
+  for (int c = 0; c < 0x20; ++c) {
+    input.push_back(static_cast<char>(c));
+    expected.push_back(c == '\t' ? '\t' : ' ');
+  }
+  input.push_back('\x7f');
+  expected.push_back(' ');
+
+  std::string backing;
+  const std::string_view sanitized =
+      rgw::http::sanitize_field_value(input, backing);
+  EXPECT_EQ(expected, sanitized);
 }
 
 TEST(MimeTests, SimpleDecode) {

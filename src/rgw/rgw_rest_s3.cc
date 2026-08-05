@@ -3276,12 +3276,25 @@ int RGWPostObj_ObjStore_S3::get_params(optional_yield y)
 		    sizeof(RGW_AMZ_META_PREFIX) - 1) != 0)
       break;
 
+    if (!rgw::http::is_valid_field_name(n)) {
+      err_msg = "Invalid metadata field name";
+      return -ERR_INVALID_REQUEST;
+    }
+
     string attr_name = RGW_ATTR_PREFIX;
     attr_name.append(n);
 
     /* need to null terminate it */
     bufferlist& data = piter->second.data;
     string str = string(data.c_str(), data.length());
+
+    /* Sanitize the metadata value the same way the PUT/COPY paths do via
+     * rgw_get_request_metadata(). Without this, control characters such as
+     * CR/LF injected into an x-amz-meta-* form field would be stored verbatim
+     * and later echoed back in response headers on GET, enabling HTTP
+     * response/header splitting (CWE-113). format_xattr() MIME-encodes any
+     * value that contains control characters or is not valid UTF-8. */
+    format_xattr(str);
 
     bufferlist attr_bl;
     attr_bl.append(str.c_str(), str.size() + 1);
@@ -3297,6 +3310,11 @@ int RGWPostObj_ObjStore_S3::get_params(optional_yield y)
     /* need to null terminate it */
     bufferlist& data = piter->second.data;
     string str = string(data.c_str(), data.length());
+
+    /* Same sanitization as the x-amz-meta-* loop above: neutralize CR/LF and
+     * other control characters so a poisoned value cannot split the response
+     * headers when it is echoed back as x-amz-website-redirect-location. */
+    format_xattr(str);
 
     bufferlist attr_bl;
     attr_bl.append(str.c_str(), str.size() + 1);

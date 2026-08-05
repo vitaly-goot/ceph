@@ -19,6 +19,7 @@
 #include "rgw_formats.h"
 #include "rgw_op.h"
 #include "rgw_rest.h"
+#include "rgw_http_fields.h"
 #include "rgw_rest_swift.h"
 #include "rgw_rest_s3.h"
 #include "rgw_swift_auth.h"
@@ -370,8 +371,20 @@ void dump_header(req_state* const s,
                  const std::string_view& name,
                  const std::string_view& val)
 {
+  /* A field name cannot be repaired without changing its meaning. Omit any
+   * invalid name left by an older/poisoned object, while retaining replacement
+   * sanitization for forbidden bytes in field values. */
+  if (!rgw::http::is_valid_field_name(name)) {
+    ldpp_dout(s, 0) << "ERROR: refusing to send an invalid HTTP header name ("
+                    << name.size() << " bytes)" << dendl;
+    return;
+  }
+
+  std::string val_backing;
+  const std::string_view safe_val =
+      rgw::http::sanitize_field_value(val, val_backing);
   try {
-    RESTFUL_IO(s)->send_header(name, val);
+    RESTFUL_IO(s)->send_header(name, safe_val);
   } catch (rgw::io::Exception& e) {
     ldpp_dout(s, 0) << "ERROR: s->cio->send_header() returned err="
                      << e.what() << dendl;

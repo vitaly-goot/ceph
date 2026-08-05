@@ -30,13 +30,13 @@
 #include <boost/asio/deadline_timer.hpp>
 
 #include "common/armor.h"
-#include "common/mime.h"
-#include "common/utf8.h"
 #include "common/ceph_json.h"
 #include "common/ceph_time.h"
 
 #include "rgw_cksum.h"
 #include "rgw_common.h"
+#include "rgw_http_fields.h"
+#include "rgw_xattr.h"
 #include "rgw_dmclock.h"
 #include "rgw_sal.h"
 #include "rgw_user.h"
@@ -2285,27 +2285,6 @@ inline int get_system_versioning_params(req_state *s,
   return 0;
 } /* get_system_versioning_params */
 
-static inline void format_xattr(std::string &xattr)
-{
-  /* If the extended attribute is not valid UTF-8, we encode it using
-   * quoted-printable encoding.
-   */
-  if ((check_utf8(xattr.c_str(), xattr.length()) != 0) ||
-      (check_for_control_characters(xattr.c_str(), xattr.length()) != 0)) {
-    static const char MIME_PREFIX_STR[] = "=?UTF-8?Q?";
-    static const int MIME_PREFIX_LEN = sizeof(MIME_PREFIX_STR) - 1;
-    static const char MIME_SUFFIX_STR[] = "?=";
-    static const int MIME_SUFFIX_LEN = sizeof(MIME_SUFFIX_STR) - 1;
-    int mlen = mime_encode_as_qp(xattr.c_str(), NULL, 0);
-    char *mime = new char[MIME_PREFIX_LEN + mlen + MIME_SUFFIX_LEN + 1];
-    strcpy(mime, MIME_PREFIX_STR);
-    mime_encode_as_qp(xattr.c_str(), mime + MIME_PREFIX_LEN, mlen);
-    strcpy(mime + MIME_PREFIX_LEN + (mlen - 1), MIME_SUFFIX_STR);
-    xattr.assign(mime);
-    delete [] mime;
-  }
-} /* format_xattr */
-
 /**
  * Get the HTTP request metadata out of the req_state as a
  * map(<attr_name, attr_contents>, where attr_name is RGW_ATTR_PREFIX.HTTP_NAME)
@@ -2338,7 +2317,11 @@ inline int rgw_get_request_metadata(const DoutPrefixProvider *dpp,
     const std::string& name = kv.first;
     std::string& xattr = kv.second;
 
-    if (blocklisted_headers.count(name) == 1) {
+    if (!rgw::http::is_valid_field_name(name)) {
+      ldpp_subdout(dpp, rgw, 0)
+          << "rejecting metadata with an invalid HTTP field name" << dendl;
+      return -ERR_INVALID_REQUEST;
+    } else if (blocklisted_headers.count(name) == 1) {
       ldpp_subdout(dpp, rgw, 10) << "skipping x>> " << name << dendl;
       continue;
     } else if (allow_empty_attrs || !xattr.empty()) {

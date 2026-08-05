@@ -15,6 +15,8 @@
 #ifndef CEPH_COMMON_MIME_H
 #define CEPH_COMMON_MIME_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,6 +34,11 @@ extern "C" {
  * buffer you will need.
  */
 signed int mime_encode_as_qp(const char *input, char *output, int outlen);
+
+/* Length-aware variant of mime_encode_as_qp(). Embedded null bytes in input
+ * are encoded as =00 instead of terminating the input. */
+signed int mime_encode_as_qp_len(const char *input, size_t input_len,
+                                 char *output, int outlen);
 
 /* Decode a quoted-printable buffer.
  *

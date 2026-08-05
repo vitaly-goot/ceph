@@ -14,39 +14,59 @@
 #include "common/utf8.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
+#include <string.h>
 
-int mime_encode_as_qp(const char *input, char *output, int outlen)
+int mime_encode_as_qp_len(const char *input, size_t input_len,
+                          char *output, int outlen)
 {
 	int ret = 1;
 	char *o = output;
-	const unsigned char *i = (const unsigned char*)input;
-	while (1) {
-		int c = *i;
-		if (c == '\0') {
-			break;
+	const unsigned char *i = (const unsigned char *)input;
+	int can_write = output != NULL && outlen > 0;
+	static const char hex[] = "0123456789ABCDEF";
+
+	if (can_write)
+		*o = '\0';
+
+	for (size_t pos = 0; pos < input_len; ++pos) {
+		const int c = i[pos];
+		char encoded[3];
+		int encoded_len;
+
+		if ((c & 0x80) || (c == '=') || (c == '\0') ||
+		    is_control_character(c)) {
+			encoded[0] = '=';
+			encoded[1] = hex[(c >> 4) & 0xf];
+			encoded[2] = hex[c & 0xf];
+			encoded_len = 3;
+		} else {
+			encoded[0] = (char)c;
+			encoded_len = 1;
 		}
-		else if ((c & 0x80) || (c == '=') || (is_control_character(c))) {
-			if (outlen >= 3) {
-				snprintf(o, outlen, "=%02X", c);
-				outlen -= 3;
-				o += 3;
-			}
-			else
-				outlen = 0;
-			ret += 3;
+
+		if (ret > INT_MAX - encoded_len)
+			return -EOVERFLOW;
+		ret += encoded_len;
+
+		/* Only write complete encoded bytes, and always reserve one byte for
+		 * the terminating null. After truncation, preserve the longest prefix. */
+		if (can_write && outlen > encoded_len) {
+			memcpy(o, encoded, encoded_len);
+			o += encoded_len;
+			outlen -= encoded_len;
+			*o = '\0';
+		} else {
+			can_write = 0;
 		}
-		else {
-			if (outlen >= 1) {
-				snprintf(o, outlen, "%c", c);
-				outlen -= 1;
-				o += 1;
-			}
-			ret += 1;
-		}
-		++i;
 	}
 	return ret;
+}
+
+int mime_encode_as_qp(const char *input, char *output, int outlen)
+{
+	return mime_encode_as_qp_len(input, strlen(input), output, outlen);
 }
 
 static inline signed int hexchar_to_int(unsigned int c)
