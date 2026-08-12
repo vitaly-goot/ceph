@@ -209,7 +209,7 @@ int RGWSecretEncrypterImpl::reload_keys(uint32_t expect_key_id)
   if (new_db->empty() || 
      (!new_db->empty() && new_db->rbegin()->first >= expect_key_id)) {
     curr_db.swap(new_db);
-    ldout(cct, 10) << "Latest key id is " << (curr_db->empty() ? 0 : curr_db->rbegin()->first) << dendl;
+    ldout(cct, 20) << "Latest key id is " << (curr_db->empty() ? 0 : curr_db->rbegin()->first) << dendl;
     return 0;
   } else {
     ldout(cct, 1) << "WARNING: key reloading doesn't cover key id " << expect_key_id << " with " << (new_db->empty() ? 0 : new_db->rbegin()->first) << dendl;

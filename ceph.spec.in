@@ -1994,7 +1994,7 @@ fi
 %{_datadir}/ceph/mgr/pg_autoscaler
 %{_datadir}/ceph/mgr/progress
 %{_datadir}/ceph/mgr/prometheus
-%{_datadir}/ceph/mgr/psi
+# %{_datadir}/ceph/mgr/psi
 %{_datadir}/ceph/mgr/rbd_support
 %{_datadir}/ceph/mgr/rgw
 %{_datadir}/ceph/mgr/selftest
@@ -2143,7 +2143,7 @@ fi
 
 %files -n ceph-exporter
 %{_bindir}/ceph-exporter
-%{_unitdir}/ceph-exporter.service
+%{_unitdir}/ceph-exporter@.service
 
 %files -n rbd-fuse
 %{_bindir}/rbd-fuse

@@ -373,7 +373,6 @@ class LCObjsLister {
   vector<rgw_bucket_dir_entry>::iterator obj_iter;
   rgw_bucket_dir_entry pre_obj;
   uint64_t num_noncurrent{0};
-  int64_t delay_ms;
 
 public:
   LCObjsLister(rgw::sal::Driver* _driver, rgw::sal::Bucket* _bucket) :
@@ -385,8 +384,6 @@ public:
 
     const auto& current_index = bucket->get_info().layout.current_index;
     list_params.allow_unordered = should_list_unordered(current_index, threshold);
-
-    delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
   }
 
   void set_prefix(const string& p) {
@@ -412,6 +409,7 @@ public:
   }
 
   void delay(const DoutPrefixProvider* dpp) {
+    auto delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
     if (delay_ms) {
       maybe_warn_about_blocking(dpp);
       std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
@@ -2896,6 +2894,37 @@ int fix_lc_shard_entry(const DoutPrefixProvider *dpp,
   return ret;
 }
 
+int reset_lc_shard_entry(const DoutPrefixProvider *dpp,
+                         rgw::sal::Driver* driver,
+		         rgw::sal::Lifecycle* sal_lc,
+		         rgw::sal::Bucket* bucket)
+{
+  if (auto aiter = bucket->get_attrs().find(RGW_ATTR_LC);
+      aiter == bucket->get_attrs().end()) {
+    ldpp_dout(dpp, 1) << "No lifecycle config on bucket=" << bucket
+                      << ", cannot reset" << dendl;
+    return -ENOENT;
+  }
+
+  auto bucket_lc_key = get_bucket_lc_key(bucket->get_key());
+  std::string lc_oid;
+  get_lc_oid(driver->ctx(), bucket_lc_key, &lc_oid);
+
+  char cookie_buf[COOKIE_LEN + 1];
+  gen_rand_alphanumeric(driver->ctx(), cookie_buf, sizeof(cookie_buf) - 1);
+  std::string cookie = cookie_buf;
+
+  int ret = guard_lc_modify(dpp,
+    driver, sal_lc, bucket->get_key(), cookie,
+    [dpp, &lc_oid](rgw::sal::Lifecycle* slc,
+                   const string& oid,
+                   rgw::sal::LCEntry& entry) {
+      return slc->set_entry(dpp, null_yield, lc_oid, entry);
+    });
+
+  return ret;
+}
+
 std::string s3_expiration_header(
   DoutPrefixProvider* dpp,
   const rgw_obj_key& obj_key,
@@ -3196,4 +3225,3 @@ void RGWLifecycleConfiguration::dump(Formatter *f) const
   }
   f->close_section();
 }
-
