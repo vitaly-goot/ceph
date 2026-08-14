@@ -41,12 +41,8 @@ fi
 
 test -f "ceph-$vers.tar.bz2" || ./make-dist $vers
 
-# Call trivy (Or anything on the command line, but the intent is trivy)
-if [[ -n "$2" ]]; then 
-    echo "** Running extra command '$2'" 
-    $2
-    echo "** Extra command '$2' completed"
-fi
+# Keep positional argument 2 reserved for the explicit Ceph version string.
+# Do not execute positional arguments as shell commands.
 #
 # rename the tarball to match debian conventions and extract it
 #

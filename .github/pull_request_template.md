@@ -20,6 +20,8 @@ Link to Jira Story: [Add link here]
 
 ### Build Trigger Guidance (Build Ceph Deliverables)
 - [ ] For PR build validation, add one label: `build-debian`, or `build-ubuntu`
+- [ ] To publish PR artifacts to Artifactory for testing, also add `publish-artifacts`
+- [ ] PR artifact publishes always target the `development` lifecycle environment, even for `aka_version_*` branches
 - [ ] If label was not present at PR open time, add it now (adding a label triggers the workflow)
 - [ ] For post-merge branch builds, ensure the target branch is `aka_version_*` (build runs on push after merge)
 - [ ] For release builds, push a tag matching `v*`

@@ -75,6 +75,16 @@ jobs:
           publish_allowed="true"
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
             publish_allowed="false"
+            lifecycle_environment="development"
+
+            # PRs are non-publishing by default. Operators must add an
+            # explicit opt-in label to exercise Artifactory publication from a
+            # PR run. Those test publishes always target the development
+            # lifecycle so they cannot be confused with promotable release
+            # artifacts.
+            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'publish-artifacts') }}" == "true" ]]; then
+              publish_allowed="true"
+            fi
           fi
 
           echo "lifecycle_environment=${lifecycle_environment}" >> "${GITHUB_OUTPUT}"
@@ -95,7 +105,7 @@ jobs:
       - name: Prepare Artifactory CA trust
         if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
         id: prepare-ca
-        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@main
+        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@v0.11.1
         with:
           artifactory_url: https://${{ vars.DOCKER_URL }}
           artifactory_ca_url: ${{ vars.ARTIFACTORY_CA_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
@@ -207,7 +217,7 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.6.0
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.11.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -215,7 +225,7 @@ jobs:
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.6.0
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.11.1
           with:
             ceph_path: ceph
             enable_ccache: ${{ env.enable_ccache }}
@@ -228,10 +238,11 @@ jobs:
             build_arch: ${{ env.build_arch }}
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.6.0
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.11.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
+            ceph_version: ${{ steps.derive-build-vars.outputs.ceph_build_version }}
             build_target: debs
             env_file: src/script/custom/build-vars.config
             custom_image_script: run-all.sh
@@ -259,90 +270,20 @@ jobs:
               find ceph/debs -type f \( -name '*-dbg_*.deb' -o -name '*-dbgsym_*.deb' \) -delete
             fi
 
-        - name: Verify JFrog CLI is available
+        - name: Publish Debian repository to Artifactory
           if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
-          run: |
-            if ! command -v jf &> /dev/null; then
-              echo "::error::JFrog CLI (jf) is not installed on this runner"
-              exit 1
-            fi
-            jf --version
-
-        - name: Publish Debian repository to Artifactory via JFrog CLI
-          if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
-          env:
-            BASE_RT_URL: ${{ vars.BASE_RT_URL }}
-            DEBIAN_REPO: ${{ vars.DEBIAN_REPO }}
-            RT_USERNAME: ${{ vars.RT_USERNAME }}
-            RT_PASSWORD: ${{ secrets.RT_PASSWORD }}
-            BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            SCAN_STATUS: pending
-          run: |
-            set -euo pipefail
-
-            if [[ -z "${BASE_RT_URL}" ]]; then
-              echo "::error::BASE_RT_URL is not configured"
-              exit 1
-            fi
-
-            if [[ -z "${DEBIAN_REPO}" ]]; then
-              echo "::error::DEBIAN_REPO is not configured in environment"
-              exit 1
-            fi
-
-            if [[ -z "${RT_USERNAME}" || -z "${RT_PASSWORD}" ]]; then
-              echo "::error::RT_USERNAME or RT_PASSWORD is missing"
-              exit 1
-            fi
-
-            artifactory_url="https://${BASE_RT_URL}"
-
-            # Validate files exist before upload
-            file_count="$(find ceph/debs -type f \( -name '*.deb' -o -name 'Packages*' -o -name 'Release*' -o -name 'InRelease' -o -name '*.changes' -o -name '*.dsc' -o -name '*.tar.*' \) | wc -l | tr -d '[:space:]')"
-            if [[ "${file_count}" -eq 0 ]]; then
-              echo "::error::No Debian repository files found under ceph/debs"
-              exit 1
-            fi
-            echo "Found ${file_count} Debian repository files to upload"
-
-            # Configure Artifactory server with username/password
-            jf c add ceph-artifactory \
-              --url "${artifactory_url}" \
-              --user "${RT_USERNAME}" \
-              --password "${RT_PASSWORD}" \
-              --interactive=false \
-              --overwrite=true
-
-            # Generate upload file spec with proper path placeholders
-            # Pattern (ceph/debs/*) captures all content, {1} preserves relative path structure
-            # Trim whitespace and trailing slash from repo name
-            target_repo="$(echo "${DEBIAN_REPO}" | tr -d '[:space:]')"
-            cat > upload-spec.json <<EOF
-            {
-              "files": [
-                {
-                  "pattern": "ceph/debs/(*)",
-                  "target": "${target_repo}/{1}",
-                  "props": "build.url=${BUILD_URL};git.commit=${GITHUB_SHA};promotion.user=${GITHUB_ACTOR};scan.status=${SCAN_STATUS};build.number=${GITHUB_RUN_NUMBER}",
-                  "recursive": "true",
-                  "flat": "false"
-                }
-              ]
-            }
-            EOF
-
-            echo "Using file spec:"
-            cat upload-spec.json
-
-            # Upload using file spec
-            jf rt upload \
-              --spec upload-spec.json \
-              --server-id ceph-artifactory
-
-            jf c rm ceph-artifactory --quiet || true
-            rm -f upload-spec.json
-
-            echo "Successfully uploaded ${file_count} files to ${target_repo}"
+          uses: StorageTeam/build-ceph-action/composite-actions/publish-debian-repo@v0.11.1
+          with:
+            os_version: ${{ matrix.os_version }}
+            source_path: ceph/debs
+            base_rt_url: ${{ vars.BASE_RT_URL }}
+            debian_repo: ${{ vars.DEBIAN_REPO }}
+            rt_username: ${{ vars.RT_USERNAME }}
+            rt_password: ${{ secrets.RT_PASSWORD }}
+            component: ${{ steps.derive-build-vars.outputs.ceph_codename }}
+            build_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            scan_status: pending
+            git_path: ceph
 
         - name: Upload debian packages
           uses: actions/upload-artifact@v3
@@ -372,7 +313,7 @@ jobs:
 
       - name: Derive build variables
         id: derive-build-vars
-        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.4.1
+        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.11.1
         with:
           ceph_path: ceph
           os_version: ${{ matrix.os_version }}
@@ -403,7 +344,7 @@ jobs:
 
       - name: Prepare Docker registry CA trust
         if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
-        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@main
+        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@v0.11.1
         with:
           artifactory_url: https://${{ steps.resolve-docker.outputs.registry_host }}
           artifactory_ca_url: ${{ vars.ARTIFACTORY_CA_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
@@ -412,14 +353,14 @@ jobs:
           require_ca: 'true'
 
       - name: Build and push docker image
-        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.4.1
+        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.11.1
         with:
           artifact_name: ceph-debians-${{ matrix.os_version }}
           artifact_path: ceph
           docker_context: ceph
           dockerfile: ceph/.github/docker/Dockerfile.debian-packages
           image_tags: |
-            ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}
+            ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_build_version }}
           platforms: linux/amd64
           build_args: |
             BASE_IMAGE=${{ matrix.base_image }}
@@ -431,4 +372,4 @@ jobs:
 
       - name: Job Output of Docker Image name
         run: |
-          echo "Docker Image: ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_git_version }}"
+          echo "Docker Image: ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_build_version }}"
