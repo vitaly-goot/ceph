@@ -657,7 +657,7 @@ add_executable(unittest_auth
   $<TARGET_OBJECTS:unit-main>
   )
 add_ceph_unittest(unittest_auth)
-target_link_libraries(unittest_auth global)
+target_link_libraries(unittest_auth osd global)
 
 # unittest_workqueue
 add_executable(unittest_workqueue
