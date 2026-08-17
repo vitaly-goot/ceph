@@ -106,11 +106,13 @@ WRITE_CLASS_ENCODER(AuthCapsInfo)
 struct AuthTicket {
   EntityName name;
   uint64_t global_id; /* global instance id */
+  /* no longer varied, kept so the verifier can tell a scrambled one apart */
+  uint64_t auid;
   utime_t created, renew_after, expires;
   AuthCapsInfo caps;
   __u32 flags;
 
-  AuthTicket() : global_id(0), flags(0){}
+  AuthTicket() : global_id(0), auid(CEPH_AUTH_UID_DEFAULT), flags(0){}
 
   void init_timestamps(utime_t now, double ttl) {
     created = now;
@@ -139,8 +141,9 @@ struct AuthTicket {
     decode(name, bl);
     decode(global_id, bl);
     if (struct_v >= 2) {
-      uint64_t old_auid;
-      decode(old_auid, bl);
+      decode(auid, bl);
+    } else {
+      auid = CEPH_AUTH_UID_DEFAULT;
     }
     decode(created, bl);
     decode(expires, bl);

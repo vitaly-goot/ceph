@@ -367,6 +367,17 @@ Time to Live
               to a Ceph client, the Ceph Storage Cluster assigns that ticket a
               Time To Live (TTL).
 
+              Set this with ``ceph config set global``. A daemon checks the
+              lifetime of a ticket against its own value of this setting, so a
+              monitor configured with a larger value than the OSDs will hand
+              out tickets that those OSDs reject.
+
+              A daemon also checks the ticket's timestamps against its own
+              clock and rejects a ticket that was minted more than roughly
+              twice this setting away from now. Keep the daemon clocks in sync;
+              a node whose clock drifts past that window will reject otherwise
+              valid tickets.
+
 :Type: Double
 :Default: ``60*60``
 
