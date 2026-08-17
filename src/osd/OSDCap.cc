@@ -522,8 +522,32 @@ bool OSDCap::parse(const string& str, ostream *err)
   string::const_iterator end = str.end();
 
   bool r = qi::phrase_parse(iter, end, g, ascii::space, *this);
-  if (r && iter == end)
+  if (r && iter == end) {
+    // Reject the shape produced by closing a scoped matcher and appending an
+    // unscoped grant. Unscoped grants are equivalent when ordered first.
+    bool saw_scoped_grant = false;
+    for (const auto& grant : grants) {
+      const bool unscoped_profile = grant.profile.is_valid() &&
+	std::any_of(grant.profile_grants.begin(), grant.profile_grants.end(),
+		    [](const auto& profile_grant) {
+		      return profile_grant.match.is_match_all();
+		    });
+      const bool unscoped = grant.network.empty() &&
+	((!grant.profile.is_valid() && grant.match.is_match_all()) ||
+	 unscoped_profile);
+      if (unscoped && saw_scoped_grant) {
+	grants.clear();
+	if (err) {
+	  *err << "unscoped osd capability follows a scoped grant";
+	}
+	return false;
+      }
+      if (!unscoped) {
+	saw_scoped_grant = true;
+      }
+    }
     return true;
+  }
 
   // Make sure no grants are kept after parsing failed!
   grants.clear();

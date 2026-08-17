@@ -136,6 +136,35 @@ TEST(OSDCap, ParseBad) {
   }
 }
 
+TEST(OSDCap, RejectLateUnscopedGrant) {
+  OSDCap rejected;
+  ASSERT_FALSE(rejected.parse(
+      "allow r pool 'long quoted pool name'; allow *", NULL));
+  ASSERT_TRUE(rejected.grants.empty());
+
+  auto parses = [](const char *str) {
+    OSDCap cap;
+    return cap.parse(str, NULL);
+  };
+
+  ASSERT_FALSE(parses("allow r pool 'long quoted pool name'; allow rwx"));
+  ASSERT_FALSE(parses(
+      "allow r pool 'long quoted pool name'; profile rbd"));
+
+  ASSERT_TRUE(parses("allow *"));
+  ASSERT_TRUE(parses("allow * pool=foo"));
+  ASSERT_TRUE(parses("allow *; allow r pool=foo"));
+  ASSERT_TRUE(parses("allow rw pool=foo, allow r pool=bar"));
+  ASSERT_TRUE(parses("profile rbd; allow r pool=foo"));
+  ASSERT_TRUE(parses("allow r pool=foo; profile rbd pool=bar"));
+  ASSERT_TRUE(parses(
+      "allow rw tag cephfs metadata=*, allow r tag cephfs data=*"));
+  ASSERT_TRUE(parses(
+      "allow rw pool=appdata, allow rw pool=logs"));
+  ASSERT_TRUE(parses(
+      "allow r pool=foo; allow * network 192.168.0.0/16"));
+}
+
 TEST(OSDCap, AllowAll) {
   OSDCap cap;
   entity_addr_t addr;
