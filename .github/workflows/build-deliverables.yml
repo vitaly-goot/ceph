@@ -58,10 +58,10 @@ jobs:
 
           # Determine lifecycle environment from ref pattern
           if [[ "${ref_type}" == "tag" ]]; then
-            lifecycle_environment="testing"
+            lifecycle_environment="qa"
             docker_tag="${ref_name}"
           elif [[ "${ref_name}" == aka_version_* ]]; then
-            lifecycle_environment="qa"
+            lifecycle_environment="testing"
           else
             lifecycle_environment="development"
           fi
