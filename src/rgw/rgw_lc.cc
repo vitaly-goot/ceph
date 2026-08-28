@@ -1218,8 +1218,8 @@ public:
      * version as current */
     if (oc.next_has_same_name(o.key.name)) {
       ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
-                         << ": next is same object, skipping "
-                         << oc.env.worker->thr_name() << dendl;
+			<< ": dm expiration would expose a non-current version, skipping "
+			<< oc.env.worker->thr_name() << dendl;
       return false;
     }
     *exp_time = real_clock::now();

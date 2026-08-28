@@ -1347,6 +1347,47 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y)
   auto& zone_params = svc.zone->get_zone_params();
   auto& zone = svc.zone->get_zone();
 
+  binfo_cache = new RGWChainedCacheImpl<bucket_info_entry>;
+  binfo_cache->init(svc.cache);
+
+  topic_cache = new RGWChainedCacheImpl<pubsub_bucket_topics_entry>;
+  topic_cache->init(svc.cache);
+
+  lc = new RGWLC();
+  lc->initialize(cct, this->driver);
+
+  restore = make_unique<rgw::restore::Restore>();
+  ret = restore->initialize(cct, this->driver);
+
+  if (ret < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to initialize restore thread" << dendl;
+    return ret;
+  }
+
+  quota_handler = RGWQuotaHandler::generate_handler(dpp, this->driver, quota_threads);
+
+  bucket_index_max_shards = (cct->_conf->rgw_override_bucket_index_max_shards ? cct->_conf->rgw_override_bucket_index_max_shards :
+                             zone.bucket_index_max_shards);
+  if (bucket_index_max_shards > get_max_bucket_shards()) {
+    bucket_index_max_shards = get_max_bucket_shards();
+    ldpp_dout(dpp, 1) << __func__ << " bucket index max shards is too large, reset to value: "
+      << get_max_bucket_shards() << dendl;
+  }
+  ldpp_dout(dpp, 20) << __func__ << " bucket index max shards: " << bucket_index_max_shards << dendl;
+
+  bool need_tombstone_cache = !svc.zone->get_zone_data_notify_to_map().empty(); /* have zones syncing from us */
+
+  if (need_tombstone_cache) {
+    obj_tombstone_cache = new tombstone_cache_t(cct->_conf->rgw_obj_tombstone_cache_size);
+  }
+
+  reshard_wait = std::make_shared<RGWReshardWait>();
+
+  reshard = new RGWReshard(this->driver);
+
+  // disable reshard thread based on zone/zonegroup support
+  run_reshard_thread = run_reshard_thread && svc.zone->can_reshard();
+
   /* no point of running sync thread if we don't have a master zone configured
     or there is no rest_master_conn */
   if (!svc.zone->need_to_sync()) {
@@ -1425,52 +1466,11 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y)
     data_notifier->start();
   }
 
-  binfo_cache = new RGWChainedCacheImpl<bucket_info_entry>;
-  binfo_cache->init(svc.cache);
-
-  topic_cache = new RGWChainedCacheImpl<pubsub_bucket_topics_entry>;
-  topic_cache->init(svc.cache);
-
-  lc = new RGWLC();
-  lc->initialize(cct, this->driver);
-
   if (use_lc_thread)
     lc->start_processor();
 
-  restore = make_unique<rgw::restore::Restore>();
-  ret = restore->initialize(cct, this->driver);
-
-  if (ret < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: failed to initialize restore thread" << dendl;
-    return ret;
-  }
-
   if (use_restore_thread)
     restore->start_processor();
-
-  quota_handler = RGWQuotaHandler::generate_handler(dpp, this->driver, quota_threads);
-
-  bucket_index_max_shards = (cct->_conf->rgw_override_bucket_index_max_shards ? cct->_conf->rgw_override_bucket_index_max_shards :
-                             zone.bucket_index_max_shards);
-  if (bucket_index_max_shards > get_max_bucket_shards()) {
-    bucket_index_max_shards = get_max_bucket_shards();
-    ldpp_dout(dpp, 1) << __func__ << " bucket index max shards is too large, reset to value: "
-      << get_max_bucket_shards() << dendl;
-  }
-  ldpp_dout(dpp, 20) << __func__ << " bucket index max shards: " << bucket_index_max_shards << dendl;
-
-  bool need_tombstone_cache = !svc.zone->get_zone_data_notify_to_map().empty(); /* have zones syncing from us */
-
-  if (need_tombstone_cache) {
-    obj_tombstone_cache = new tombstone_cache_t(cct->_conf->rgw_obj_tombstone_cache_size);
-  }
-
-  reshard_wait = std::make_shared<RGWReshardWait>();
-
-  reshard = new RGWReshard(this->driver);
-
-  // disable reshard thread based on zone/zonegroup support
-  run_reshard_thread = run_reshard_thread && svc.zone->can_reshard();
 
   if (run_reshard_thread)  {
     reshard->start_processor();
@@ -3168,6 +3168,7 @@ int RGWRados::swift_versioning_copy(RGWObjectCtx& obj_ctx,
                NULL, /* string *petag */
                NULL, /* void (*progress_cb)(off_t, void *) */
                NULL, /* void *progress_data */
+               NULL, /* rgw::sal::DataProcessorFactory *dp_factory */
                dpp,
                y,
                no_trace);
@@ -3268,6 +3269,7 @@ int RGWRados::swift_versioning_restore(RGWObjectCtx& obj_ctx,
                        nullptr,       /* string *petag */
                        nullptr,       /* void (*progress_cb)(off_t, void *) */
                        nullptr,       /* void *progress_data */
+                       nullptr,       /* rgw::sal::DataProcessorFactory *dp_factory */
                        dpp,
                        y,
                        no_trace);
@@ -3985,7 +3987,7 @@ int RGWRados::rewrite_obj(RGWBucketInfo& dest_bucket_info, const rgw_obj& obj, c
   return copy_obj_data(octx, owner, dest_bucket_info,
                        dest_bucket_info.placement_rule,
                        read_op, obj_size - 1, obj, NULL, mtime,
-                       attrset, 0, real_time(), NULL, dpp, y);
+                       attrset, 0, real_time(), NULL, NULL, dpp, y);
 }
 
 
@@ -5025,6 +5027,7 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
                string *petag,
                void (*progress_cb)(off_t, void *),
                void *progress_data,
+               rgw::sal::DataProcessorFactory *dp_factory,
                const DoutPrefixProvider *dpp,
                optional_yield y,
                jspan_context& trace)
@@ -5088,15 +5091,6 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   if (ret < 0) {
     return ret;
   }
-  if (src_attrs.count(RGW_ATTR_CRYPT_MODE)) {
-    // Current implementation does not follow S3 spec and even
-    // may result in data corruption silently when copying
-    // multipart objects across pools. So reject COPY operations
-    //on encrypted objects before it is fully functional.
-    ldpp_dout(dpp, 0) << "ERROR: copy op for encrypted object " << src_obj
-                  << " has not been implemented." << dendl;
-    return -ERR_NOT_IMPLEMENTED;
-  }
 
   src_attrs[RGW_ATTR_ACL] = attrs[RGW_ATTR_ACL];
   src_attrs.erase(RGW_ATTR_DELETE_AT);
@@ -5116,9 +5110,20 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
     src_attrs.erase(RGW_ATTR_OLH_VER);
   }
 
+  src_attrs.erase(RGW_ATTR_STORAGE_CLASS);
+
   src_attrs.erase(RGW_ATTR_OBJ_REPLICATION_TRACE);
   src_attrs.erase(RGW_ATTR_OBJ_REPLICATION_TIMESTAMP);
   src_attrs.erase(RGW_ATTR_OBJ_REPLICATION_STATUS);
+
+  // drop encryption attributes
+  // will be generated by copy_obj_data() if encryption is requested
+  src_attrs.erase(RGW_ATTR_CRYPT_KEYSEL);
+  src_attrs.erase(RGW_ATTR_CRYPT_CONTEXT);
+  src_attrs.erase(RGW_ATTR_CRYPT_MODE);
+  src_attrs.erase(RGW_ATTR_CRYPT_KEYID);
+  src_attrs.erase(RGW_ATTR_CRYPT_KEYMD5);
+  src_attrs.erase(RGW_ATTR_CRYPT_DATAKEY);
 
   set_copy_attrs(src_attrs, attrs, attrs_mod);
   attrs.erase(RGW_ATTR_ID_TAG);
@@ -5214,6 +5219,10 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
     }
   }
 
+  if (dp_factory && dp_factory->need_copy_data()) {
+    copy_data = true;
+  }
+
   if (petag) {
     const auto iter = attrs.find(RGW_ATTR_ETAG);
     if (iter != attrs.end()) {
@@ -5224,7 +5233,7 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   if (copy_data) { /* refcounting tail wouldn't work here, just copy the data */
     attrs.erase(RGW_ATTR_TAIL_TAG);
     return copy_obj_data(dest_obj_ctx, owner, dest_bucket_info, dest_placement, read_op, obj_size - 1, dest_obj,
-                         mtime, real_time(), attrs, olh_epoch, delete_at, petag, dpp, y);
+                         mtime, real_time(), attrs, olh_epoch, delete_at, petag, dp_factory, dpp, y);
   }
 
   /* This has been in for 2 years, so we can safely assume amanifest is not NULL */
@@ -5392,6 +5401,7 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
                uint64_t olh_epoch,
 	       real_time delete_at,
                string *petag,
+               rgw::sal::DataProcessorFactory *dp_factory,
                const DoutPrefixProvider *dpp,
                optional_yield y,
                bool log_op)
@@ -5402,36 +5412,45 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
   auto aio = rgw::make_throttle(cct->_conf->rgw_put_obj_min_window_size, y);
   using namespace rgw::putobj;
   jspan_context no_trace{false, false};
-  AtomicObjectProcessor processor(aio.get(), this, dest_bucket_info,
-                                  &dest_placement, owner,
-                                  obj_ctx, dest_obj, olh_epoch, tag, dpp, y, no_trace);
-  int ret = processor.prepare(y);
+  AtomicObjectProcessor aoproc(aio.get(), this, dest_bucket_info,
+                               &dest_placement, owner,
+                               obj_ctx, dest_obj, olh_epoch, tag, dpp, y, no_trace);
+
+  DataProcessorFilter aoproc_filter(&aoproc);
+  RGWGetObj_Filter *filter = &aoproc_filter;
+  if (dp_factory) {
+    int ret = dp_factory->set_writer(&aoproc, attrs, dpp, y);
+    if (ret < 0) {
+      return ret;
+    }
+
+    filter = dp_factory->get_filter();
+  }
+
+  int ret = aoproc.prepare(y);
   if (ret < 0)
     return ret;
 
   off_t ofs = 0;
 
-  do {
-    bufferlist bl;
-    ret = read_op.read(ofs, end, bl, y, dpp);
-    if (ret < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: fail to read object data, ret = " << ret << dendl;
-      return ret;
-    }
+  ret = read_op.iterate(dpp, ofs, end, filter, y);
+  if (ret < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to read object data ret=" << ret << dendl;
+    return ret;
+  }
 
-    uint64_t read_len = ret;
-    ret = processor.process(std::move(bl), ofs);
-    if (ret < 0) {
-      return ret;
-    }
-
-    ofs += read_len;
-  } while (ofs <= end);
+  // set ofs to the total bytes read
+  // `end` is always the last byte offset, so add 1
+  ofs = end + 1;
 
   // flush
-  ret = processor.process({}, ofs);
+  ret = filter->flush();
   if (ret < 0) {
     return ret;
+  }
+
+  if (dp_factory) {
+    dp_factory->finalize_attrs(attrs);
   }
 
   string etag;
@@ -5458,7 +5477,7 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
   }
 
   const req_context rctx{dpp, y, nullptr};
-  return processor.complete(accounted_size, etag, mtime, set_mtime, attrs,
+  return aoproc.complete(accounted_size, etag, mtime, set_mtime, attrs,
 			    rgw::cksum::no_cksum, delete_at,
                             nullptr, nullptr, nullptr, nullptr, nullptr, rctx,
                             log_op ? rgw::sal::FLAG_LOG_OP : 0);
@@ -5557,6 +5576,7 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                       olh_epoch,
                       real_time(),
                       nullptr /* petag */,
+                      nullptr, /* dp_factory */
                       dpp,
                       y,
                       log_op);
@@ -9348,11 +9368,6 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
       ldpp_dout(dpp, 20) << "olh_log_entry: epoch=" << iter->first << " op=" << (int)entry.op
                      << " key=" << entry.key.name << "[" << entry.key.instance << "] "
                      << (entry.delete_marker ? "(delete)" : "") << dendl;
-
-      if (link_epoch == iter->first)
-        ldpp_dout(dpp, 1) << "apply_olh_log epoch collision detected for " << entry.key
-                          << "; incoming op: " << entry.op << "(" << entry.op_tag << ")" << dendl;
-
       switch (entry.op) {
       case CLS_RGW_OLH_OP_REMOVE_INSTANCE:
         remove_instances.push_back(entry.key);

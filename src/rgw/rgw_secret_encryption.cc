@@ -67,7 +67,11 @@ protected:
 
   CryptoKeyHandler *get_key_handler(const bufferptr &secret)
   {
-    auto* cryptohandler = cct->get_crypto_handler(CEPH_CRYPTO_AES);
+    auto cryptohandler = cct->get_crypto_manager()->get_handler(CEPH_CRYPTO_AES);
+    if (!cryptohandler) {
+      ldout(cct, 1) << "ERROR: No AES crypto handler found" << dendl;
+      return nullptr;
+    }
 
     if (cryptohandler->validate_secret(secret) < 0) {
       ldout(cct, 1) << "ERROR: Invalid rgw secret encryption key, please ensure its length is 16" << dendl;
@@ -85,7 +89,7 @@ protected:
   int reload_keys(uint32_t expect_key_id);
 
   // Make an encryption key that is unique to the differentiator and the master encryption key.
-  CryptoKey make_unique_key(const RGWEncryptKey& encrypt_key, const std::string& differentiator);
+  bufferptr make_unique_key(const RGWEncryptKey& encrypt_key, const std::string& differentiator);
 };
 
 static std::unique_ptr<RGWSecretEncrypterImpl> TheSecretEncrypter;
@@ -217,7 +221,7 @@ int RGWSecretEncrypterImpl::reload_keys(uint32_t expect_key_id)
   }
 }
 
-CryptoKey RGWSecretEncrypterImpl::make_unique_key(const RGWEncryptKey &encrypt_key, const std::string &differentiator)
+bufferptr RGWSecretEncrypterImpl::make_unique_key(const RGWEncryptKey &encrypt_key, const std::string &differentiator)
 {
   auto now = ceph_clock_now();
   bufferptr key(encrypt_key.key.data(), encrypt_key.key.length());
@@ -229,8 +233,7 @@ CryptoKey RGWSecretEncrypterImpl::make_unique_key(const RGWEncryptKey &encrypt_k
 
   auto hash = ck.hmac_sha256(cct, bl);
 
-  bufferptr unique_key((const char*)hash.v, hash.SIZE);
-  return CryptoKey{CEPH_CRYPTO_AES, now, unique_key};
+  return bufferptr((const char*)hash.v, hash.SIZE);
 }
 
 std::tuple<bool, uint32_t, bufferlist> RGWSecretEncrypterImpl::decrypt(uint32_t key_id, const bufferlist &secret, bufferptr&iv, const std::string &differentiator)
@@ -275,7 +278,7 @@ std::tuple<bool, uint32_t, bufferlist> RGWSecretEncrypterImpl::decrypt(uint32_t 
 
   auto unique_key = make_unique_key(key_found->second, differentiator);
 
-  std::unique_ptr<CryptoKeyHandler> keyhandler(get_key_handler(unique_key.get_secret()));
+  std::unique_ptr<CryptoKeyHandler> keyhandler(get_key_handler(unique_key));
   if (!keyhandler) {
     ldout(cct, 1) << "ERROR: No Key handler found" << dendl;
     return std::make_tuple(false, 0, std::move(secret));
@@ -283,7 +286,7 @@ std::tuple<bool, uint32_t, bufferlist> RGWSecretEncrypterImpl::decrypt(uint32_t 
 
   bufferlist out;
   std::string error;
-  int ret = keyhandler->decrypt(secret, out, iv, &error);
+  int ret = keyhandler->decrypt(cct, secret, out, iv, &error);
   if (ret < 0) {
     ldout(cct, 1) << "ERROR: fail to decrypt secret: " << ret << " error " << error << dendl;
     return std::make_tuple(false, 0, std::move(secret));
@@ -309,7 +312,7 @@ std::tuple<uint32_t, std::string, bufferlist> RGWSecretEncrypterImpl::encrypt(co
 
   auto unique_key = make_unique_key(suggested_key, differentiator);
 
-  std::unique_ptr<CryptoKeyHandler> keyhandler(get_key_handler(unique_key.get_secret()));
+  std::unique_ptr<CryptoKeyHandler> keyhandler(get_key_handler(unique_key));
   if (! keyhandler) {
     ldout(cct, 1) << "ERROR: No Key handler" << dendl;
     return std::make_tuple(0, "", std::move(secret));
@@ -322,7 +325,7 @@ std::tuple<uint32_t, std::string, bufferlist> RGWSecretEncrypterImpl::encrypt(co
   bufferlist out;
   std::string error;
   bufferptr iv_buf(iv, AES_BLOCK_LEN);
-  int ret = keyhandler->encrypt(secret, out, iv_buf, &error);
+  int ret = keyhandler->encrypt(cct, secret, out, iv_buf, &error);
   if (ret < 0) {
     ldout(cct, 1) << "ERROR: fail to encrypt secret: " << error << dendl;
     return std::make_tuple(0, "", std::move(secret));
