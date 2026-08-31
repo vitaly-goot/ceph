@@ -1,0 +1,90 @@
+# Canonical entrypoint for Ceph devstack + teuthology matrix runs.
+#
+# This workflow calls the high-level orchestrator composite action directly
+# instead of routing through run-teuthology-suite.yaml. Keep runner selection,
+# timeout, and permissions here at the job level.
+#
+# Migration note: run-teuthology-suite.yaml is retained as a deprecated
+# transition path, but new callers should use this workflow.
+#
+# Versioning note: pin the orchestrator action to a real release tag when
+# available. Using @main can introduce silent behavior drift over time.
+
+name: Call Teuthology Suites
+
+on:
+    # As I'm testing this, there will be zero inputs
+    workflow_dispatch:
+        inputs:
+            ceph-image-ref:
+                description: 'Fully qualified Ceph image reference (registry/repo:tag). Preferred over ceph-image + docker-registry-url.'
+                required: false
+                default: 'storageeng-docker-qa.artifactory.linode.com/ceph-18:ubuntu22.04-18.2.7-609-g08768fc5c47'
+            ceph-image:
+                description: 'Deprecated: image path/tag without registry. Use ceph-image-ref instead.'
+                required: false
+                default: ''
+            docker-registry-url:
+                description: 'Deprecated: registry URL used with ceph-image when ceph-image-ref is not set.'
+                required: false
+                default: ''
+            ceph-package-version:
+                description: 'Exact Ceph package version to install and verify'
+                required: false
+                default: '18.2.7-609-g08768fc5c47-1'
+            ceph-package-repo-component:
+                description: 'Ceph release component (eg. reef, tentacle, etc.) This is the component name used in the apt sources.list file.'
+                required: true
+            ceph-package-repo-path:
+                description: 'Repo path appended to configured base URL (normal mode)'
+                required: false
+                default: 'storageeng-debian-qa'
+            ceph-package-repo-trusted:
+                description: 'Whether the Ceph package repo is trusted'
+                required: false
+                default: 'true'
+            upload-artifacts:
+                description: 'Set true to upload teuthology logs and archives as workflow artifacts'
+                required: false
+                type: boolean
+
+jobs:
+    call-teuthology-suites:
+        runs-on: [teuthology]
+        timeout-minutes: 720
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                suite:
+                    - "rgw/singleton"
+                    - "rgw/verify"
+                    - "rgw/crypt"
+                    - "rgw/lifecycle"
+        steps:
+            - name: Run Teuthology Via Orchestrator Action
+              uses: StorageTeam/test-ceph-action/composite-actions/orchestrate-teuthology-suite@main
+              with:
+                  rt-username: ${{ secrets.RT_USERNAME }}
+                  rt-token: ${{ secrets.RT_ACCESS_TOKEN }}
+                  rt-custom-ca-cert: ${{ secrets.RT_CUSTOM_CA_CERT }}
+                  checkout-token: ${{ secrets.CHECKOUT_TOKEN }}
+                  ceph-image-ref: ${{ github.event.inputs.ceph-image-ref != '' && github.event.inputs.ceph-image-ref || format('{0}/{1}', github.event.inputs.docker-registry-url || 'storageeng-docker-qa.artifactory.linode.com', github.event.inputs.ceph-image) }}
+                  ceph-image: ${{ github.event.inputs.ceph-image }}
+                  registry-url: ${{ github.event.inputs.docker-registry-url || vars.REGISTRY_URL || 'storageeng-docker-qa.artifactory.linode.com' }}
+                  suite: ${{ matrix.suite }}
+                  filter-out-extra: "barbican"
+                  teuthology-repo: ${{ vars.TEUTHOLOGY_REPO || 'StorageTeam/teuthology' }}
+                  teuthology-branch: ${{ vars.TEUTHOLOGY_BRANCH || 'chsmith/fix-builds' }}
+                  devstack-repo: ${{ vars.DEVSTACK_REPO || 'StorageTeam/ceph-devstack' }}
+                  devstack-branch: ${{ vars.DEVSTACK_BRANCH || 'mheler-upstream' }}
+                  ceph-package-repo-url: ${{ github.event.inputs.ceph-package-repo-url }}
+                  ceph-package-repo-base-url: ${{ vars.CEPH_PACKAGE_REPO_BASE_URL || 'https://artifactory.linode.com/artifactory' }}
+                  ceph-package-repo-path: ${{ github.event.inputs.ceph-package-repo-path }}
+                  ceph-package-repo-component: ${{ github.event.inputs.ceph-package-repo-component || 'main' }}
+                  ceph-package-repo-trusted: ${{ github.event.inputs.ceph-package-repo-trusted || vars.CEPH_PACKAGE_REPO_TRUSTED || 'true' }}
+                  ceph-package-repo-ca-cert-url: ${{ vars.CEPH_PACKAGE_REPO_CA_CERT_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
+                  ceph-package-version: ${{ github.event.inputs.ceph-package-version }}
+                  upload-artifacts: ${{ github.event.inputs.upload-artifacts || 'false' }}
+                  distro-version: "22.04"

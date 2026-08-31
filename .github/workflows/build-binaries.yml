@@ -41,7 +41,7 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.11.1
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.13.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -49,7 +49,7 @@ jobs:
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.11.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.13.1
           with:
             ceph_path: ceph
             enable_ccache: ${{ env.enable_ccache }}
@@ -62,7 +62,7 @@ jobs:
             build_arch: ${{ env.build_arch }}
 
         - name: Run Ceph
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.11.1
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.13.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -72,4 +72,3 @@ jobs:
             custom_image_script: run-all.sh
             patch_rocksdb_portable: 'true'
             enable_ccache: ${{ env.enable_ccache }}
-            enable_sccache: ${{ env.enable_sccache }}

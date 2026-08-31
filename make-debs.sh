@@ -61,22 +61,39 @@ if [[ -n "$SKIP_DEBUG_PACKAGES" ]] ; then
 	perl -pi -e 's/--dbg-package.*//' ceph-$vers/debian/rules
 fi
 
+# For cache hit consistency, allow CI builds to use a build directory whose name
+# does not contain version information
+if [ "${CEPH_BUILD_NORMALIZE_PATHS}" = 'true' ]; then
+    mv ceph-$vers ceph
+    cd ceph
+else
+    cd ceph-$vers
+fi
+
 #
 # update the changelog to match the desired version
 #
-cd ceph-$vers
 chvers=$(head -1 debian/changelog | perl -ne 's/.*\(//; s/\).*//; print')
 if [ "$chvers" != "$dvers" ]; then
    DEBEMAIL="contact@ceph.com" dch -D $VERSION_CODENAME --force-distribution -b -v "$dvers" "new version"
 fi
 #
 # Add a -j option if $DEB_BUILD_OPTIONS doesn't have parallel=n in it.
-# Default: use half of the available processors
+# Fallback job count is RAM-aware (~3-4GB/job), not just half the CPUs, to
+# avoid OOM kills on high-core/lower-memory builders (upstream 16183205fe1).
 PARALLEL="parallel"
 echo "DEB_BUILD_OPTIONS " $DEB_BUILD_OPTIONS
 if [[ ! $DEB_BUILD_OPTIONS =~ $PARALLEL ]] ; then
-   : ${NPROC:=$(($(nproc) / 2))}
-   if test $NPROC -gt 1 ; then
+   : ${NPROC:=$(nproc)}
+   RAM_MB=$(vmstat --stats --unit m | grep 'total memory' | awk '{print $1}')
+   if test "$NPROC" -gt 50 ; then
+      MAX_JOBS=$((RAM_MB / 4000))
+   else
+      MAX_JOBS=$((RAM_MB / 3000))
+   fi
+   if test "$NPROC" -gt "$MAX_JOBS" ; then
+      j=-j${MAX_JOBS}
+   else
       j=-j${NPROC}
    fi
 fi

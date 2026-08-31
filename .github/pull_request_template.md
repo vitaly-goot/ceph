@@ -2,10 +2,14 @@
 # Pull Request Template
 
 ## Title
+<!--
 Please include the Jira Story Number in the format: `[ISSUE-123] Brief description of changes`
+-->
 
 ## Description
+<!--
 Link to Jira Story: [Add link here]
+-->
 
 ### Changes
 - [ ] Feature implementation
@@ -26,6 +30,16 @@ Link to Jira Story: [Add link here]
 - [ ] For post-merge branch builds, ensure the target branch is `aka_version_*` (build runs on push after merge)
 - [ ] For release builds, push a tag matching `v*`
 - [ ] If PR checks show this workflow as skipped, confirm one of the build labels is present
+
+### Before Merging: Teuthology Validation
+> [!IMPORTANT]
+> `publish-artifacts` is also what gates the teuthology suite run - it only
+> executes once artifacts are actually published (the suite installs the
+> built .deb/image from Artifactory/the registry).
+>
+> Add the `publish-artifacts` label to this PR to trigger a teuthology run
+> against this build before merging, and confirm it passed before merging.
+
 
 ### Checklist
 - [ ] Code follows project style guidelines

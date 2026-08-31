@@ -3,6 +3,17 @@ name: Build Ceph Deliverables
 
 on:
   workflow_dispatch:
+    inputs:
+      include_debug_packages:
+        description: Build and keep Debian debug packages (-dbg/-dbgsym)
+        required: false
+        default: 'true'
+        type: boolean
+      upload_teuthology_artifacts:
+        description: Upload Teuthology artifacts as workflow artifacts
+        required: false
+        default: 'false'
+        type: boolean
   push:
     branches:
       - 'aka_version_*'
@@ -31,6 +42,13 @@ env:
   percentage_of_cpus_to_use: "25"
   enable_ccache: "false"
   enable_sccache: "true"
+  # Policy:
+  # - pull_request: keep debug packages enabled
+  # - release tags (v*): disable debug packages by default
+  # - aka_version_* branches: disable debug packages by default
+  # - workflow_dispatch: allow explicit operator override via input
+  include_debug_packages: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.include_debug_packages || (github.event_name == 'pull_request' && 'true') || (startsWith(github.ref, 'refs/tags/v') && 'false') || (startsWith(github.ref, 'refs/heads/aka_version_') && 'false') || 'true' }}
+  upload_teuthology_artifacts: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.upload_teuthology_artifacts || 'false' }}
 
 jobs:
 
@@ -105,7 +123,7 @@ jobs:
       - name: Prepare Artifactory CA trust
         if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
         id: prepare-ca
-        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@v0.11.1
+        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@v0.13.1
         with:
           artifactory_url: https://${{ vars.DOCKER_URL }}
           artifactory_ca_url: ${{ vars.ARTIFACTORY_CA_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
@@ -196,6 +214,8 @@ jobs:
     needs:
       - resolve-lifecycle
       - preflight-registry
+    outputs:
+      ceph_package_repo_component: ${{ steps.derive-build-vars.outputs.ceph_codename }}
     environment: ${{ needs.resolve-lifecycle.outputs.lifecycle_environment }}
     strategy:
       matrix:
@@ -217,7 +237,7 @@ jobs:
 
         - name: Derive build variables
           id: derive-build-vars
-          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.11.1
+          uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.13.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -225,11 +245,12 @@ jobs:
 
         - name: Create build vars config file
           id: write-build-vars-config
-          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.11.1
+          uses: StorageTeam/build-ceph-action/composite-actions/write-build-vars-config@v0.13.1
           with:
             ceph_path: ceph
             enable_ccache: ${{ env.enable_ccache }}
             enable_sccache: ${{ env.enable_sccache }}
+            include_debug_packages: ${{ env.include_debug_packages }}
             redis_db_number: ${{ steps.derive-build-vars.outputs.redis_db_number }}
             ccache_namespace: ${{ steps.derive-build-vars.outputs.ccache_namespace }}
             cxx_standard: ${{ steps.derive-build-vars.outputs.cxx_standard }}
@@ -238,7 +259,7 @@ jobs:
             build_arch: ${{ env.build_arch }}
 
         - name: Run Build With Container on debians
-          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.11.1
+          uses: StorageTeam/build-ceph-action/composite-actions/run-build-with-container@v0.13.1
           with:
             ceph_path: ceph
             os_version: ${{ matrix.os_version }}
@@ -272,7 +293,7 @@ jobs:
 
         - name: Publish Debian repository to Artifactory
           if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
-          uses: StorageTeam/build-ceph-action/composite-actions/publish-debian-repo@v0.11.1
+          uses: StorageTeam/build-ceph-action/composite-actions/publish-debian-repo@v0.13.1
           with:
             os_version: ${{ matrix.os_version }}
             source_path: ceph/debs
@@ -295,6 +316,10 @@ jobs:
     needs:
       - resolve-lifecycle
       - build-ceph-debians
+    outputs:
+      docker_image: ${{ steps.capture-docker-image.outputs.docker_image }}
+      ceph_build_version: ${{ steps.derive-build-vars.outputs.ceph_build_version }}
+      ceph_deb_version: ${{ steps.derive-build-vars.outputs.ceph_deb_version }}
     environment: ${{ needs.resolve-lifecycle.outputs.lifecycle_environment }}
     strategy:
       matrix:
@@ -313,7 +338,7 @@ jobs:
 
       - name: Derive build variables
         id: derive-build-vars
-        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.11.1
+        uses: StorageTeam/build-ceph-action/composite-actions/derive-build-vars@v0.13.1
         with:
           ceph_path: ceph
           os_version: ${{ matrix.os_version }}
@@ -344,7 +369,7 @@ jobs:
 
       - name: Prepare Docker registry CA trust
         if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
-        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@v0.11.1
+        uses: StorageTeam/build-ceph-action/composite-actions/prepare-artifactory-ca@v0.13.1
         with:
           artifactory_url: https://${{ steps.resolve-docker.outputs.registry_host }}
           artifactory_ca_url: ${{ vars.ARTIFACTORY_CA_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
@@ -353,7 +378,7 @@ jobs:
           require_ca: 'true'
 
       - name: Build and push docker image
-        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.11.1
+        uses: StorageTeam/build-ceph-action/composite-actions/build-docker-images@v0.13.1
         with:
           artifact_name: ceph-debians-${{ matrix.os_version }}
           artifact_path: ceph
@@ -370,6 +395,52 @@ jobs:
           registry_username: ${{ vars.RT_USERNAME }}
           registry_password: ${{ secrets.RT_PASSWORD }}
 
-      - name: Job Output of Docker Image name
+      - name: Capture Docker image output
+        id: capture-docker-image
         run: |
-          echo "Docker Image: ${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_build_version }}"
+          echo "docker_image=${{ steps.resolve-docker.outputs.registry_host }}/ceph-${{ steps.derive-build-vars.outputs.ceph_version }}:${{ matrix.os_version }}-${{ steps.derive-build-vars.outputs.ceph_build_version }}" >> "${GITHUB_OUTPUT}"
+  
+  # After building the debians & docker images, run teuthology suites to verify the build.
+  # Only runs when artifacts were actually published, since the suite installs
+  # the built .deb/image from Artifactory/the registry and would otherwise fail.
+  call-teuthology-suites:
+    needs:
+      - resolve-lifecycle
+      - build-ceph-debians
+      - build-ceph-docker-images
+    if: ${{ needs.resolve-lifecycle.outputs.publish_allowed == 'true' }}
+    environment: ${{ needs.resolve-lifecycle.outputs.lifecycle_environment }}
+    runs-on: teuthology
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - "rgw/singleton"
+          - "rgw/verify"
+          - "rgw/crypt"
+          - "rgw/lifecycle"
+    steps:
+      - name: Run Teuthology Via Orchestrator Action
+        uses: StorageTeam/test-ceph-action/composite-actions/orchestrate-teuthology-suite@main
+        with:
+          rt-username: ${{ secrets.RT_USERNAME }}
+          rt-token: ${{ secrets.RT_ACCESS_TOKEN }}
+          rt-custom-ca-cert: ${{ secrets.RT_CUSTOM_CA_CERT }}
+          checkout-token: ${{ secrets.CHECKOUT_TOKEN }}
+          # Test the image/packages just built & published by this workflow, not an operator-supplied one.
+          ceph-image-ref: ${{ needs.build-ceph-docker-images.outputs.docker_image }}
+          suite: ${{ matrix.suite }}
+          filter-out-extra: "barbican"
+          teuthology-repo: ${{ vars.TEUTHOLOGY_REPO || 'StorageTeam/teuthology' }}
+          teuthology-branch: ${{ vars.TEUTHOLOGY_BRANCH || 'chsmith/fix-builds' }}
+          devstack-repo: ${{ vars.DEVSTACK_REPO || 'StorageTeam/ceph-devstack' }}
+          devstack-branch: ${{ vars.DEVSTACK_BRANCH || 'mheler-upstream' }}
+          ceph-package-repo-base-url: ${{ vars.CEPH_PACKAGE_REPO_BASE_URL || 'https://artifactory.linode.com/artifactory' }}
+          ceph-package-repo-path: ${{ vars.DEBIAN_REPO }}
+          ceph-package-repo-component: ${{ needs.build-ceph-debians.outputs.ceph_package_repo_component }}
+          ceph-package-repo-trusted: ${{ vars.CEPH_PACKAGE_REPO_TRUSTED || 'true' }}
+          ceph-package-repo-ca-cert-url: ${{ vars.CEPH_PACKAGE_REPO_CA_CERT_URL || 'https://us-east-1.linodeobjects.com/linode-internal-ca/cacert-2019.pem' }}
+          ceph-package-version: ${{ needs.build-ceph-docker-images.outputs.ceph_deb_version }}
+          upload-artifacts: 'false'
+          distro-version: "22.04"
