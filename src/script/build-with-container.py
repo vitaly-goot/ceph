@@ -287,6 +287,19 @@ def _run(cmd, *args, **kwargs):
 def _container_cmd(
     ctx, args, *, workdir=None, interactive=False, extra_args=None
 ):
+    if len(args) >= 3 and args[0] == "bash" and args[1] == "-c":
+        restore_ownership_cmd = (
+            f"chown -R {os.getuid()}:{os.getgid()} "
+            f"{shlex.quote(ctx.cli.homedir)} || true"
+        )
+        args = [
+            args[0],
+            args[1],
+            "git config --global --add safe.directory '*' "
+            f"&& {{ {args[2]}; build_status=$?; "
+            f"{restore_ownership_cmd}; exit $build_status; }}",
+            *args[3:],
+        ]
     rm_container = not ctx.cli.keep_container
     cmd = [
         ctx.container_engine,
@@ -325,6 +338,35 @@ def _container_cmd(
         )
         cmd.append(f"-eCCACHE_DIR={ccdir}")
         cmd.append(f"-eCCACHE_BASEDIR={ctx.cli.homedir}")
+    if ctx._github_token_present():
+        if ctx._github_token_in_environ():
+            # Forward GITHUB_TOKEN from this script's own environment
+            # into the container. A bare `-e NAME` (no `=value`) is
+            # resolved by the container engine from its own calling
+            # environment, so the secret value never appears as a
+            # command line argument, in _cmdstr() output, or in logs.
+            # If the token instead only came from --env-file, the
+            # engine's existing --env-file handling above already
+            # supplies it and nothing further is needed here.
+            cmd.append("-eGITHUB_TOKEN")
+        # Configure Git (inside the container) to authenticate
+        # HTTPS requests to github.com using GITHUB_TOKEN, via a
+        # credential helper that reads the token from the container's
+        # own environment only when Git asks for credentials. This
+        # only affects Git-over-HTTPS to github.com (e.g. CMake
+        # FetchContent/ExternalProject_Add dependency fetches); it
+        # does not authenticate curl, the GitHub API, or container
+        # registries. None of the values below contain the token
+        # itself, only a reference to the GITHUB_TOKEN variable name.
+        cmd.append("-eGIT_CONFIG_COUNT=1")
+        cmd.append(
+            "-eGIT_CONFIG_KEY_0=credential.https://github.com.helper"
+        )
+        cmd.append(
+            "-eGIT_CONFIG_VALUE_0="
+            '!f() { echo "username=x-access-token"; '
+            'echo "password=$GITHUB_TOKEN"; }; f'
+        )
     cmd.extend(extra_args or [])
     cmd.extend(ctx.cli.extra or [])
     if ctx.npm_cache_dir:
@@ -423,6 +465,22 @@ class ImageSource(StrEnum):
         return ", ".join(s.value for s in cls)
 
 
+class GitHubTokenHandling(enum.Enum):
+    # No GITHUB_TOKEN is available (from either the environment or an
+    # --env-file); nothing should be forwarded into the container.
+    DISABLED = enum.auto()
+    # A GITHUB_TOKEN is available, but only via --env-file. The
+    # container engine's own --env-file handling already supplies it;
+    # no extra `-e` argument is needed.
+    ENABLED = enum.auto()
+    # A GITHUB_TOKEN is available in this process's own environment
+    # (regardless of whether it's also in the --env-file). It must be
+    # forwarded explicitly with a bare `-e GITHUB_TOKEN` so the
+    # container engine copies the value from its own calling
+    # environment rather than the command line.
+    ENABLED_IN_ENVIRON = enum.auto()
+
+
 class ImageVariant(StrEnum):
     DEFAULT = 'default'  # build everything + make check
     # test dependencies will not be instaled, other parameters
@@ -498,6 +556,41 @@ class Context:
         if len(values) != 1:
             raise ValueError(f"unexpected value in env file: {found!r}")
         return values[0]
+
+    @ftcache
+    def _github_token_present(self):
+        """Return True if a GITHUB_TOKEN is available, either from this
+        process's own environment or from the --env-file. The secret
+        value itself is only held transiently (for this presence check
+        and, if sourced from the environment, for the container
+        engine's own env-passthrough) and is never written into any
+        generated command, exception, or log message.
+        """
+        from_env = os.environ.get('GITHUB_TOKEN')
+        from_file = self.lookup_env_file('GITHUB_TOKEN')
+        log.debug("Environment GITHUB_TOKEN present=%r", from_env is not None)
+        log.debug(
+            "Env file GITHUB_TOKEN present=%r", from_file is not None
+        )
+        if (
+            from_env != from_file
+            and from_env is not None
+            and from_file is not None
+        ):
+            raise ValueError(
+                'conflicting GITHUB_TOKEN values in env and env file'
+            )
+        return bool(from_env or from_file)
+
+    @ftcache
+    def _github_token_in_environ(self):
+        """Return True if GITHUB_TOKEN is set in this process's own
+        environment. When true, the token can be forwarded to the
+        container with a bare `-e GITHUB_TOKEN` (no `=value`), which
+        tells docker/podman to copy the value from their own calling
+        environment instead of taking a value from the command line.
+        """
+        return 'GITHUB_TOKEN' in os.environ
 
     def packages_build(self):
         """Return true if only packages will be build (not make check)."""
