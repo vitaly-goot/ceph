@@ -70,6 +70,7 @@ jobs:
                   rt-token: ${{ secrets.RT_ACCESS_TOKEN }}
                   rt-custom-ca-cert: ${{ secrets.RT_CUSTOM_CA_CERT }}
                   checkout-token: ${{ secrets.CHECKOUT_TOKEN }}
+                  github-token: ${{ secrets.GH_COM_PAT }}
                   ceph-image-ref: ${{ github.event.inputs.ceph-image-ref != '' && github.event.inputs.ceph-image-ref || format('{0}/{1}', github.event.inputs.docker-registry-url || 'storageeng-docker-qa.artifactory.linode.com', github.event.inputs.ceph-image) }}
                   ceph-image: ${{ github.event.inputs.ceph-image }}
                   registry-url: ${{ github.event.inputs.docker-registry-url || vars.REGISTRY_URL || 'storageeng-docker-qa.artifactory.linode.com' }}
