@@ -112,7 +112,9 @@ namespace rgw {
  * If something goes wrong in RGW during bucket creation and we exit
  * ::execute() in state CREATE_RPC_SUCCEEDED, we need to rollback the create
  * with a Delete operation. This is implemented in the destructor but can be
- * invoked manually if desired.
+ * invoked manually if desired. The destructor's automatic rollback always
+ * blocks (null_yield) regardless of the yield context the machine was
+ * constructed with -- see ~UBNSCreateStateMachine() for why.
  *
  * ```
  * ... -> CREATE_RPC_SUCCEEDED -> *ROLLBACK_CREATE_START* ->
@@ -207,8 +209,14 @@ public:
    * @param bucket_name The bucket name.
    * @param cluster_id The cluster ID, set at startup.
    * @param owner The bucket owner.
+   * @param y Yield context to use for RPCs made via explicit set_state()
+   *          calls. Pass null_yield if no coroutine is in scope. Note: the
+   *          destructor's automatic rollback (if the machine is destroyed
+   *          in a partially-completed state) always blocks via null_yield
+   *          regardless of what's passed here -- see the destructor's
+   *          documentation for why.
    */
-  UBNSCreateStateMachine(const DoutPrefixProvider* dpp, std::shared_ptr<T> client, const std::string& bucket_name, const std::string cluster_id, const std::string& owner)
+  UBNSCreateStateMachine(const DoutPrefixProvider* dpp, std::shared_ptr<T> client, const std::string& bucket_name, const std::string cluster_id, const std::string& owner, optional_yield y)
       : dpp_ { dpp }
       , client_ { client }
       , bucket_name_ { bucket_name }
@@ -227,17 +235,29 @@ public:
    * This is not a passive destructor. If the machine is in a
    * partially-completed state, the destructor will send RPCs to try to keep
    * the upstream state machine in sync.
+   *
+   * This always runs the rollback with null_yield, i.e. blocking, even if
+   * the machine was originally driven with a live yield_context. A
+   * destructor is not a safe place to implicitly suspend the enclosing
+   * coroutine: it can run during stack unwinding (including mid-exception),
+   * and a hidden suspension point there means some *other* coroutine could
+   * run and observe state (locks, request state, etc.) that this object's
+   * owner assumed would stay untouched until destruction finished. Blocking
+   * the current thread is a well-understood, bounded cost; silently
+   * yielding control away in the middle of teardown is not.
    */
   ~UBNSCreateStateMachine()
   {
     if (state_ == CreateMachineState::CREATE_RPC_SOFT_FAILURE) {
       // In the idempotent-repeated-create case, just mark the machine as
       // complete so there's no ambiguity in the logs.
-      (void)set_state(CreateMachineState::COMPLETE);
+      (void)set_state(CreateMachineState::COMPLETE, null_yield);
     } else if (state_ == CreateMachineState::CREATE_RPC_SUCCEEDED) {
       ldpp_dout(dpp_, 1) << fmt::format(FMT_STRING("{}: Rolling back bucket creation for {}"), machine_id, bucket_log_id_) << dendl;
-      // Start the rollback. Ignore the result.
-      (void)set_state(CreateMachineState::ROLLBACK_CREATE_START);
+      // Start the rollback. Ignore the result. Deliberately blocking (see
+      // the note above) rather than using whichever yield context the
+      // machine was constructed with.
+      (void)set_state(CreateMachineState::ROLLBACK_CREATE_START, null_yield);
     }
     ldpp_dout(dpp_, 1) << fmt::format(FMT_STRING("{}: destructor: {} end state {}"), machine_id, bucket_log_id_, to_str(state_)) << dendl;
   }
@@ -278,10 +298,11 @@ public:
    * Attempts to set a state not deemed user-accessible will assert.
    *
    * @param new_state The requested new state.
+   * @param y         Yield context, or null_yield to block.
    * @return true on success.
    * @return false on failure.
    */
-  bool set_state(CreateMachineState new_state) noexcept
+  bool set_state(CreateMachineState new_state, optional_yield y) noexcept
   {
     ceph_assertf_always(state_ != CreateMachineState::EMPTY, "%s: attempt to set state on empty machine", machine_id);
 
@@ -311,7 +332,7 @@ public:
         break;
       }
       saved_result_.reset();
-      result = client_->add_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_);
+      result = client_->add_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, y);
       if (result.ok()) {
         state_ = CreateMachineState::CREATE_RPC_SUCCEEDED;
         ldpp_dout(dpp_, 5) << fmt::format(FMT_STRING("{}: add_bucket_entry() rpc for {} succeeded"), machine_id, bucket_log_id_) << dendl;
@@ -356,7 +377,7 @@ public:
         break;
       }
       saved_result_.reset();
-      result = client_->update_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, UBNSBucketUpdateState::CREATED);
+      result = client_->update_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, UBNSBucketUpdateState::CREATED, y);
       if (result.ok()) {
         state_ = CreateMachineState::UPDATE_RPC_SUCCEEDED;
         ldpp_dout(dpp_, 5) << fmt::format(FMT_STRING("{}: update_bucket_entry() rpc for {} succeeded"), machine_id, bucket_log_id_) << dendl;
@@ -380,7 +401,7 @@ public:
         break;
       }
       saved_result_.reset();
-      result = client_->delete_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_);
+      result = client_->delete_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, y);
       if (result.ok()) {
         state_ = CreateMachineState::ROLLBACK_CREATE_SUCCEEDED;
         ldpp_dout(dpp_, 5) << fmt::format(FMT_STRING("{}: rollback delete_bucket_entry() rpc for {} succeeded"), machine_id, bucket_log_id_) << dendl;
@@ -492,7 +513,10 @@ using UBNSCreateState = UBNSCreateMachine::CreateMachineState;
  * If something goes wrong in RGW during bucket deletion and we exit
  * ::execute() in state DELETE_RPC_SUCCEEDED, we need to rollback the update
  * so the bucket is back in its 'created' state. This is implemented in the
- * destructor but can be invoked manually if desired.
+ * destructor but can be invoked manually if desired. The destructor's
+ * automatic rollback always blocks (null_yield) regardless of the yield
+ * context the machine was constructed with -- see
+ * ~UBNSDeleteStateMachine() for why.
  *
  * ```
  * ... -> DELETE_RPC_SUCCEEDED -> *ROLLBACK_UPDATE_START* ->
@@ -585,8 +609,14 @@ public:
    * @param bucket_name The bucket name.
    * @param cluster_id The cluster ID, set at startup.
    * @param owner The bucket owner (not really used for delete, but set here anyway).
+   * @param y Yield context to use for RPCs made via explicit set_state()
+   *          calls. Pass null_yield if no coroutine is in scope. Note: the
+   *          destructor's automatic rollback (if the machine is destroyed
+   *          in a partially-completed state) always blocks via null_yield
+   *          regardless of what's passed here -- see the destructor's
+   *          documentation for why.
    */
-  UBNSDeleteStateMachine(const DoutPrefixProvider* dpp, std::shared_ptr<T> client, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner)
+  UBNSDeleteStateMachine(const DoutPrefixProvider* dpp, std::shared_ptr<T> client, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, optional_yield y)
       : dpp_ { dpp }
       , client_ { client }
       , bucket_name_ { bucket_name }
@@ -605,13 +635,25 @@ public:
    * This is not a passive destructor. If the machine is in a
    * partially-completed state, the destructor will send RPCs to try to keep
    * the upstream state machine in sync.
+   *
+   * This always runs the rollback with null_yield, i.e. blocking, even if
+   * the machine was originally driven with a live yield_context. A
+   * destructor is not a safe place to implicitly suspend the enclosing
+   * coroutine: it can run during stack unwinding (including mid-exception),
+   * and a hidden suspension point there means some *other* coroutine could
+   * run and observe state (locks, request state, etc.) that this object's
+   * owner assumed would stay untouched until destruction finished. Blocking
+   * the current thread is a well-understood, bounded cost; silently
+   * yielding control away in the middle of teardown is not.
    */
   ~UBNSDeleteStateMachine()
   {
     if (state_ == DeleteMachineState::UPDATE_RPC_SUCCEEDED) {
       ldpp_dout(dpp_, 1) << fmt::format(FMT_STRING("{}: rolling back bucket deletion update for {}"), machine_id, bucket_log_id_) << dendl;
-      // Start the rollback. Ignore the result.
-      (void)set_state(DeleteMachineState::ROLLBACK_UPDATE_START);
+      // Start the rollback. Ignore the result. Deliberately blocking (see
+      // the note above) rather than using whichever yield context the
+      // machine was constructed with.
+      (void)set_state(DeleteMachineState::ROLLBACK_UPDATE_START, null_yield);
     }
     ldpp_dout(dpp_, 1) << fmt::format(FMT_STRING("{}: destructor: {} end state {}"), machine_id, bucket_log_id_, to_str(state_)) << dendl;
   }
@@ -652,10 +694,11 @@ public:
    * Attempts to set a state not deemed user-accessible will assert.
    *
    * @param new_state The requested new state.
+   * @param y         Yield context, or null_yield to block.
    * @return true on success.
    * @return false on failure.
    */
-  bool set_state(DeleteMachineState new_state) noexcept
+  bool set_state(DeleteMachineState new_state, optional_yield y) noexcept
   {
     ceph_assertf_always(state_ != DeleteMachineState::EMPTY, "%s: attempt to set state on empty machine", machine_id);
 
@@ -683,7 +726,7 @@ public:
       if (state_ != DeleteMachineState::INIT) {
         break;
       }
-      result = client_->update_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, UBNSBucketUpdateState::DELETING);
+      result = client_->update_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, UBNSBucketUpdateState::DELETING, y);
       if (result.ok()) {
         state_ = DeleteMachineState::UPDATE_RPC_SUCCEEDED;
         ldpp_dout(dpp_, 5) << fmt::format(FMT_STRING("{}: update_bucket_entry() rpc for {} succeeded"), machine_id, bucket_log_id_) << dendl;
@@ -706,7 +749,7 @@ public:
       if (state_ != DeleteMachineState::UPDATE_RPC_SUCCEEDED && state_ != DeleteMachineState::DELETE_RPC_FAILED) {
         break;
       }
-      result = client_->delete_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_);
+      result = client_->delete_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, y);
       if (result.ok()) {
         state_ = DeleteMachineState::DELETE_RPC_SUCCEEDED;
         ldpp_dout(dpp_, 5) << fmt::format(FMT_STRING("{}: delete_bucket_entry() rpc for {} succeeded"), machine_id, bucket_log_id_) << dendl;
@@ -733,7 +776,7 @@ public:
       }
       ldpp_dout(dpp_, 1) << fmt::format(FMT_STRING("{}: rolling back bucket deletion update for {}"), machine_id, bucket_log_id_)
                          << dendl;
-      result = client_->update_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, UBNSBucketUpdateState::CREATED);
+      result = client_->update_bucket_entry(dpp_, bucket_name_, cluster_id_, owner_, UBNSBucketUpdateState::CREATED, y);
       if (result.ok()) {
         state_ = DeleteMachineState::ROLLBACK_UPDATE_SUCCEEDED;
         ldpp_dout(dpp_, 5) << fmt::format(FMT_STRING("{}: rollback update_bucket_entry() rpc for {} succeeded"), machine_id, bucket_log_id_) << dendl;

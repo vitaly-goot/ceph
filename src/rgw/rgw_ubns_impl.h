@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -34,125 +35,92 @@
 
 #include "ubdb/v1/ubdb.grpc.pb.h"
 
+#include <boost/asio/associated_cancellation_slot.hpp>
+#include <boost/asio/associated_executor.hpp>
+#include <boost/asio/async_result.hpp>
+#include <boost/asio/cancellation_signal.hpp>
+#include <boost/asio/co_composed.hpp>
+#include <boost/asio/deferred.hpp>
+#include <boost/asio/dispatch.hpp>
+
+#include "common/async/blocked_completion.h"
+
+// Avoid including rgw_common.h here -- it transitively pulls in opentelemetry
+// headers that fail to parse with GCC 11 / C++20.
+#ifndef ERR_INTERNAL_ERROR
+#define ERR_INTERNAL_ERROR 2200
+#endif
+
 namespace rgw {
 
 /**
- * @brief Thin wrapper around the gRPC client.
+ * @brief Bridge a single gRPC callback-async call to any Asio completion
+ * token.
  *
- * Error return codes are based on the following guidance from the service
- * developers:
+ * @param ctx The grpc::ClientContext for this call. Must outlive the
+ *   returned async operation (in practice: a coroutine-frame local that's
+ *   still in scope across the co_await). Used for two things:
+ *   - If the completion handler has a connected associated cancellation
+ *     slot, that slot is wired to call ctx.TryCancel() when a cancellation
+ *     signal is emitted. This makes async_grpc_call() a well-behaved,
+ *     cancellation-aware composed operation: if the enclosing coroutine's
+ *     cancellation state is ever triggered (e.g. by a caller wrapping the
+ *     call with a per-operation timeout/cancellation adapter), the
+ *     in-flight gRPC call is told to stop instead of being silently
+ *     orphaned. gRPC still delivers a normal completion afterwards (with a
+ *     CANCELLED status) through the usual callback below -- TryCancel()
+ *     does not bypass or race the completion path.
+ *   - Not otherwise touched here; callers are expected to have already
+ *     called ctx.set_deadline() themselves before invoking this function,
+ *     since that's the primary deadline enforcement mechanism (native to
+ *     gRPC, and in effect regardless of whether anything is connected to
+ *     the cancellation slot).
+ * @tparam StartFn A callable with signature
+ *   void(std::function<void(grpc::Status)>).
+ *   It should call stub->async()->SomeMethod(&ctx, &req, &resp, the_callback).
+ * @tparam CompletionToken Any Asio completion token for void(grpc::Status).
  *
- * ```
- * Create:
- *    Internal errors: grpc code Internal
- *    Terminated due to context: grpc code DeadlineExceeded
- *    Invalid or missing parameter: grpc code InvalidArgument
- *    Aborted due to being duplicated: grpc code FailedPrecondition
- *    User already owns bucket: grpc code AlreadyExists
- *    Another user owns the bucket: grpc code Aborted
- *    OK: nil
- *
- * Update:
- *    Internal errors: grpc code Internal
- *    Terminated due to context: grpc code DeadlineExceeded
- *    Invalid or missing parameter: grpc code InvalidArgument
- *    Invalid state transition (start a delete for a bucket not yet marked as created in ubns): grpc code InvalidArgument
- *    BucketEntry not found: grpc code NotFound
- *    Aborted due to being duplicated: grpc code FailedPrecondition
- *    Bucket is hosted on another cluster: grpc code FailedPrecondition
- *    OK: nil
- *
- * Delete:
- *    Internal errors: grpc code Internal
- *    Terminated due to context: grpc code DeadlineExceeded
- *    Invalid or missing parameter: grpc code InvalidArgument
- *    Bucket is hosted on another cluster: grpc code FailedPrecondition
- *    OK: nil
- * ```
- *
- * Note that in two instances in Update, we get the same error code for
- * multiple causes. The error message we return will list both potential
- * causes - what else can we do?
- *
+ * The gRPC library fires the callback on a gRPC-internal thread.  We
+ * dispatch the result back to the executor associated with the
+ * completion handler before invoking it, which ensures the Asio
+ * coroutine (or any other handler) is resumed on its own executor.
  */
-class UBNSgRPCClient {
-private:
-  std::unique_ptr<ubdb::v1::UBDBService::Stub> stub_;
+template <typename StartFn,
+          boost::asio::completion_token_for<void(grpc::Status)> CompletionToken>
+auto async_grpc_call(grpc::ClientContext& ctx, StartFn start_fn, CompletionToken&& token)
+{
+  return boost::asio::async_initiate<CompletionToken, void(grpc::Status)>(
+      [&ctx, sf = std::move(start_fn)](auto handler) mutable {
+        auto ex = boost::asio::get_associated_executor(handler);
 
-public:
-  /**
-   * @brief Construct a new UBNSgRPCClient object with no initial stub. You
-   * must call set_stub() before using any RPC!
-   */
-  UBNSgRPCClient() {};
+        auto slot = boost::asio::get_associated_cancellation_slot(handler);
+        if (slot.is_connected()) {
+          slot.assign([&ctx](boost::asio::cancellation_type_t /*type*/) {
+            // Ask gRPC to abort the in-flight call. This does not
+            // complete the operation itself -- gRPC will still invoke
+            // our completion callback below exactly once, just with a
+            // CANCELLED (or similar) status instead of the call's normal
+            // outcome.
+            ctx.TryCancel();
+          });
+        }
 
-  /**
-   * @brief Construct a new UBNSgRPCClient object given a gRPC channel.
-   */
-  explicit UBNSgRPCClient(std::shared_ptr<::grpc::Channel>) {};
-  ~UBNSgRPCClient() {};
-
-  // Can't copy with a unique_ptr.
-  UBNSgRPCClient(const UBNSgRPCClient&) = delete;
-  UBNSgRPCClient& operator=(const UBNSgRPCClient&) = delete;
-  // Move is fine.
-  UBNSgRPCClient(UBNSgRPCClient&&) = default;
-  UBNSgRPCClient& operator=(UBNSgRPCClient&&) = default;
-
-  /**
-   * @brief Set the gRPC stub for this object.
-   *
-   * @param channel the gRPC channel pointer.
-   */
-  void set_stub(std::shared_ptr<::grpc::Channel> channel)
-  {
-    stub_ = ubdb::v1::UBDBService::NewStub(channel);
-  }
-
-  /**
-   * @brief Call the AddBucketEntry service and return a result suitable for
-   * returning to RGW.
-   *
-   * See the class documentation for the table of gRPC codes to RGW codes.
-   *
-   * @param req The request object.
-   * @return UBNSClientResult The result object.
-   */
-  UBNSClientResult add_bucket_request(const ubdb::v1::AddBucketEntryRequest& req);
-
-  /**
-   * @brief Call the DeleteBucketEntry service and return a result suitable for
-   * returning to RGW.
-   *
-   * See the class documentation for the table of gRPC codes to RGW codes.
-   *
-   * @param req The request object.
-   * @return UBNSClientResult The result object.
-   */
-  UBNSClientResult delete_bucket_request(const ubdb::v1::DeleteBucketEntryRequest& req);
-
-  /**
-   * @brief Call the UpdateBucketEntry service and return a result suitable for
-   * returning to RGW.
-   *
-   * See the class documentation for the table of gRPC codes to RGW codes.
-   *
-   * @param req The request object.
-   * @return UBNSClientResult The result object.
-   */
-  UBNSClientResult update_bucket_request(const ubdb::v1::UpdateBucketEntryRequest& req);
-
-  /// @brief Return a UBNSClientResult object based on the return from the
-  /// AddBucketEntry service.
-  UBNSClientResult _add_bucket_xform_result(const grpc::Status& status);
-  /// @brief Return a UBNSClientResult object based on the return from the
-  /// DeleteBucketEntry service.
-  UBNSClientResult _delete_bucket_xform_result(const grpc::Status& status);
-  /// @brief Return a UBNSClientResult object based on the return from the
-  /// UpdateBucketEntry service.
-  UBNSClientResult _update_bucket_xform_result(const grpc::Status& status);
-
-}; // class UBNSgRPCClient
+        // gRPC's callback argument is std::function<void(grpc::Status)>, which
+        // requires a copy-constructible target.  Asio completion handlers are
+        // typically move-only.  Wrap the handler in a shared_ptr so the gRPC
+        // callback lambda — which captures it by shared ownership — satisfies
+        // std::function's copy-constructibility requirement.
+        auto sh = std::make_shared<decltype(handler)>(std::move(handler));
+        sf([ex, sh](grpc::Status s) mutable {
+          // gRPC fires this on a gRPC-internal thread; dispatch the result
+          // back to the handler's executor before invoking it.
+          boost::asio::dispatch(ex,
+              [sh = std::move(sh), s = std::move(s)]() mutable {
+                std::move(*sh)(std::move(s));
+              });
+        });
+      }, token);
+}
 
 /**
  * @brief Ceph configuration observer for UBNSClientImpl.
@@ -288,31 +256,263 @@ public:
   void shutdown();
 
   /**
-   * @brief Call ubdb.v1.AddBucketEntry() and return the result.
+   * @brief Asynchronously call ubdb.v1.AddBucketEntry() and deliver a
+   * UBNSClientResult via the given completion token.
    *
-   * @param dpp DoutPrefixProvider.
+   * Accepts any Asio completion token (use_awaitable, use_blocked,
+   * yield_context, deferred, …).  When called with
+   * ceph::async::use_blocked the behaviour is identical to the former
+   * synchronous implementation.
+   *
+   * @param dpp        DoutPrefixProvider.
    * @param bucket_name The bucket name.
-   * @return UBNSClientResult A result object.
+   * @param cluster_id  The cluster ID.
+   * @param owner       The owner.
+   * @param token       Any Asio completion token for void(UBNSClientResult).
    */
-  UBNSClientResult add_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner);
+  template <boost::asio::completion_token_for<void(UBNSClientResult)> CT>
+  auto add_bucket_entry(const DoutPrefixProvider* dpp,
+                        const std::string& bucket_name,
+                        const std::string& cluster_id,
+                        const std::string& owner,
+                        CT&& token)
+  {
+    // Log before entering the coroutine: GCC-12 ICEs on ldpp_dout inside
+    // coroutine lambda bodies (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=103790).
+    ldpp_dout(dpp, 20) << "UBNSClientImpl::add_bucket_entry" << dendl;
+    ldpp_dout(dpp, 5)
+        << fmt::format(FMT_STRING("UBNS: sending gRPC AddBucketRequest"
+                                  "(bucket={},cluster={},owner={})"),
+                       bucket_name, cluster_id, owner)
+        << dendl;
+    // Read the per-call deadline here, outside the coroutine, for the same
+    // reason logging happens out here (see comment above): keep config/dpp
+    // access out of the coroutine body where practical.
+    const int deadline_ms = dpp->get_cct()->_conf->rgw_ubns_grpc_call_deadline_ms;
+    return boost::asio::async_initiate<CT, void(UBNSClientResult)>(
+        boost::asio::co_composed<void(UBNSClientResult)>(
+            // Capture this-ptr and string args by value.  UBNSClientImpl is
+            // neither copyable nor movable so it cannot be passed as an extra
+            // async_initiate arg (deferred would try to decay-copy it).
+            [this, dpp, bucket_name, cluster_id, owner, deadline_ms](auto /*state*/) -> void
+            {
+              // The whole body is wrapped in try/catch, not just the parts
+              // that "obviously" can throw (e.g. allocation in NewStub(),
+              // protobuf field setters, fmt::format in xform_result).  This
+              // matters more here than in a plain synchronous call chain:
+              // once we've suspended on the co_await below, resumption is
+              // driven by dispatch() from gRPC's own completion callback,
+              // which may run on a foreign (gRPC-internal) thread, or be
+              // posted to run inside some unrelated io_context::run() call.
+              // boost::asio::co_composed's promise::unhandled_exception()
+              // simply rethrows -- it does NOT route the exception through
+              // the normal completion-handler channel -- so an uncaught
+              // exception here would escape into whichever context resumed
+              // us, not back to our original caller's stack as it would in
+              // the old fully-synchronous implementation. Catch everything
+              // here and convert it into a normal UBNSClientResult so it's
+              // always delivered safely through co_return.
+              //
+              // Note: co_return is deliberately kept out of the try/catch
+              // entirely (single exit point via the 'result' local below).
+              // GCC 12 has an internal compiler error (segfault) on a
+              // co_return placed directly inside a catch handler for some
+              // completion-token instantiations (e.g. CT =
+              // ceph::async::use_blocked_t) -- the same general class of
+              // GCC 12 coroutine bug as the ldpp_dout one noted above.
+              UBNSClientResult result;
+              try {
+                auto channel = this->safe_get_channel(dpp);
+                if (!channel) {
+                  result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                      "Internal error (could not fetch gRPC channel)");
+                } else {
+                  auto stub = ubdb::v1::UBDBService::NewStub(channel);
+                  ubdb::v1::AddBucketEntryRequest req;
+                  req.set_bucket(bucket_name);
+                  req.set_cluster(cluster_id);
+                  req.set_owner(owner);
+                  grpc::ClientContext ctx;
+                  ctx.set_deadline(std::chrono::system_clock::now()
+                      + std::chrono::milliseconds(deadline_ms));
+                  ubdb::v1::AddBucketEntryResponse resp;
+                  grpc::Status status = co_await async_grpc_call(ctx,
+                      [&stub, &ctx, &req, &resp](auto cb) {
+                        stub->async()->AddBucketEntry(&ctx, &req, &resp,
+                                                       std::move(cb));
+                      }, boost::asio::deferred);
+                  result = this->_add_bucket_xform_result(status);
+                }
+              } catch (const std::exception& e) {
+                // Deliberately not fmt::format(FMT_STRING(...)) here: that
+                // combination (fmt::format with a FMT_STRING compile-time
+                // format literal, inside a catch handler, inside a
+                // co_composed coroutine instantiated for
+                // ceph::async::use_blocked_t) triggers a GCC 12 internal
+                // compiler error (segfault) -- the same general class of
+                // bug as the ldpp_dout restriction noted above. Plain
+                // string concatenation avoids it entirely.
+                result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                    std::string("UBNS: AddBucketEntry: caught exception: ") + e.what());
+              } catch (...) {
+                result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                    "UBNS: AddBucketEntry: caught unknown exception");
+              }
+              co_return result;
+            }),
+        token);
+  }
 
   /**
-   * @brief Call ubdb.v1.DeleteBucketEntry() and return the result.
+   * @brief Asynchronously call ubdb.v1.DeleteBucketEntry() and deliver a
+   * UBNSClientResult via the given completion token.
    *
-   * @param dpp DoutPrefixProvider.
+   * @param dpp        DoutPrefixProvider.
    * @param bucket_name The bucket name.
-   * @return UBNSClientResult A result object.
+   * @param cluster_id  The cluster ID.
+   * @param owner       The owner.
+   * @param token       Any Asio completion token for void(UBNSClientResult).
    */
-  UBNSClientResult delete_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner);
+  template <boost::asio::completion_token_for<void(UBNSClientResult)> CT>
+  auto delete_bucket_entry(const DoutPrefixProvider* dpp,
+                           const std::string& bucket_name,
+                           const std::string& cluster_id,
+                           const std::string& owner,
+                           CT&& token)
+  {
+    ldpp_dout(dpp, 20) << "UBNSClientImpl::delete_bucket_entry" << dendl;
+    ldpp_dout(dpp, 5)
+        << fmt::format(FMT_STRING("UBNS: sending gRPC DeleteBucketRequest"
+                                  "(bucket={},cluster={},owner={})"),
+                       bucket_name, cluster_id, owner)
+        << dendl;
+    const int deadline_ms = dpp->get_cct()->_conf->rgw_ubns_grpc_call_deadline_ms;
+    return boost::asio::async_initiate<CT, void(UBNSClientResult)>(
+        boost::asio::co_composed<void(UBNSClientResult)>(
+            [this, dpp, bucket_name, cluster_id, owner, deadline_ms](auto /*state*/) -> void
+            {
+              // See add_bucket_entry() above for why the whole body needs
+              // to be inside this try/catch, and why co_return is kept out
+              // of the try/catch itself (single exit via 'result').
+              UBNSClientResult result;
+              try {
+                auto channel = this->safe_get_channel(dpp);
+                if (!channel) {
+                  result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                      "Internal error (could not fetch gRPC channel)");
+                } else {
+                  auto stub = ubdb::v1::UBDBService::NewStub(channel);
+                  ubdb::v1::DeleteBucketEntryRequest req;
+                  req.set_bucket(bucket_name);
+                  req.set_cluster(cluster_id);
+                  req.set_owner(owner);
+                  grpc::ClientContext ctx;
+                  ctx.set_deadline(std::chrono::system_clock::now()
+                      + std::chrono::milliseconds(deadline_ms));
+                  ubdb::v1::DeleteBucketEntryResponse resp;
+                  grpc::Status status = co_await async_grpc_call(ctx,
+                      [&stub, &ctx, &req, &resp](auto cb) {
+                        stub->async()->DeleteBucketEntry(&ctx, &req, &resp,
+                                                           std::move(cb));
+                      }, boost::asio::deferred);
+                  result = this->_delete_bucket_xform_result(status);
+                }
+              } catch (const std::exception& e) {
+                // See add_bucket_entry() above: avoid fmt::format(FMT_STRING)
+                // inside a coroutine catch handler (GCC 12 ICE).
+                result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                    std::string("UBNS: DeleteBucketEntry: caught exception: ") + e.what());
+              } catch (...) {
+                result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                    "UBNS: DeleteBucketEntry: caught unknown exception");
+              }
+              co_return result;
+            }),
+        token);
+  }
 
   /**
-   * @brief Call ubdb.v1.UpdateBucketEntry() and return the result.
+   * @brief Asynchronously call ubdb.v1.UpdateBucketEntry() and deliver a
+   * UBNSClientResult via the given completion token.
    *
-   * @param dpp DoutPrefixProvider.
+   * @param dpp        DoutPrefixProvider.
    * @param bucket_name The bucket name.
-   * @return UBNSClientResult A result object.
+   * @param cluster_id  The cluster ID.
+   * @param owner       The owner.
+   * @param state       The new bucket state.
+   * @param token       Any Asio completion token for void(UBNSClientResult).
    */
-  UBNSClientResult update_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, UBNSBucketUpdateState state);
+  template <boost::asio::completion_token_for<void(UBNSClientResult)> CT>
+  auto update_bucket_entry(const DoutPrefixProvider* dpp,
+                           const std::string& bucket_name,
+                           const std::string& cluster_id,
+                           const std::string& owner,
+                           UBNSBucketUpdateState state,
+                           CT&& token)
+  {
+    ldpp_dout(dpp, 20) << "UBNSClientImpl::update_bucket_entry" << dendl;
+    ldpp_dout(dpp, 1)
+        << fmt::format(FMT_STRING("UBNS: sending gRPC UpdateBucketRequest"
+                                  "(bucket={},cluster={},owner={},state={})"),
+                       bucket_name, cluster_id, owner, to_str(state))
+        << dendl;
+    const int deadline_ms = dpp->get_cct()->_conf->rgw_ubns_grpc_call_deadline_ms;
+    return boost::asio::async_initiate<CT, void(UBNSClientResult)>(
+        boost::asio::co_composed<void(UBNSClientResult)>(
+            [this, dpp, bucket_name, cluster_id, owner, state, deadline_ms](auto /*state_coro*/) -> void
+            {
+              // See add_bucket_entry() above for why the whole body needs
+              // to be inside this try/catch, and why co_return is kept out
+              // of the try/catch itself (single exit via 'result').
+              UBNSClientResult result;
+              try {
+                auto channel = this->safe_get_channel(dpp);
+                if (!channel) {
+                  result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                      "Internal error (could not fetch gRPC channel)");
+                } else {
+                  auto stub = ubdb::v1::UBDBService::NewStub(channel);
+                  ubdb::v1::UpdateBucketEntryRequest req;
+                  req.set_bucket(bucket_name);
+                  req.set_cluster(cluster_id);
+                  req.set_owner(owner);
+                  ubdb::v1::BucketState rpc_state;
+                  switch (state) {
+                  case rgw::UBNSBucketUpdateState::UNSPECIFIED:
+                    rpc_state = ubdb::v1::BucketState::BUCKET_STATE_UNSPECIFIED;
+                    break;
+                  case rgw::UBNSBucketUpdateState::CREATED:
+                    rpc_state = ubdb::v1::BucketState::BUCKET_STATE_CREATED;
+                    break;
+                  case rgw::UBNSBucketUpdateState::DELETING:
+                    rpc_state = ubdb::v1::BucketState::BUCKET_STATE_DELETING;
+                    break;
+                  }
+                  req.set_state(rpc_state);
+                  grpc::ClientContext ctx;
+                  ctx.set_deadline(std::chrono::system_clock::now()
+                      + std::chrono::milliseconds(deadline_ms));
+                  ubdb::v1::UpdateBucketEntryResponse resp;
+                  grpc::Status status = co_await async_grpc_call(ctx,
+                      [&stub, &ctx, &req, &resp](auto cb) {
+                        stub->async()->UpdateBucketEntry(&ctx, &req, &resp,
+                                                           std::move(cb));
+                      }, boost::asio::deferred);
+                  result = this->_update_bucket_xform_result(status);
+                }
+              } catch (const std::exception& e) {
+                // See add_bucket_entry() above: avoid fmt::format(FMT_STRING)
+                // inside a coroutine catch handler (GCC 12 ICE).
+                result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                    std::string("UBNS: UpdateBucketEntry: caught exception: ") + e.what());
+              } catch (...) {
+                result = UBNSClientResult::error(ERR_INTERNAL_ERROR,
+                    "UBNS: UpdateBucketEntry: caught unknown exception");
+              }
+              co_return result;
+            }),
+        token);
+  }
 
   std::string cluster_id() const
   {
@@ -412,13 +612,24 @@ public:
 
 private:
   /**
-   * @brief Safely fetch a UBNSgRPCClient object from under the channel shared mutex.
+   * @brief Safely fetch a copy of the current gRPC channel pointer under the
+   * channel shared mutex.
    *
    * @param dpp DoutPrefixProvider.
-   * @return std::optional<UBNSgRPCClient> A gRPC client object, or
-   * std::nullopt on failure.
+   * @return std::shared_ptr<grpc::Channel> The channel pointer, or nullptr
+   * on failure (e.g. channel not yet set up).
    */
-  std::optional<UBNSgRPCClient> safe_get_client(const DoutPrefixProvider* dpp);
+  std::shared_ptr<grpc::Channel> safe_get_channel(const DoutPrefixProvider* dpp);
+
+  /// @brief Return a UBNSClientResult object based on the return from the
+  /// AddBucketEntry service.
+  UBNSClientResult _add_bucket_xform_result(const grpc::Status& status);
+  /// @brief Return a UBNSClientResult object based on the return from the
+  /// DeleteBucketEntry service.
+  UBNSClientResult _delete_bucket_xform_result(const grpc::Status& status);
+  /// @brief Return a UBNSClientResult object based on the return from the
+  /// UpdateBucketEntry service.
+  UBNSClientResult _update_bucket_xform_result(const grpc::Status& status);
 
 }; // class UBNSClientImpl
 

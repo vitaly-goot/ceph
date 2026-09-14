@@ -4585,6 +4585,21 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_ubns_grpc_call_deadline_ms
+  type: int
+  level: advanced
+  desc: Deadline (timeout), in milliseconds, for each individual UBNS gRPC call.
+  long_desc: The maximum amount of time, in milliseconds, to wait for a single
+    UBNS gRPC call (AddBucketEntry, DeleteBucketEntry, UpdateBucketEntry) to
+    complete before it is cancelled and treated as failed. This is set via
+    grpc::ClientContext::set_deadline() on each call. If the deadline is
+    reached, gRPC completes the call with status code DEADLINE_EXCEEDED.
+  default: 30000
+  flags:
+  - runtime
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_ubns_grpc_mtls_enabled
   type: bool
   level: advanced

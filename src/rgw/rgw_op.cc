@@ -3901,7 +3901,7 @@ void RGWCreateBucket::execute(optional_yield y)
     // function to interact with UBNS. Notice the use of emplace() here - the
     // state machine's copy and move constructors are deleted, and most forms
     // of std::optional creation have an implicit move.
-    ubns_creater.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), s->user->get_id().to_str());
+    ubns_creater.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), s->user->get_id().to_str(), y);
   }
 
   op_ret = get_params(y);
@@ -3915,7 +3915,7 @@ void RGWCreateBucket::execute(optional_yield y)
   const RGWZoneGroup* bucket_zonegroup = &my_zonegroup;
 
   if (ubns_creater) {
-    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::CREATE_START);
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::CREATE_START, y);
     if (!success) {
       auto result = ubns_creater->saved_grpc_result();
       if (result) {
@@ -4175,7 +4175,7 @@ void RGWCreateBucket::execute(optional_yield y)
 
   if (ubns_creater) {
     // Move the state machine from CREATE_RPC_SUCCEEDED to UPDATE_START.
-    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::UPDATE_START);
+    bool success = ubns_creater->set_state(rgw::UBNSCreateMachine::CreateMachineState::UPDATE_START, y);
     if (!success) {
       // We've created the bucket! We will need to be reconcile this
       // externally, there's no obvious way to roll this back from
@@ -4232,11 +4232,11 @@ void RGWDeleteBucket::execute(optional_yield y)
     // function to interact with UBNS. Notice the use of emplace() here - the
     // state machine's copy and move constructors are deleted, and most forms
     // of std::optional creation have an implicit move.
-    ubns_deleter.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), user_id);
+    ubns_deleter.emplace(this, s->ubns_client, s->bucket_name, s->ubns_client->cluster_id(), user_id, y);
   }
 
   if (ubns_deleter) {
-    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::UPDATE_START);
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::UPDATE_START, y);
     if (!success) {
       auto result = ubns_deleter->saved_grpc_result();
       if (result) {
@@ -4299,7 +4299,7 @@ void RGWDeleteBucket::execute(optional_yield y)
   }
 
   if (ubns_deleter) {
-    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::DELETE_START);
+    bool success = ubns_deleter->set_state(rgw::UBNSDeleteMachine::DeleteMachineState::DELETE_START, y);
     if (!success) {
       // There's an error, but we've already deleted the bucket! We need to
       // reconcile this externally, there's no obvious way to roll this back

@@ -11,6 +11,7 @@
 
 #include "rgw_ubns.h"
 
+#include "common/async/blocked_completion.h"
 #include "common/debug.h"
 #include "include/ceph_assert.h"
 #include "rgw_ubns_impl.h"
@@ -60,17 +61,32 @@ void UBNSClient::shutdown()
   impl_->shutdown();
 }
 
-UBNSClientResult UBNSClient::add_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner)
+UBNSClientResult UBNSClient::add_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, optional_yield y)
 {
-  return impl_->add_bucket_entry(dpp, bucket_name, cluster_id, owner);
+  if (y) {
+    return impl_->add_bucket_entry(dpp, bucket_name, cluster_id, owner,
+                                   y.get_yield_context());
+  }
+  return impl_->add_bucket_entry(dpp, bucket_name, cluster_id, owner,
+                                 ceph::async::use_blocked);
 }
-UBNSClientResult UBNSClient::delete_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner)
+UBNSClientResult UBNSClient::delete_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, optional_yield y)
 {
-  return impl_->delete_bucket_entry(dpp, bucket_name, cluster_id, owner);
+  if (y) {
+    return impl_->delete_bucket_entry(dpp, bucket_name, cluster_id, owner,
+                                      y.get_yield_context());
+  }
+  return impl_->delete_bucket_entry(dpp, bucket_name, cluster_id, owner,
+                                    ceph::async::use_blocked);
 }
-UBNSClientResult UBNSClient::update_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, UBNSBucketUpdateState state)
+UBNSClientResult UBNSClient::update_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, UBNSBucketUpdateState state, optional_yield y)
 {
-  return impl_->update_bucket_entry(dpp, bucket_name, cluster_id, owner, state);
+  if (y) {
+    return impl_->update_bucket_entry(dpp, bucket_name, cluster_id, owner, state,
+                                      y.get_yield_context());
+  }
+  return impl_->update_bucket_entry(dpp, bucket_name, cluster_id, owner, state,
+                                    ceph::async::use_blocked);
 }
 
 std::string UBNSClient::cluster_id() const

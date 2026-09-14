@@ -21,6 +21,7 @@
 
 #include <fmt/format.h>
 
+#include "common/async/yield_context.h"
 #include "common/dout.h"
 
 namespace rgw {
@@ -232,35 +233,55 @@ public:
   void shutdown();
 
   /**
-   * @brief Return type for RPC operations.
-   */
-
-  /**
    * @brief Pass to the implementation's add_bucket_entry().
+   *
+   * Runs synchronously or asynchronously depending on \p y: pass
+   * null_yield to block the calling thread until the RPC completes, or a
+   * live yield_context (via optional_yield) to suspend the calling
+   * coroutine and resume it on its own executor once the RPC completes.
    *
    * @param dpp DoutPrefixProvider.
    * @param bucket_name The bucket name.
-   * @return UBNSClient::Result the implementation's result object.
+   * @param cluster_id The cluster ID.
+   * @param owner The bucket owner.
+   * @param y Yield context. Pass null_yield to run synchronously (blocking
+   * the calling thread), or a valid yield_context to run asynchronously.
+   * @return UBNSClientResult the implementation's result object.
    */
-  UBNSClientResult add_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner);
+  UBNSClientResult add_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, optional_yield y);
 
   /**
    * @brief Pass to the implementation's delete_bucket_entry().
    *
+   * Runs synchronously or asynchronously depending on \p y; see
+   * add_bucket_entry() for details.
+   *
    * @param dpp DoutPrefixProvider.
    * @param bucket_name The bucket name.
-   * @return UBNSClient::Result the implementation's result object.
+   * @param cluster_id The cluster ID.
+   * @param owner The bucket owner.
+   * @param y Yield context. Pass null_yield to run synchronously (blocking
+   * the calling thread), or a valid yield_context to run asynchronously.
+   * @return UBNSClientResult the implementation's result object.
    */
-  UBNSClientResult delete_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner);
+  UBNSClientResult delete_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, optional_yield y);
 
   /**
    * @brief Pass to the implementation's update_bucket_entry().
    *
+   * Runs synchronously or asynchronously depending on \p y; see
+   * add_bucket_entry() for details.
+   *
    * @param dpp DoutPrefixProvider.
    * @param bucket_name The bucket name.
-   * @return UBNSClient::Result the implementation's result object.
+   * @param cluster_id The cluster ID.
+   * @param owner The bucket owner.
+   * @param state The new bucket state.
+   * @param y Yield context. Pass null_yield to run synchronously (blocking
+   * the calling thread), or a valid yield_context to run asynchronously.
+   * @return UBNSClientResult the implementation's result object.
    */
-  UBNSClientResult update_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, UBNSBucketUpdateState state);
+  UBNSClientResult update_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, UBNSBucketUpdateState state, optional_yield y);
 
   /**
    * @brief Return the configured cluster ID.

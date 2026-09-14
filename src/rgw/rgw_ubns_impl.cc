@@ -52,15 +52,7 @@
 
 namespace rgw {
 
-UBNSClientResult UBNSgRPCClient::add_bucket_request(const ubdb::v1::AddBucketEntryRequest& req)
-{
-  ::grpc::ClientContext context;
-  ubdb::v1::AddBucketEntryResponse resp;
-  auto status = stub_->AddBucketEntry(&context, req, &resp);
-  return _add_bucket_xform_result(status);
-}
-
-UBNSClientResult UBNSgRPCClient::_add_bucket_xform_result(const ::grpc::Status& status)
+UBNSClientResult UBNSClientImpl::_add_bucket_xform_result(const ::grpc::Status& status)
 {
   if (status.ok()) {
     return UBNSClientResult::success();
@@ -110,15 +102,7 @@ UBNSClientResult UBNSgRPCClient::_add_bucket_xform_result(const ::grpc::Status& 
   }
 }
 
-UBNSClientResult UBNSgRPCClient::delete_bucket_request(const ubdb::v1::DeleteBucketEntryRequest& req)
-{
-  ::grpc::ClientContext context;
-  ubdb::v1::DeleteBucketEntryResponse resp;
-  auto status = stub_->DeleteBucketEntry(&context, req, &resp);
-  return _delete_bucket_xform_result(status);
-}
-
-UBNSClientResult UBNSgRPCClient::_delete_bucket_xform_result(const ::grpc::Status& status)
+UBNSClientResult UBNSClientImpl::_delete_bucket_xform_result(const ::grpc::Status& status)
 {
   if (status.ok()) {
     // The document says '204 NoContent', but we're relying on RGW to supply
@@ -154,15 +138,7 @@ UBNSClientResult UBNSgRPCClient::_delete_bucket_xform_result(const ::grpc::Statu
   }
 }
 
-UBNSClientResult UBNSgRPCClient::update_bucket_request(const ubdb::v1::UpdateBucketEntryRequest& req)
-{
-  ::grpc::ClientContext context;
-  ubdb::v1::UpdateBucketEntryResponse resp;
-  auto status = stub_->UpdateBucketEntry(&context, req, &resp);
-  return _update_bucket_xform_result(status);
-}
-
-UBNSClientResult UBNSgRPCClient::_update_bucket_xform_result(const ::grpc::Status& status)
+UBNSClientResult UBNSClientImpl::_update_bucket_xform_result(const ::grpc::Status& status)
 {
   if (status.ok()) {
     return UBNSClientResult::success();
@@ -244,75 +220,15 @@ void UBNSClientImpl::shutdown()
   // destruction.
 }
 
-std::optional<UBNSgRPCClient> UBNSClientImpl::safe_get_client(const DoutPrefixProvider* dpp)
+std::shared_ptr<grpc::Channel> UBNSClientImpl::safe_get_channel(const DoutPrefixProvider* dpp)
 {
-  UBNSgRPCClient client {};
   std::shared_lock<std::shared_mutex> g(m_channel_);
   // Quick confidence check of channel_.
   if (!channel_) {
     ldpp_dout(dpp, 0) << "Unset gRPC channel" << dendl;
-    return std::nullopt;
+    return nullptr;
   }
-  client.set_stub(channel_);
-  return std::make_optional(std::move(client));
-}
-
-UBNSClientResult UBNSClientImpl::add_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner)
-{
-  ldpp_dout(dpp, 20) << __func__ << dendl;
-  auto client = safe_get_client(dpp);
-  if (!client) {
-    return UBNSClientResult::error(ERR_INTERNAL_ERROR, "Internal error (could not fetch gRPC client)");
-  }
-  ubdb::v1::AddBucketEntryRequest req;
-  req.set_bucket(bucket_name);
-  req.set_cluster(cluster_id);
-  req.set_owner(owner);
-  ldpp_dout(dpp, 5) << fmt::format(FMT_STRING("UBNS: sending gRPC AddBucketRequest(bucket={},cluster={},owner={})"), req.bucket(), req.cluster(), req.owner()) << dendl;
-  return client->add_bucket_request(req);
-}
-
-UBNSClientResult UBNSClientImpl::delete_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner)
-{
-  ldpp_dout(dpp, 20) << __func__ << dendl;
-  auto client = safe_get_client(dpp);
-  if (!client) {
-    return UBNSClientResult::error(ERR_INTERNAL_ERROR, "Internal error (could not fetch gRPC client)");
-  }
-  ubdb::v1::DeleteBucketEntryRequest req;
-  req.set_bucket(bucket_name);
-  req.set_cluster(cluster_id);
-  req.set_owner(owner);
-  ldpp_dout(dpp, 5) << fmt::format(FMT_STRING("UBNS: sending gRPC DeleteBucketRequest(bucket={},cluster={},owner={})"), req.bucket(), req.cluster(), req.owner()) << dendl;
-  return client->delete_bucket_request(req);
-}
-
-UBNSClientResult UBNSClientImpl::update_bucket_entry(const DoutPrefixProvider* dpp, const std::string& bucket_name, const std::string& cluster_id, const std::string& owner, UBNSBucketUpdateState state)
-{
-  ldpp_dout(dpp, 20) << __func__ << dendl;
-  auto client = safe_get_client(dpp);
-  if (!client) {
-    return UBNSClientResult::error(ERR_INTERNAL_ERROR, "Internal error (could not fetch gRPC client)");
-  }
-  ubdb::v1::UpdateBucketEntryRequest req;
-  req.set_bucket(bucket_name);
-  req.set_cluster(cluster_id);
-  req.set_owner(owner);
-  ubdb::v1::BucketState rpc_state;
-  switch (state) {
-  case rgw::UBNSBucketUpdateState::UNSPECIFIED:
-    rpc_state = ubdb::v1::BucketState::BUCKET_STATE_UNSPECIFIED;
-    break;
-  case rgw::UBNSBucketUpdateState::CREATED:
-    rpc_state = ubdb::v1::BucketState::BUCKET_STATE_CREATED;
-    break;
-  case rgw::UBNSBucketUpdateState::DELETING:
-    rpc_state = ubdb::v1::BucketState::BUCKET_STATE_DELETING;
-    break;
-  }
-  req.set_state(rpc_state);
-  ldpp_dout(dpp, 1) << fmt::format(FMT_STRING("UBNS: sending gRPC UpdateBucketRequest(bucket={},cluster={},owner={},state={})"), req.bucket(), req.cluster(), req.owner(), to_str(state)) << dendl;
-  return client->update_bucket_request(req);
+  return channel_;
 }
 
 grpc::ChannelArguments UBNSClientImpl::get_default_channel_args(CephContext* const cct)
@@ -330,7 +246,7 @@ grpc::ChannelArguments UBNSClientImpl::get_default_channel_args(CephContext* con
       cct->_conf->rgw_ubns_grpc_arg_max_reconnect_backoff_ms)
                  << dendl;
 
-  return grpc::ChannelArguments();
+  return args;
 }
 
 bool UBNSClientImpl::_set_insecure_channel(CephContext* const cct, const std::string& new_uri)
