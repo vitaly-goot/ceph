@@ -7076,6 +7076,11 @@ void RGWPutLC::execute(optional_yield y)
     ldpp_dout(this, 15) << "New LifecycleConfiguration:" << ss.str() << dendl;
   }
 
+  if (s->info.env->exists("HTTP_X_RGW_VALIDATE_ONLY")) {
+    ldpp_dout(this, 15) << "x-rgw-validate-only header set - exiting early" << dendl;
+    return;
+  }
+
   op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->owner.id,
                                          &data, nullptr, s->info, s->err, y);
   if (op_ret < 0) {
