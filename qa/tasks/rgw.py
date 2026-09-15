@@ -82,14 +82,25 @@ def start_rgw(ctx, config, clients):
             frontends += ' ssl_certificate={}'.format(endpoint.cert.certificate)
             frontends += ' ssl_port={}'.format(endpoint.port)
             path = 'lib/security/cacerts'
+            alias = endpoint.hostname
+            keystore = run.Raw(
+                '$(readlink -e $(dirname $(readlink -e $(which keytool)))/../{path})'.format(path=path))
             ctx.cluster.only(client).run(
                 args=['sudo',
                       'keytool',
-                      '-import', '-alias', '{alias}'.format(
-                          alias=endpoint.hostname),
+                      '-delete', '-alias', alias,
+                      '-keystore', keystore,
+                      '-storepass', 'changeit',
+                      ],
+                check_status=False,
+                stdout=BytesIO()
+            )
+            ctx.cluster.only(client).run(
+                args=['sudo',
+                      'keytool',
+                      '-import', '-alias', alias,
                       '-keystore',
-                      run.Raw(
-                          '$(readlink -e $(dirname $(readlink -e $(which keytool)))/../{path})'.format(path=path)),
+                      keystore,
                       '-file', endpoint.cert.certificate,
                       '-storepass', 'changeit',
                       ],
