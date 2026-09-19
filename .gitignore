@@ -63,6 +63,7 @@ GTAGS
 # common cmake build dir
 /build
 /build.*
+/build-journal-poc/
 
 # editor backup files etc.
 \#*\#
