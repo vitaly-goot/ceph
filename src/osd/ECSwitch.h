@@ -175,6 +175,11 @@ public:
     return legacy.check_recovery_sources(osdmap);
   }
 
+  void drain_ec_journal_for_shutdown(std::function<void(int)> done) override
+  {
+    optimized.drain_journal_for_shutdown(std::move(done));
+  }
+
   void on_change() override
   {
     if (is_optimized_unchecked()) {

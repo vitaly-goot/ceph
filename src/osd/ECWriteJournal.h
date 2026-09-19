@@ -42,6 +42,8 @@ struct Stripe {
 
   uint64_t dirty_bytes() const { return blocks.size() * block_size; }
   bool full() const { return dirty_bytes() == valid_bytes; }
+  // Reference-model helpers for core tests/diagnostics only. The OSD uses
+  // ECJournalFlush's shard planner/assembly (covered by separate tests).
   // Logical object ranges that still need base data (not rounded device reads).
   std::vector<std::pair<uint64_t, uint64_t>> holes() const;
   // A complete stripe needs no base. Otherwise base must contain valid_bytes
@@ -56,6 +58,8 @@ struct Limits {
   uint64_t max_bytes = 16 * 1024 * 1024;
   uint64_t max_records = 8192;
   uint64_t max_segments = 4;
+
+  bool valid() const;
 };
 
 struct Ticket {
@@ -86,8 +90,8 @@ class Journal {
              const ceph::bufferlist& data, ceph::os::Transaction& t,
              Ticket* ticket);
 
-  // Call ONLY from a successfully submitted append's on_commit callback,
-  // wrapped in PGBackend::Listener::bless_context() by the backend owner.
+  // Call ONLY after the append transaction commits, with the PG lock held.
+  // RMW on_all_commit already holds it; direct store callbacks need blessing.
   // Append errors latch the journal closed; never ACK them or silently bypass.
   int committed(Ticket ticket, int result);
 
@@ -107,6 +111,8 @@ class Journal {
   uint64_t bytes() const { return used_bytes; }
   uint64_t records() const { return used_records; }
   bool empty() const { return segments.empty(); }
+  bool has_open_segment() const;
+  bool flush_ready() const;
   int error() const { return failed; }
 
  private:

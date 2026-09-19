@@ -1960,6 +1960,9 @@ public:
   void on_flushed() override;
   void on_removal(ObjectStore::Transaction &t) override;
   void on_shutdown() override;
+  void drain_ec_journal_for_shutdown(std::function<void(int)> done) override {
+    pgbackend->drain_ec_journal_for_shutdown(std::move(done));
+  }
   bool check_failsafe_full() override;
   bool maybe_preempt_replica_scrub(const hobject_t& oid) override;
   struct ECListener *get_eclistener() override;

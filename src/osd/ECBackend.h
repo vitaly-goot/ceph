@@ -113,9 +113,9 @@ class ECBackend : public ECCommon {
 
   void dump_recovery_info(ceph::Formatter *f) const;
 
-  void call_write_ordered(std::function<void(void)> &&cb) {
-    rmw_pipeline.call_write_ordered(std::move(cb));
-  }
+  void call_write_ordered(std::function<void(void)> &&cb);
+
+  void drain_journal_for_shutdown(std::function<void(int)> on_finish);
 
   void submit_transaction(
       const hobject_t &hoid,

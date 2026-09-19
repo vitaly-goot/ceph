@@ -28,6 +28,7 @@
 #include "ECTypes.h"
 #include "ECSwitch.h"
 #include "ECJournalFlush.h"
+#include "ECJournalQueue.h"
 
 #include "PrimaryLogPG.h"
 
@@ -71,7 +72,8 @@ struct ECBackend::ECRecoveryBackend::ECRecoveryHandle : public PGBackend::Recove
 struct ECBackend::JournalState {
   ECBackend* backend;
   ECWriteJournal::Journal journal;
-  std::deque<std::shared_ptr<ECClassicalOp>> pending;
+  ECWriteJournal::AdmissionQueue<std::shared_ptr<ECClassicalOp>> pending;
+  ECWriteJournal::DrainWaiters shutdown_drain;
   std::optional<ECWriteJournal::Flush> flush;
   size_t next_stripe = 0;
   bool flush_in_progress = false;
@@ -132,6 +134,8 @@ ECBackend::ECBackend(
    */
   ceph_assert((ec_impl->get_data_chunk_count() *
     ec_impl->get_chunk_size(stripe_width)) == stripe_width);
+  // All enrollment settings are startup-only; no lookups on disabled writes.
+  init_journal();
 }
 
 PGBackend::RecoveryHandle *ECBackend::open_recovery_op() {
@@ -930,6 +934,8 @@ void ECBackend::dump_recovery_info(Formatter *f) const {
 struct ECClassicalOp : ECCommon::RMWPipeline::Op {
   PGTransactionUPtr t;
   bool journal_eligible = false;
+  bool pressure_counted = false;
+  std::map<hobject_t, object_info_t> submitted_oi;
   uint64_t journal_object_size = 0;
   std::optional<ObjectStore::Transaction> journal_append;
   shard_id_t journal_shard;
@@ -1001,7 +1007,8 @@ struct ECJournalFlushOp final : ECCommon::RMWPipeline::Op {
     auto data = ECWriteJournal::assemble_flush(stripe, sinfo,
       read == remote_shard_extent_map.end() ? empty : read->second);
     data.insert_parity_buffers();
-    ceph_assert(data.encode(ec_impl, dpp) == 0);
+    const int encoded = data.encode(ec_impl, dpp);
+    ceph_assert(encoded == 0);
     const uint64_t chunk_off = stripe.offset / sinfo.get_k();
     for (auto& [shard, txn] : *transactions) {
       bufferlist chunk;
@@ -1030,17 +1037,20 @@ void ECBackend::init_journal()
         get_parent()->get_info().pgid.pgid.pool()) {
     return;
   }
-  ceph_assert((sinfo.get_k() == 8 || sinfo.get_k() == 12) &&
-              sinfo.get_m() == 3 && sinfo.get_chunk_size() == 4096);
-  ECWriteJournal::Limits limits;
-  limits.stripe_width = sinfo.get_k() * sinfo.get_chunk_size();
-  limits.segment_bytes = cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_segment_bytes");
-  limits.max_bytes = cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_max_bytes");
-  limits.max_records = cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_max_records");
-  limits.max_segments = std::max(uint64_t(1), limits.max_bytes / limits.segment_bytes);
+  const auto limits = ECWriteJournal::read_limits(cct->_conf,
+    sinfo.get_k() * sinfo.get_chunk_size());
+  if (!get_parent()->get_pool().allows_ecoptimizations() ||
+      !ECWriteJournal::supported_geometry(sinfo.get_k(), sinfo.get_m(),
+                                          sinfo.get_chunk_size()) ||
+      !limits.valid()) {
+    derr << "EC journal POC enrollment refused: requires optimized 4+3/8+3/12+3 with 4096-byte "
+         << "chunks and nonzero limits with segment_bytes <= max_bytes" << dendl;
+    return;
+  }
   const auto pgid = get_parent()->get_info().pgid.pgid;
-  // Temp-pool objects cannot collide with client names. Do not register these
-  // in temp_contents (peering deletes those objects). There is no replay yet.
+  // Temp-pool objects cannot collide with client names. OSD::clear_temp_objects
+  // removes them on restart; that is discard, NOT replay. Track live segments
+  // in temp_contents too, and unregister only after trim has committed.
   const hobject_t anchor(object_t("ec-write-journal"), "", CEPH_NOSNAP,
                          pgid.ps(), pgid.pool(), "");
   auto name = std::string("ec-write-journal.") +
@@ -1081,6 +1091,7 @@ void ECBackend::reset_journal()
   ceph_assertf(journal_state->journal.empty(),
     "EC journal POC: PG reset with dirty records; replay is NOT implemented");
   journal_state->pending.clear();
+  journal_state->shutdown_drain.finish(-ECANCELED);
   // Do not destroy the timer here: its thread may be releasing a reference
   // after cancellation. Its lifetime is the backend's lifetime.
 }
@@ -1116,21 +1127,24 @@ void ECBackend::pump_journal()
     get_parent()->get_backfill_shards().empty();
   ceph_assertf(healthy || s.journal.empty(),
     "EC journal POC requires a fixed healthy acting set while dirty");
-  const bool drain = cct->_conf.get_val<bool>("osd_ec_journal_poc_drain");
+  const bool drain = s.shutdown_drain.requested() ||
+    cct->_conf.get_val<bool>("osd_ec_journal_poc_drain");
   if (drain || ceph::mono_clock::now() - s.open_since >=
                  std::chrono::milliseconds(s.flush_ms)) {
     s.journal.seal();
   }
 
-  while (!s.pending.empty()) {
-    auto op = s.pending.front();
+  while (auto next = s.pending.next([this](std::function<void()> cb) {
+      rmw_pipeline.call_write_ordered(std::move(cb));
+    })) {
+    auto op = *next;
     if (!op->journal_eligible || drain || !healthy) {
       // Unsupported mutations cannot overtake buffered data.
       if (!s.journal.empty()) {
         s.journal.seal();
         break;
       }
-      s.pending.pop_front();
+      s.pending.pop();
       start_transaction(std::move(op));
       continue;
     }
@@ -1143,15 +1157,24 @@ void ECBackend::pump_journal()
     int r = s.journal.append(op->hoid, op->version, op->journal_object_size,
                             extent.get_off(), write.buffer, append, &ticket);
     if (r == -EAGAIN) {
-      ++s.pressure_events;
+      if (!std::exchange(op->pressure_counted, true)) {
+        ++s.pressure_events;
+      }
       s.journal.seal();
       break; // requests stay unacknowledged under the OSD's admission limits
+    }
+    if (r == -E2BIG) {
+      // A long object name can exceed a tiny configured segment. append has
+      // changed no state: drain older records and use the ordinary write path.
+      op->journal_eligible = false;
+      continue;
     }
     ceph_assert(r == 0);
     if (s.open_segment != ticket.segment) {
       s.open_segment = ticket.segment;
       s.open_since = ceph::mono_clock::now();
       s.coverage.clear();
+      switcher->add_temp_obj(s.journal.segment_object(ticket.segment).hobj);
     }
     const uint64_t width = sinfo.get_k() * sinfo.get_chunk_size();
     const uint64_t start = extent.get_off() / width * width;
@@ -1167,13 +1190,19 @@ void ECBackend::pump_journal()
     op->on_all_commit = make_lambda_context(
       [this, ticket, completion = std::move(completion)](int result) mutable {
         ceph_assert(result == 0);
-        ceph_assert(journal_state->journal.committed(ticket, result) == 0);
+        const bool was_ready = journal_state->journal.flush_ready();
+        const int committed = journal_state->journal.committed(ticket, result);
+        ceph_assert(committed == 0);
         ++journal_state->acked;
-        completion.release()->complete(result);
-        schedule_journal();
+        if (completion) {
+          completion.release()->complete(result);
+        }
+        if (!was_ready && journal_state->journal.flush_ready()) {
+          schedule_journal();
+        }
       });
     ++s.admitted;
-    s.pending.pop_front();
+    s.pending.pop();
     start_transaction(std::move(op));
   }
 
@@ -1185,13 +1214,16 @@ void ECBackend::pump_journal()
     if (s.next_stripe == s.flush->stripes.size()) {
       ObjectStore::Transaction trim;
       const auto segment = s.flush->segment;
-      ceph_assert(s.journal.finish_flush(segment, 0, trim) == 0);
+      const int finished = s.journal.finish_flush(segment, 0, trim);
+      ceph_assert(finished == 0);
       s.trimming = true;
       trim.register_on_commit(get_parent()->bless_context(make_lambda_context(
         [this, segment](int r) {
           ceph_assert(r == 0);
           auto& s = *journal_state;
-          ceph_assert(s.journal.trimmed(segment, r) == 0);
+          const int trimmed = s.journal.trimmed(segment, r);
+          ceph_assert(trimmed == 0);
+          switcher->clear_temp_obj(s.journal.segment_object(segment).hobj);
           s.trimming = false;
           s.flush.reset();
           if (s.journal.empty()) {
@@ -1238,17 +1270,44 @@ void ECBackend::pump_journal()
   s.pumping = false;
   const auto remaining = s.open_since + std::chrono::milliseconds(s.flush_ms) -
                          ceph::mono_clock::now();
-  if (!s.journal.empty() && remaining > decltype(remaining)::zero()) {
+  if (s.journal.has_open_segment() && remaining > decltype(remaining)::zero()) {
     // No periodic polling while waiting for append/flush/trim commits: each
     // completion schedules progress. This timer only expires the open segment.
     schedule_journal(std::chrono::ceil<std::chrono::milliseconds>(remaining));
+  }
+  s.shutdown_drain.maybe_finish(s.journal.empty(), s.pending.empty());
+}
+
+void ECBackend::call_write_ordered(std::function<void()> &&cb)
+{
+  if (!journal_state) {
+    rmw_pipeline.call_write_ordered(std::move(cb));
+    return;
+  }
+  auto& s = *journal_state;
+  // Version/error log callbacks share admission order with deferred writes.
+  s.pending.ordered(std::move(cb));
+  if (!s.pumping) {
+    pump_journal();
+  }
+}
+
+void ECBackend::drain_journal_for_shutdown(std::function<void(int)> on_finish)
+{
+  if (!journal_state) {
+    on_finish(0);
+    return;
+  }
+  journal_state->shutdown_drain.request(std::move(on_finish));
+  if (!journal_state->pumping) {
+    pump_journal();
   }
 }
 
 void ECBackend::start_transaction(std::shared_ptr<ECClassicalOp> op)
 {
   op->plan = get_write_plan(sinfo, *op->t, read_pipeline, rmw_pipeline,
-                           get_parent()->get_dpp());
+    get_parent()->get_dpp(), journal_state ? &op->submitted_oi : nullptr);
   ldpp_dout(get_parent()->get_dpp(), 20) << __func__
     << " plans=" << op->plan << dendl;
   rmw_pipeline.start_rmw(std::move(op));
@@ -1312,41 +1371,29 @@ void ECBackend::submit_transaction(
   if (client_op) {
     op->trace = client_op->pg_trace;
   }
-  init_journal();
   if (!journal_state) {
     start_transaction(std::move(op));
     return;
   }
-  // One ordinary overwrite with only the normal OI attribute update. Capture
-  // its size now, not from the potentially newer OBC when it eventually drains.
+  // Capture projected metadata at submission, not from a later client's OBC
+  // when the admission queue drains. The original size is read at pipeline
+  // admission from the cache/attr_cache, advanced only by earlier operations.
+  op->submitted_oi = ECTransaction::snapshot_object_info(*op->t);
   if (hoid.snap == CEPH_NOSNAP && op->t->op_map.size() == 1 &&
       op->t->op_map.contains(hoid) && op->log_entries.size() == 1 &&
       op->log_entries.front().soid == hoid && op->t->obc_map.contains(hoid)) {
     const auto& update = op->t->op_map.at(hoid);
     auto old_oi = get_object_info_from_obc(op->t->obc_map.at(hoid));
-    if (update.is_none() && !update.truncate && !update.updated_snaps &&
-        !update.alloc_hint && !update.clear_omap && !update.omap_header &&
-        update.omap_updates.empty() && update.attr_updates.size() == 1 &&
-        update.attr_updates.contains(OI_ATTR) && update.attr_updates.at(OI_ATTR) &&
-        old_oi && !update.buffer_updates.empty()) {
-      const object_info_t oi(*update.attr_updates.at(OI_ATTR));
-      auto i = update.buffer_updates.begin();
-      const auto* w = boost::get<PGTransaction::ObjectOperation::BufferUpdate::Write>(
-        &i.get_val());
-      const uint64_t off = i.get_off();
-      const uint64_t len = i.get_len();
-      const uint64_t width = sinfo.get_k() * sinfo.get_chunk_size();
-      if (++i == update.buffer_updates.end() && w &&
-          (len == 1024 || len == 4096) && off % 1024 == 0 &&
-          oi.size == old_oi->size && off <= oi.size && len <= oi.size - off &&
-          len <= width - off % width) {
-        op->journal_eligible = true;
-        op->journal_object_size = oi.size;
-      }
+    if (old_oi && ECWriteJournal::eligible_overwrite(hoid, update, old_oi->size,
+        sinfo.get_k() * sinfo.get_chunk_size())) {
+      op->journal_eligible = true;
+      op->journal_object_size = old_oi->size;
     }
   }
-  journal_state->pending.push_back(std::move(op));
-  pump_journal();
+  journal_state->pending.push(std::move(op));
+  if (!journal_state->pumping) {
+    pump_journal();
+  }
 }
 
 int ECBackend::objects_read_sync(

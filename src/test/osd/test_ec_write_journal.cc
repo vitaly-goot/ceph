@@ -124,6 +124,33 @@ TEST_P(JournalTest, ExactPayloadInAppendOnlyObjectStoreRecords)
   EXPECT_TRUE(j.begin_flush());
 }
 
+TEST_P(JournalTest, WakeOnlyWhenOldestSealedSegmentBecomesDurable)
+{
+  auto j = journal();
+  auto first = append(j, 0, 1024, 'a', object(), false);
+  auto second = append(j, 1024, 1024, 'b', object(), false);
+  EXPECT_TRUE(j.has_open_segment());
+  EXPECT_FALSE(j.flush_ready());
+  j.seal();
+  EXPECT_FALSE(j.has_open_segment());
+  auto next = append(j, 2048, 1024, 'c', object(), false);
+  EXPECT_TRUE(j.has_open_segment());
+  EXPECT_EQ(0, j.committed(next, 0));
+  EXPECT_FALSE(j.flush_ready());
+  EXPECT_EQ(0, j.committed(second, 0));
+  EXPECT_FALSE(j.flush_ready());
+  EXPECT_EQ(0, j.committed(first, 0));
+  EXPECT_TRUE(j.flush_ready());
+  auto flush = j.begin_flush();
+  ASSERT_TRUE(flush);
+  EXPECT_FALSE(j.flush_ready());
+  j.seal();
+  EXPECT_FALSE(j.has_open_segment());
+  EXPECT_FALSE(j.flush_ready()); // newer durable segment cannot overtake flush
+  drain(j, *flush);
+  EXPECT_TRUE(j.flush_ready());
+}
+
 TEST_P(JournalTest, RandomOrderDistinctWritesCompleteStripeWithoutBaseReads)
 {
   for (unsigned size : {1024u, 4096u}) {
@@ -471,7 +498,8 @@ TEST_P(JournalTest, FullyCoveredTailNeedsNoBaseRead)
   EXPECT_EQ(expected, stripe.assemble().to_str());
 }
 
-INSTANTIATE_TEST_SUITE_P(EC8plus3And12plus3, JournalTest, testing::Values(8, 12));
+INSTANTIATE_TEST_SUITE_P(EC4plus3And8plus3And12plus3, JournalTest,
+                        testing::Values(4, 8, 12));
 
 TEST(ECWriteJournal, RejectInvalidGeometryAndLimits)
 {

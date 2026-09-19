@@ -841,7 +841,8 @@ struct ECCommon {
     PGTransaction &t,
     ECCommon::ReadPipeline &read_pipeline,
     ECCommon::RMWPipeline &rmw_pipeline,
-    DoutPrefixProvider *dpp);
+    DoutPrefixProvider *dpp,
+    const std::map<hobject_t, object_info_t>* submitted_oi = nullptr);
 };
 
 struct RecoveryMessages {

@@ -4577,6 +4577,34 @@ PerfCounters* OSD::create_recoverystate_perf()
 
 int OSD::shutdown()
 {
+  if (cct->_conf.get_val<bool>("osd_ec_journal_poc_enable")) {
+    // Journal data needs the live cluster, not merely a local store flush.
+    // This MUST precede prepare_to_stop(), STATE_STOPPING and fast-shutdown
+    // _exit. Waiting in PG::on_shutdown would deadlock after workers stop.
+    cct->_conf.set_val("osd_ec_journal_poc_drain", "true");
+    cct->_conf.apply_changes(nullptr);
+    vector<PGRef> pgs;
+    _get_pgs(&pgs);
+    vector<std::shared_ptr<C_SaferCond>> drains;
+    for (auto& pg : pgs) {
+      auto done = std::make_shared<C_SaferCond>();
+      drains.push_back(done);
+      pg->lock();
+      pg->drain_ec_journal_for_shutdown([done](int r) { done->complete(r); });
+      pg->unlock();
+    }
+    const auto deadline = ceph::mono_clock::now() + std::chrono::seconds(30);
+    for (auto& done : drains) {
+      const ceph::timespan left{std::max(ceph::signedspan::zero(),
+        deadline - ceph::mono_clock::now()).count()};
+      if (done->wait_for(left) != 0) {
+        derr << "EC journal POC: refusing shutdown; drain did not finish. "
+             << "Keep peers running, stop clients and drain before retrying. "
+             << "Forced termination has NO replay guarantee." << dendl;
+        return -EBUSY;
+      }
+    }
+  }
   // vstart overwrites osd_fast_shutdown value in the conf file -> force the value here!
   //cct->_conf->osd_fast_shutdown = true;
 

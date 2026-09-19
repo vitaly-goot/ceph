@@ -422,6 +422,9 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
     * won't be called after on_change()
     */
    virtual void on_change() = 0;
+   virtual void drain_ec_journal_for_shutdown(std::function<void(int)> done) {
+     done(0);
+   }
    virtual void clear_recovery_state() = 0;
 
    virtual IsPGRecoverablePredicate *get_is_recoverable_predicate() const = 0;

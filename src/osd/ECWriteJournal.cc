@@ -70,12 +70,16 @@ ceph::bufferlist Stripe::assemble(const ceph::bufferlist* base) const
   return out;
 }
 
+bool Limits::valid() const
+{
+  return stripe_width && stripe_width % 4096 == 0 &&
+    segment_bytes && segment_bytes <= max_bytes && max_records && max_segments;
+}
+
 Journal::Journal(coll_t collection, ghobject_t prefix, Limits limits)
   : collection(std::move(collection)), prefix(std::move(prefix)), limits(limits)
 {
-  if (!limits.stripe_width || limits.stripe_width % 4096 ||
-      !limits.segment_bytes || limits.segment_bytes > limits.max_bytes ||
-      !limits.max_records || !limits.max_segments) {
+  if (!limits.valid()) {
     throw std::invalid_argument("invalid EC journal geometry or capacity");
   }
 }
@@ -170,14 +174,10 @@ void Journal::seal()
 
 std::optional<Flush> Journal::begin_flush()
 {
-  if (failed || segments.empty()) {
+  if (!flush_ready()) {
     return std::nullopt;
   }
   auto& segment = segments.front();
-  if (segment.state != State::sealed ||
-      segment.durable_records != segment.entries.size()) {
-    return std::nullopt;
-  }
   Flush flush;
   flush.segment = segment.id;
   flush.records = segment.entries.size();
@@ -209,6 +209,18 @@ std::optional<Flush> Journal::begin_flush()
   }
   segment.state = State::flushing;
   return flush;
+}
+
+bool Journal::has_open_segment() const
+{
+  return !segments.empty() && segments.back().state == State::open;
+}
+
+bool Journal::flush_ready() const
+{
+  return !failed && !segments.empty() &&
+    segments.front().state == State::sealed &&
+    segments.front().durable_records == segments.front().entries.size();
 }
 
 int Journal::finish_flush(uint64_t id, int result, ceph::os::Transaction& t)

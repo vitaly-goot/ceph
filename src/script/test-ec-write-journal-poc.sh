@@ -52,10 +52,18 @@ fi
 # Compile the actual classic backend without requiring all libosd link inputs.
 # Use only with headers/dependencies from this same Ceph base revision.
 if [[ ${EC_JOURNAL_BACKEND_CHECK:-0} == 1 ]]; then
+  # The reused RGW-only build may not have generated OSD tracepoint headers.
+  # Generate them in our own ignored output directory, never in the old build.
+  mkdir -p "$build/include/tracing"
+  for trace in osd pg; do
+    lttng-gen-tp "$root/src/tracing/$trace.tp" \
+      -o "$build/include/tracing/$trace.h"
+  done
   "$cxx" "${flags[@]}" -fsyntax-only -Werror -Wno-deprecated-declarations \
     -DCEPH_DEBUG_MUTEX -DBOOST_ALLOW_DEPRECATED_HEADERS \
     -DBOOST_MPL_CFG_NO_PREPROCESSED_HEADERS -DBOOST_MPL_LIMIT_LIST_SIZE=30 \
     -DBOOST_ASIO_NO_TS_EXECUTORS \
+    -I"$build/include" \
     -I"$root/src" -I"$root/src/include" \
     -I"$CEPH_DEPS_BUILD/src/include" -I"$CEPH_DEPS_BUILD/include" \
     -I"$CEPH_DEPS_BUILD/src" -I"$CEPH_DEPS_SOURCE/src" \
@@ -68,7 +76,8 @@ if [[ ${EC_JOURNAL_BACKEND_CHECK:-0} == 1 ]]; then
     -I"$CEPH_DEPS_SOURCE/src/jaegertracing/opentelemetry-cpp/exporters/jaeger/include" \
     -I"$CEPH_DEPS_SOURCE/src/jaegertracing/opentelemetry-cpp/ext/include" \
     -I"$CEPH_DEPS_SOURCE/src/jaegertracing/opentelemetry-cpp/sdk/include" \
-    "$root/src/osd/ECBackend.cc" "$root/src/osd/ECJournalFlush.cc"
+    "$root/src/osd/ECBackend.cc" "$root/src/osd/ECJournalFlush.cc" \
+    "$root/src/osd/ECCommon.cc" "$root/src/osd/OSD.cc"
 fi
 
 # Build gtest from source rather than reusing archives built by another GCC:

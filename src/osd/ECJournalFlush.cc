@@ -4,6 +4,39 @@
 
 namespace ECWriteJournal {
 
+bool eligible_overwrite(const hobject_t& object,
+  const PGTransaction::ObjectOperation& update, uint64_t old_size,
+  uint64_t stripe_width)
+{
+  // finish_ctx always sets both attrs on head writes. Other attrs and real
+  // snapshot state remain outside this experiment.
+  if (object.snap != CEPH_NOSNAP || !update.is_none() || update.truncate ||
+      update.updated_snaps || update.alloc_hint || update.clear_omap ||
+      update.omap_header || !update.omap_updates.empty() ||
+      update.attr_updates.size() != 2 ||
+      !update.attr_updates.contains(OI_ATTR) || !update.attr_updates.at(OI_ATTR) ||
+      !update.attr_updates.contains(SS_ATTR) || !update.attr_updates.at(SS_ATTR) ||
+      update.buffer_updates.empty() || !stripe_width) {
+    return false;
+  }
+  const object_info_t oi(*update.attr_updates.at(OI_ATTR));
+  SnapSet ss;
+  auto p = update.attr_updates.at(SS_ATTR)->cbegin();
+  decode(ss, p);
+  if (ss.seq != 0 || !ss.clones.empty()) {
+    return false;
+  }
+  auto i = update.buffer_updates.begin();
+  const auto* write = boost::get<PGTransaction::ObjectOperation::BufferUpdate::Write>(
+    &i.get_val());
+  const auto off = i.get_off();
+  const auto len = i.get_len();
+  return ++i == update.buffer_updates.end() && write &&
+    (len == 1024 || len == 4096) && write->buffer.length() == len &&
+    off % 1024 == 0 && oi.size == old_size && off <= old_size &&
+    len <= old_size - off && len <= stripe_width - off % stripe_width;
+}
+
 ECTransaction::WritePlanObj plan_flush(
   const Stripe& stripe, const ECUtil::stripe_info_t& sinfo,
   const shard_id_set& shards)

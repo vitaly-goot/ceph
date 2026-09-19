@@ -6,10 +6,13 @@ options:
   type: bool
   level: dev
   desc: Enable unsafe write-only primary-local EC journal experiment
-  long_desc: Only disposable 8+3 or 12+3 optimized pools with 4 KiB chunks. No
+  long_desc: Only disposable 4+3, 8+3 or 12+3 optimized pools with 4 KiB chunks. No
     client reads while dirty, replay, recovery, scrub, snapshots or failover.
     A PG reset with dirty records deliberately aborts rather than losing data
     silently. Requires osd_ec_journal_poc_pool and a fresh experimental pool.
+    Graceful shutdown attempts a local drain before teardown and refuses to
+    stop if it cannot finish within 30 seconds. Drain all participating OSDs
+    before stopping peers. Restart discards temp journal objects, without replay.
   default: false
   flags:
   - startup
