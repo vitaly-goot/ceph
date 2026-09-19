@@ -192,6 +192,7 @@ std::optional<Flush> Journal::begin_flush()
     auto& stripe = i->second;
     if (inserted) {
       stripe.object = record.object;
+      stripe.object_size = record.object_size;
       stripe.offset = start;
       stripe.width = limits.stripe_width;
       stripe.valid_bytes = std::min(limits.stripe_width, record.object_size - start);

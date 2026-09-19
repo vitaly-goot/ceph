@@ -2,6 +2,66 @@
 ---
 
 options:
+- name: osd_ec_journal_poc_enable
+  type: bool
+  level: dev
+  desc: Enable unsafe write-only primary-local EC journal experiment
+  long_desc: Only disposable 8+3 or 12+3 optimized pools with 4 KiB chunks. No
+    client reads while dirty, replay, recovery, scrub, snapshots or failover.
+    A PG reset with dirty records deliberately aborts rather than losing data
+    silently. Requires osd_ec_journal_poc_pool and a fresh experimental pool.
+  default: false
+  flags:
+  - startup
+- name: osd_ec_journal_poc_pool
+  type: int
+  level: dev
+  desc: Pool ID enrolled in the EC journal experiment (-1 disables enrollment)
+  default: -1
+  flags:
+  - startup
+- name: osd_ec_journal_poc_segment_bytes
+  type: size
+  level: dev
+  desc: Maximum encoded bytes in a per-PG journal segment
+  default: 4_M
+  min: 8_K
+  flags:
+  - startup
+- name: osd_ec_journal_poc_max_bytes
+  type: size
+  level: dev
+  desc: Maximum encoded journal bytes per PG including in-flight flushes
+  default: 16_M
+  min: 8_K
+  flags:
+  - startup
+- name: osd_ec_journal_poc_max_records
+  type: uint
+  level: dev
+  desc: Maximum retained journal records per PG
+  default: 8192
+  min: 1
+  flags:
+  - startup
+- name: osd_ec_journal_poc_flush_ms
+  type: uint
+  level: dev
+  desc: Maximum open-segment coalescing delay in milliseconds
+  default: 100
+  min: 1
+  flags:
+  - startup
+- name: osd_ec_journal_poc_drain
+  type: bool
+  level: dev
+  desc: Drain the experimental journal and stop enrolling new writes
+  long_desc: Set on all OSDs hosting experimental primaries and stop clients.
+    Poll ec_write_journal_poc in the PG query recovery_state until bytes,
+    pending_admissions and flush_in_progress are zero before verifying reads.
+  default: false
+  flags:
+  - runtime
 - name: osd_numa_prefer_iface
   type: bool
   level: advanced

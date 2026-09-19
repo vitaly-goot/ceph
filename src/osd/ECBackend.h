@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/set.hpp>
 
@@ -40,9 +41,11 @@ struct ECSubReadReply;
 class ECSwitch;
 
 class ECSwitch;
+struct ECClassicalOp;
 
 class ECBackend : public ECCommon {
  public:
+  ~ECBackend();
   PGBackend::RecoveryHandle *open_recovery_op();
 
   void run_recovery_op(
@@ -188,6 +191,14 @@ class ECBackend : public ECCommon {
   friend struct ECRecoveryHandle;
 
   void kick_reads();
+  struct JournalState;
+  std::unique_ptr<JournalState> journal_state;
+  void init_journal();
+  void pump_journal();
+  void schedule_journal(std::chrono::milliseconds delay = std::chrono::milliseconds(0));
+  void reset_journal();
+  void dump_journal(ceph::Formatter* f) const;
+  void start_transaction(std::shared_ptr<ECClassicalOp> op);
 
 public:
   struct ECRecoveryBackend : RecoveryBackend {

@@ -51,6 +51,7 @@ set(osd_srcs
   ECTransaction.cc
   ECUtil.cc
   ECWriteJournal.cc
+  ECJournalFlush.cc
   ECInject.cc
   ECInject.h
   ${CMAKE_SOURCE_DIR}/src/common/TrackedOp.cc

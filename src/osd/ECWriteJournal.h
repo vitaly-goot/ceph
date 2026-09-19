@@ -33,6 +33,7 @@ WRITE_CLASS_ENCODER(Record)
 
 struct Stripe {
   hobject_t object;
+  uint64_t object_size = 0;
   uint64_t offset = 0;
   uint64_t width = 0;
   uint64_t valid_bytes = 0; // logical bytes before EOF, at most width

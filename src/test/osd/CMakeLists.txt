@@ -171,6 +171,10 @@ add_executable(unittest_ec_write_journal
 add_ceph_unittest(unittest_ec_write_journal)
 target_link_libraries(unittest_ec_write_journal global)
 
+add_executable(unittest_ec_journal_flush test_ec_journal_flush.cc)
+add_ceph_unittest(unittest_ec_journal_flush)
+target_link_libraries(unittest_ec_journal_flush osd global)
+
 # unittest_mclock_scheduler
 # unittest_mclock_scheduler
 add_executable(unittest_mclock_scheduler

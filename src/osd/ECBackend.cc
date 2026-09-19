@@ -27,6 +27,7 @@
 #include "ECMsgTypes.h"
 #include "ECTypes.h"
 #include "ECSwitch.h"
+#include "ECJournalFlush.h"
 
 #include "PrimaryLogPG.h"
 
@@ -65,6 +66,44 @@ static ostream& _prefix(std::ostream *_dout, ECBackend::ECRecoveryBackend *pgb) 
 
 struct ECBackend::ECRecoveryBackend::ECRecoveryHandle : public PGBackend::RecoveryHandle {
   list<ECCommon::RecoveryBackend::RecoveryOp> ops;
+};
+
+struct ECBackend::JournalState {
+  ECBackend* backend;
+  ECWriteJournal::Journal journal;
+  std::deque<std::shared_ptr<ECClassicalOp>> pending;
+  std::optional<ECWriteJournal::Flush> flush;
+  size_t next_stripe = 0;
+  bool flush_in_progress = false;
+  bool trimming = false;
+  bool pumping = false;
+  uint64_t open_segment = 0;
+  std::map<std::pair<hobject_t, uint64_t>, interval_set<uint64_t>> coverage;
+  ceph::mono_clock::time_point open_since = ceph::mono_clock::now();
+  ceph::mono_clock::time_point wake_at{};
+  uint64_t flush_ms;
+  uint64_t admitted = 0;
+  uint64_t acked = 0;
+  uint64_t full_stripes = 0;
+  uint64_t partial_stripes = 0;
+  uint64_t planned_read_bytes = 0;
+  uint64_t flushed_bytes = 0;
+  uint64_t pressure_events = 0;
+
+  struct Timer final : common::intrusive_timer::callback_t {
+    JournalState* state;
+    explicit Timer(JournalState* state) : state(state) {}
+    void lock() override { state->backend->parent->pg_lock(); }
+    void unlock() override { state->backend->parent->pg_unlock(); }
+    void add_ref() override { state->backend->parent->pg_add_ref(); }
+    void dec_ref() override { state->backend->parent->pg_dec_ref(); }
+    void invoke() override { state->backend->pump_journal(); }
+  } timer{this};
+
+  JournalState(ECBackend* backend, ghobject_t prefix,
+               ECWriteJournal::Limits limits, uint64_t flush_ms)
+    : backend(backend), journal(backend->switcher->coll, std::move(prefix), limits),
+      flush_ms(flush_ms) {}
 };
 
 ECBackend::ECBackend(
@@ -853,6 +892,7 @@ void ECBackend::check_recovery_sources(const OSDMapRef &osdmap) {
 }
 
 void ECBackend::on_change() {
+  reset_journal();
   rmw_pipeline.on_change();
   read_pipeline.on_change();
   rmw_pipeline.on_change2();
@@ -864,6 +904,7 @@ void ECBackend::clear_recovery_state() {
 }
 
 void ECBackend::dump_recovery_info(Formatter *f) const {
+  dump_journal(f);
   f->open_array_section("recovery_ops");
   for (map<hobject_t, RecoveryBackend::RecoveryOp>::const_iterator i =
          recovery_backend.recovery_ops.begin();
@@ -888,6 +929,10 @@ void ECBackend::dump_recovery_info(Formatter *f) const {
 
 struct ECClassicalOp : ECCommon::RMWPipeline::Op {
   PGTransactionUPtr t;
+  bool journal_eligible = false;
+  uint64_t journal_object_size = 0;
+  std::optional<ObjectStore::Transaction> journal_append;
+  shard_id_t journal_shard;
 
   void generate_transactions(
     ceph::ErasureCodeInterfaceRef &ec_impl,
@@ -899,6 +944,9 @@ struct ECClassicalOp : ECCommon::RMWPipeline::Op {
     const OSDMapRef &osdmap,
     bool& first_write_in_interval) final {
     ceph_assert(t);
+    // Keep OI current on all shards: journal writes have no data write set from
+    // which the usual partial-write path could infer shard versions.
+    bool write_all = journal_append ? true : first_write_in_interval;
     ECTransaction::generate_transactions(
       t.get(),
       plan,
@@ -913,7 +961,14 @@ struct ECClassicalOp : ECCommon::RMWPipeline::Op {
       &temp_cleared,
       dpp,
       osdmap,
-      first_write_in_interval);
+      write_all);
+    first_write_in_interval = write_all;
+    if (journal_append) {
+      // Only the primary stores the payload; the normal commit gather waits
+      // for this transaction and the remote metadata/log transactions.
+      transactions->at(journal_shard).append(*journal_append);
+      journal_append.reset();
+    }
   }
 
   bool skip_transaction(
@@ -927,6 +982,277 @@ struct ECClassicalOp : ECCommon::RMWPipeline::Op {
     return false;
   }
 };
+
+// No PG log entries or metadata updates: these writes materialize data already
+// acknowledged from the journal. Cache ordering and shard commit gathering are
+// still provided by the normal RMW pipeline.
+struct ECJournalFlushOp final : ECCommon::RMWPipeline::Op {
+  ECWriteJournal::Stripe stripe;
+
+  void generate_transactions(
+      ErasureCodeInterfaceRef& ec_impl, pg_t pgid,
+      const ECUtil::stripe_info_t& sinfo,
+      map<hobject_t, ECUtil::shard_extent_map_t>* written,
+      shard_id_map<ObjectStore::Transaction>* transactions,
+      DoutPrefixProvider* dpp, const OSDMapRef&,
+      bool&) final {
+    ECUtil::shard_extent_map_t empty(&sinfo);
+    auto read = remote_shard_extent_map.find(hoid);
+    auto data = ECWriteJournal::assemble_flush(stripe, sinfo,
+      read == remote_shard_extent_map.end() ? empty : read->second);
+    data.insert_parity_buffers();
+    ceph_assert(data.encode(ec_impl, dpp) == 0);
+    const uint64_t chunk_off = stripe.offset / sinfo.get_k();
+    for (auto& [shard, txn] : *transactions) {
+      bufferlist chunk;
+      data.get_buffer(shard, chunk_off, sinfo.get_chunk_size(), chunk);
+      ceph_assert(chunk.length() == sinfo.get_chunk_size());
+      txn.write(coll_t(spg_t(pgid, shard)),
+        ghobject_t(hoid, ghobject_t::NO_GEN, shard), chunk_off,
+        chunk.length(), chunk);
+    }
+    written->emplace(hoid, std::move(data));
+  }
+
+  bool skip_transaction(std::set<shard_id_t>&,
+                        shard_id_t, ObjectStore::Transaction& t) final {
+    return t.empty();
+  }
+};
+
+ECBackend::~ECBackend() = default;
+
+void ECBackend::init_journal()
+{
+  if (journal_state ||
+      !cct->_conf.get_val<bool>("osd_ec_journal_poc_enable") ||
+      cct->_conf.get_val<int64_t>("osd_ec_journal_poc_pool") !=
+        get_parent()->get_info().pgid.pgid.pool()) {
+    return;
+  }
+  ceph_assert((sinfo.get_k() == 8 || sinfo.get_k() == 12) &&
+              sinfo.get_m() == 3 && sinfo.get_chunk_size() == 4096);
+  ECWriteJournal::Limits limits;
+  limits.stripe_width = sinfo.get_k() * sinfo.get_chunk_size();
+  limits.segment_bytes = cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_segment_bytes");
+  limits.max_bytes = cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_max_bytes");
+  limits.max_records = cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_max_records");
+  limits.max_segments = std::max(uint64_t(1), limits.max_bytes / limits.segment_bytes);
+  const auto pgid = get_parent()->get_info().pgid.pgid;
+  // Temp-pool objects cannot collide with client names. Do not register these
+  // in temp_contents (peering deletes those objects). There is no replay yet.
+  const hobject_t anchor(object_t("ec-write-journal"), "", CEPH_NOSNAP,
+                         pgid.ps(), pgid.pool(), "");
+  auto name = std::string("ec-write-journal.") +
+    std::to_string(ceph::real_clock::now().time_since_epoch().count()) + "." +
+    std::to_string(get_parent()->get_tid());
+  ghobject_t prefix(anchor.make_temp_hobject(name), ghobject_t::NO_GEN,
+                     get_parent()->whoami_shard().shard);
+  journal_state = std::make_unique<JournalState>(this, std::move(prefix), limits,
+    cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_flush_ms"));
+  dout(0) << "UNSAFE write-only EC journal POC enabled for " << pgid
+          << "; primary-local data, no replay/recovery or dirty reads" << dendl;
+}
+
+void ECBackend::schedule_journal(std::chrono::milliseconds delay)
+{
+  auto& state = *journal_state;
+  const auto when = ceph::mono_clock::now() + delay;
+  if (state.timer.is_scheduled()) {
+    if (state.wake_at <= when) {
+      return;
+    }
+    get_parent()->get_pg_timer().cancel(state.timer);
+  }
+  // Timer invocation acquires the PG lock, so even zero delay cannot reenter
+  // RMWPipeline::finish_rmw recursively. Commit callbacks preempt the timeout.
+  state.wake_at = when;
+  get_parent()->get_pg_timer().schedule_after(state.timer, delay);
+}
+
+void ECBackend::reset_journal()
+{
+  if (!journal_state) {
+    return;
+  }
+  if (journal_state->timer.is_scheduled()) {
+    get_parent()->get_pg_timer().cancel(journal_state->timer);
+  }
+  ceph_assertf(journal_state->journal.empty(),
+    "EC journal POC: PG reset with dirty records; replay is NOT implemented");
+  journal_state->pending.clear();
+  // Do not destroy the timer here: its thread may be releasing a reference
+  // after cancellation. Its lifetime is the backend's lifetime.
+}
+
+void ECBackend::dump_journal(Formatter* f) const
+{
+  if (!journal_state) {
+    return;
+  }
+  const auto& s = *journal_state;
+  f->open_object_section("ec_write_journal_poc");
+  f->dump_unsigned("bytes", s.journal.bytes());
+  f->dump_unsigned("records", s.journal.records());
+  f->dump_unsigned("pending_admissions", s.pending.size());
+  f->dump_bool("flush_in_progress", bool(s.flush));
+  f->dump_unsigned("admitted", s.admitted);
+  f->dump_unsigned("acked", s.acked);
+  f->dump_unsigned("full_stripes", s.full_stripes);
+  f->dump_unsigned("partial_stripes", s.partial_stripes);
+  f->dump_unsigned("planned_flush_read_bytes", s.planned_read_bytes);
+  f->dump_unsigned("flushed_logical_bytes", s.flushed_bytes);
+  f->dump_unsigned("pressure_events", s.pressure_events);
+  f->close_section();
+}
+
+void ECBackend::pump_journal()
+{
+  auto& s = *journal_state;
+  ceph_assert(!s.pumping);
+  s.pumping = true;
+  const bool healthy = !get_parent()->pg_is_undersized() &&
+    get_parent()->get_acting_shards().size() == sinfo.get_k_plus_m() &&
+    get_parent()->get_backfill_shards().empty();
+  ceph_assertf(healthy || s.journal.empty(),
+    "EC journal POC requires a fixed healthy acting set while dirty");
+  const bool drain = cct->_conf.get_val<bool>("osd_ec_journal_poc_drain");
+  if (drain || ceph::mono_clock::now() - s.open_since >=
+                 std::chrono::milliseconds(s.flush_ms)) {
+    s.journal.seal();
+  }
+
+  while (!s.pending.empty()) {
+    auto op = s.pending.front();
+    if (!op->journal_eligible || drain || !healthy) {
+      // Unsupported mutations cannot overtake buffered data.
+      if (!s.journal.empty()) {
+        s.journal.seal();
+        break;
+      }
+      s.pending.pop_front();
+      start_transaction(std::move(op));
+      continue;
+    }
+    auto& update = op->t->op_map.at(op->hoid);
+    const auto extent = update.buffer_updates.begin();
+    const auto& write = boost::get<PGTransaction::ObjectOperation::BufferUpdate::Write>(
+      extent.get_val());
+    ObjectStore::Transaction append;
+    ECWriteJournal::Ticket ticket;
+    int r = s.journal.append(op->hoid, op->version, op->journal_object_size,
+                            extent.get_off(), write.buffer, append, &ticket);
+    if (r == -EAGAIN) {
+      ++s.pressure_events;
+      s.journal.seal();
+      break; // requests stay unacknowledged under the OSD's admission limits
+    }
+    ceph_assert(r == 0);
+    if (s.open_segment != ticket.segment) {
+      s.open_segment = ticket.segment;
+      s.open_since = ceph::mono_clock::now();
+      s.coverage.clear();
+    }
+    const uint64_t width = sinfo.get_k() * sinfo.get_chunk_size();
+    const uint64_t start = extent.get_off() / width * width;
+    auto& coverage = s.coverage[{op->hoid, start}];
+    coverage.union_insert(extent.get_off() - start, write.buffer.length());
+    if (coverage.size() == std::min(width, op->journal_object_size - start)) {
+      s.journal.seal();
+    }
+    update.buffer_updates.clear(); // BEFORE get_write_plan(), hence no RMW
+    op->journal_append.emplace(std::move(append));
+    op->journal_shard = get_parent()->whoami_shard().shard;
+    auto completion = std::unique_ptr<Context>(std::exchange(op->on_all_commit, nullptr));
+    op->on_all_commit = make_lambda_context(
+      [this, ticket, completion = std::move(completion)](int result) mutable {
+        ceph_assert(result == 0);
+        ceph_assert(journal_state->journal.committed(ticket, result) == 0);
+        ++journal_state->acked;
+        completion.release()->complete(result);
+        schedule_journal();
+      });
+    ++s.admitted;
+    s.pending.pop_front();
+    start_transaction(std::move(op));
+  }
+
+  if (!s.flush) {
+    s.flush = s.journal.begin_flush();
+    s.next_stripe = 0;
+  }
+  if (s.flush && !s.flush_in_progress && !s.trimming) {
+    if (s.next_stripe == s.flush->stripes.size()) {
+      ObjectStore::Transaction trim;
+      const auto segment = s.flush->segment;
+      ceph_assert(s.journal.finish_flush(segment, 0, trim) == 0);
+      s.trimming = true;
+      trim.register_on_commit(get_parent()->bless_context(make_lambda_context(
+        [this, segment](int r) {
+          ceph_assert(r == 0);
+          auto& s = *journal_state;
+          ceph_assert(s.journal.trimmed(segment, r) == 0);
+          s.trimming = false;
+          s.flush.reset();
+          if (s.journal.empty()) {
+            s.coverage.clear();
+          }
+          schedule_journal();
+        })));
+      get_parent()->queue_transaction(std::move(trim));
+    } else {
+      auto op = std::make_shared<ECJournalFlushOp>();
+      op->stripe = s.flush->stripes[s.next_stripe];
+      op->hoid = op->stripe.object;
+      op->tid = get_parent()->get_tid();
+      op->pipeline = &rmw_pipeline;
+      // Zero version: do not apply/log the foreground operation a second time.
+      op->version = eversion_t();
+      op->pg_committed_to = rmw_pipeline.committed_to;
+      const auto shards = read_pipeline.get_readable_writable_shard_id_sets().first;
+      auto plan = ECWriteJournal::plan_flush(op->stripe, sinfo, shards);
+      if (plan.to_read) {
+        op->plan.want_read = true;
+        for (const auto& [shard, extents] : *plan.to_read) {
+          s.planned_read_bytes += extents.size();
+        }
+      }
+      op->plan.plans.push_back(std::move(plan));
+      s.flush_in_progress = true;
+      const uint64_t width = op->stripe.width;
+      const bool full = op->stripe.full();
+      // Called by finish_rmw with the PG lock held, like C_OSD_RepopCommit.
+      // Do not bless again here (that would recursively lock the PG mutex).
+      op->on_all_commit = make_lambda_context([this, width, full](int r) {
+        ceph_assert(r == 0);
+        auto& s = *journal_state;
+        s.flush_in_progress = false;
+        ++s.next_stripe;
+        (full ? s.full_stripes : s.partial_stripes)++;
+        s.flushed_bytes += width;
+        schedule_journal();
+      });
+      rmw_pipeline.start_rmw(std::move(op));
+    }
+  }
+  s.pumping = false;
+  const auto remaining = s.open_since + std::chrono::milliseconds(s.flush_ms) -
+                         ceph::mono_clock::now();
+  if (!s.journal.empty() && remaining > decltype(remaining)::zero()) {
+    // No periodic polling while waiting for append/flush/trim commits: each
+    // completion schedules progress. This timer only expires the open segment.
+    schedule_journal(std::chrono::ceil<std::chrono::milliseconds>(remaining));
+  }
+}
+
+void ECBackend::start_transaction(std::shared_ptr<ECClassicalOp> op)
+{
+  op->plan = get_write_plan(sinfo, *op->t, read_pipeline, rmw_pipeline,
+                           get_parent()->get_dpp());
+  ldpp_dout(get_parent()->get_dpp(), 20) << __func__
+    << " plans=" << op->plan << dendl;
+  rmw_pipeline.start_rmw(std::move(op));
+}
 
 std::tuple<
   int,
@@ -986,19 +1312,41 @@ void ECBackend::submit_transaction(
   if (client_op) {
     op->trace = client_op->pg_trace;
   }
-  ECTransaction::WritePlan &plans = op->plan;
-
-  ceph_assert(op->plan.plans.empty());
-  op->plan = get_write_plan(
-    sinfo,
-    *op->t,
-    read_pipeline,
-    rmw_pipeline,
-    get_parent()->get_dpp());
-  ldpp_dout(get_parent()->get_dpp(), 20) << __func__
-             << " plans=" << plans
-             << dendl;
-  rmw_pipeline.start_rmw(std::move(op));
+  init_journal();
+  if (!journal_state) {
+    start_transaction(std::move(op));
+    return;
+  }
+  // One ordinary overwrite with only the normal OI attribute update. Capture
+  // its size now, not from the potentially newer OBC when it eventually drains.
+  if (hoid.snap == CEPH_NOSNAP && op->t->op_map.size() == 1 &&
+      op->t->op_map.contains(hoid) && op->log_entries.size() == 1 &&
+      op->log_entries.front().soid == hoid && op->t->obc_map.contains(hoid)) {
+    const auto& update = op->t->op_map.at(hoid);
+    auto old_oi = get_object_info_from_obc(op->t->obc_map.at(hoid));
+    if (update.is_none() && !update.truncate && !update.updated_snaps &&
+        !update.alloc_hint && !update.clear_omap && !update.omap_header &&
+        update.omap_updates.empty() && update.attr_updates.size() == 1 &&
+        update.attr_updates.contains(OI_ATTR) && update.attr_updates.at(OI_ATTR) &&
+        old_oi && !update.buffer_updates.empty()) {
+      const object_info_t oi(*update.attr_updates.at(OI_ATTR));
+      auto i = update.buffer_updates.begin();
+      const auto* w = boost::get<PGTransaction::ObjectOperation::BufferUpdate::Write>(
+        &i.get_val());
+      const uint64_t off = i.get_off();
+      const uint64_t len = i.get_len();
+      const uint64_t width = sinfo.get_k() * sinfo.get_chunk_size();
+      if (++i == update.buffer_updates.end() && w &&
+          (len == 1024 || len == 4096) && off % 1024 == 0 &&
+          oi.size == old_oi->size && off <= oi.size && len <= oi.size - off &&
+          len <= width - off % width) {
+        op->journal_eligible = true;
+        op->journal_object_size = oi.size;
+      }
+    }
+  }
+  journal_state->pending.push_back(std::move(op));
+  pump_journal();
 }
 
 int ECBackend::objects_read_sync(
