@@ -783,6 +783,20 @@ void ECCommon::RMWPipeline::cache_ready(Op &op) {
 
   op.trace.event("start ec write");
 
+  // While the PG is degraded or undersized every write lists all shards in
+  // its log entry, as the first write of an interval does. A partial write
+  // that skips a shard which is down or still recovering lets the next
+  // peering rebuild that shard's missing set without it: the shard needs an
+  // older version of the object than the other shards do, and
+  // MissingLoc::add_active_missing asserts (tracker #73249). The EC write
+  // journal made this common: it flushes its whole backlog, stripe by
+  // stripe, as soon as a PG turns undersized.
+  if (get_parent()->pg_is_degraded_or_undersized()) {
+    for (auto &plan : op.plan.plans) {
+      plan.write_all_shards = true;
+    }
+  }
+
   map<hobject_t, ECUtil::shard_extent_map_t> written;
   op.generate_transactions(
     ec_impl,

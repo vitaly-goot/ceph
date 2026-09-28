@@ -31,6 +31,9 @@ class WritePlanObj {
   const uint64_t projected_size;
   bool invalidates_cache;
   bool do_parity_delta_write = false;
+  // Set at submission while the PG is degraded or undersized: the log entry
+  // lists every shard as written, as for the first write of an interval.
+  bool write_all_shards = false;
 
   WritePlanObj(
       const hobject_t &hoid,
@@ -52,6 +55,7 @@ class WritePlanObj {
        << " projected_size: " << projected_size
        << " invalidates_cache: " << invalidates_cache
        << " do_pdw: " << do_parity_delta_write
+       << " write_all_shards: " << write_all_shards
        << "}";
   }
 };

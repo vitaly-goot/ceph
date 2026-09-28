@@ -86,6 +86,9 @@ struct ECListener {
     const hobject_t oid) = 0;
 
   virtual bool pg_is_repair() const = 0;
+  // Optimized EC: writes list every shard in their log entries while this
+  // holds (see RMWPipeline::cache_ready).
+  virtual bool pg_is_degraded_or_undersized() const { return false; }
 
 #ifndef WITH_CRIMSON
   virtual ObjectContextRef get_obc(
