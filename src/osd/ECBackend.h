@@ -43,6 +43,7 @@ class ECSwitch;
 
 class ECBackend : public ECCommon {
  public:
+  ~ECBackend();
   PGBackend::RecoveryHandle *open_recovery_op();
 
   void run_recovery_op(
@@ -188,6 +189,10 @@ class ECBackend : public ECCommon {
   friend struct ECRecoveryHandle;
 
   void kick_reads();
+  // Defers the RMW pipeline's roll-forward kick by
+  // osd_ec_rollforward_delay_ms (RMWPipeline::defer_rollforward).
+  struct RollforwardKick;
+  std::unique_ptr<RollforwardKick> rollforward_kick;
 
 public:
   struct ECRecoveryBackend : RecoveryBackend {

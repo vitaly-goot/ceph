@@ -2,6 +2,24 @@
 ---
 
 options:
+- name: osd_ec_rollforward_delay_ms
+  type: uint
+  level: advanced
+  desc: Delay before an idle optimized-EC PG sends its roll-forward kick
+  long_desc: Once the last write in flight has committed, the primary of an
+    optimized EC pool sends every shard that still holds rollback state an
+    empty transaction carrying pg_committed_to, so that it can discard that
+    state. Under load the pipeline is idle for a moment after about a third
+    of the writes, and each kick costs those shards a transaction with a full
+    PG info write and a message pair, and the next write's acknowledgement
+    queues behind its commit. With a nonzero delay the kick waits that long
+    and is skipped if a write started meanwhile, since every write carries
+    pg_committed_to itself. 0 sends it at once.
+  default: 20
+  min: 0
+  max: 10000
+  flags:
+  - runtime
 - name: osd_numa_prefer_iface
   type: bool
   level: advanced
