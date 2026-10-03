@@ -246,8 +246,7 @@ class Journal {
 
   // prefix names the slot objects: a PG-local internal object that no client
   // can address, the same on every shard (only its shard id differs).
-  // collection and prefix's shard are used by the single-copy append below.
-  Journal(coll_t collection, ghobject_t prefix, Limits limits);
+  Journal(ghobject_t prefix, Limits limits);
 
   // Place an append. Writes of whole 1 KiB blocks, aligned to 1 KiB, within
   // a prefilled object and one stripe are supported (librbd merges adjacent
@@ -272,11 +271,6 @@ class Journal {
   // no state change: 0, -EAGAIN (no room until something is released),
   // -E2BIG (never fits a segment), -EINVAL or a latched error.
   int check_append(const hobject_t& object, uint64_t length) const;
-  // Single copy: place and emit into collection, for prefix's shard.
-  int append(const hobject_t& object, eversion_t version,
-             uint64_t object_size, uint64_t offset,
-             const ceph::bufferlist& data, ceph::os::Transaction& t,
-             Ticket* ticket, utime_t mtime = {});
   // Write one holder's copy of a placed record into t.
   void emit(const Placement& placement, const coll_t& collection,
             shard_id_t shard, ceph::os::Transaction& t) const;
@@ -472,7 +466,6 @@ class Journal {
   // appends are all durable: its budget and its slot become free.
   void collect();
 
-  coll_t collection;
   ghobject_t prefix;
   Limits limits;
   std::deque<Segment> segments;

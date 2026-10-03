@@ -253,7 +253,7 @@ struct ECBackend::JournalState final : md_config_obs_t {
   JournalState(ECBackend* backend, ghobject_t prefix,
                ECWriteJournal::Limits limits,
                unsigned max_flushes, std::vector<shard_id_t> holders)
-    : backend(backend), journal(backend->switcher->coll, std::move(prefix), limits),
+    : backend(backend), journal(std::move(prefix), limits),
       max_flushes(max_flushes), holders(std::move(holders)) {
     drain_conf = backend->cct->_conf.get_val<bool>("osd_ec_journal_poc_drain");
     backend->cct->_conf.add_observer(this);

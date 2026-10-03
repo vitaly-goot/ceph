@@ -894,7 +894,7 @@ TEST_P(JournalFlushTest, JournalGenerationsUseProductionShardAssembly)
   auto object = stripe().object;
   ECWriteJournal::Limits limits;
   limits.stripe_width = width();
-  ECWriteJournal::Journal journal(coll_t(), ghobject_t(object), limits);
+  ECWriteJournal::Journal journal(ghobject_t(object), limits);
   pg_pool_t pool;
   pool.set_flag(pg_pool_t::FLAG_EC_OPTIMIZATIONS);
   ECUtil::stripe_info_t sinfo(GetParam(), 3, width(), &pool);
@@ -909,10 +909,10 @@ TEST_P(JournalFlushTest, JournalGenerationsUseProductionShardAssembly)
       char value = 'a' + n % 26;
       ceph::bufferlist bytes;
       bytes.append(std::string(1024, value));
-      ceph::os::Transaction txn;
+      ECWriteJournal::Placement placement;
       ECWriteJournal::Ticket ticket;
       ASSERT_EQ(0, journal.append(object, eversion_t(1, generation * 65 + n + 1),
-        width(), off, bytes, txn, &ticket));
+        width(), off, bytes, &placement, &ticket));
       ASSERT_EQ(0, journal.committed(ticket, 0));
       expected.replace(off, 1024, bytes.to_str());
     }

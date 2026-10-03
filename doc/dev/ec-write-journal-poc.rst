@@ -24,7 +24,7 @@ size-option variants, submitted object-state snapshots, log admission barriers,
 flush readiness and journal-to-production-assembler generations. Backend,
 planner and OSD-shutdown translation units are checked with ``-Werror``.
 These checks do not establish runtime correctness of the driver or shutdown.
-Current focused result: **211 tests pass with GCC 13, ASan and UBSan**,
+Current focused result: **210 tests pass with GCC 13, ASan and UBSan**,
 including detached record headers. The production
 backend, planner, generator, journal core, PrimaryLogPG and OSD translation
 units pass the focused warning-as-error compile check. These are not

@@ -39,6 +39,22 @@ ghobject_t prefix()
                    shard_id_t(0));
 }
 
+// One holder's copy of an append, as the backend writes it for each holder:
+// place the record, then emit it into t for prefix()'s shard.
+int append_copy(Journal& journal, const hobject_t& object, eversion_t version,
+                uint64_t object_size, uint64_t offset,
+                const ceph::bufferlist& data, Transaction& t, Ticket* ticket,
+                utime_t mtime = {})
+{
+  Placement placement;
+  const int r = journal.append(object, version, object_size, offset, data,
+                               &placement, ticket, mtime);
+  if (r == 0) {
+    journal.emit(placement, coll_t(), prefix().shard_id, t);
+  }
+  return r;
+}
+
 // Logical reference model of a stripe, kept out of libosd: the OSD assembles
 // through ECJournalFlush (see test_ec_journal_flush.cc). Object ranges that
 // still need base data (not rounded device reads).
@@ -88,23 +104,23 @@ class JournalTest : public testing::TestWithParam<unsigned> {
     limits.stripe_width = GetParam() * 4096;
     return limits;
   }
-  Journal journal() const { return Journal(coll_t(), prefix(), limits()); }
+  Journal journal() const { return Journal(prefix(), limits()); }
   uint64_t width() const { return limits().stripe_width; }
   // Encoded size of one 1 KiB record, to size segments in records.
   uint64_t record_bytes() const {
     auto j = journal();
     Transaction t;
     Ticket ticket;
-    EXPECT_EQ(0, j.append(object(), eversion_t(1, 1), width(), 0,
-                          bytes(1024, 'x'), t, &ticket));
+    EXPECT_EQ(0, append_copy(j, object(), eversion_t(1, 1), width(), 0,
+                             bytes(1024, 'x'), t, &ticket));
     return j.bytes();
   }
   Ticket append(Journal& journal, uint64_t off, uint64_t len, char c = 'x',
                 const hobject_t& oid = object(), bool durable = true) {
     Transaction t;
     Ticket ticket;
-    EXPECT_EQ(0, journal.append(oid, eversion_t(1, next_version++),
-                              16 * width(), off, bytes(len, c), t, &ticket));
+    EXPECT_EQ(0, append_copy(journal, oid, eversion_t(1, next_version++),
+                             16 * width(), off, bytes(len, c), t, &ticket));
     seen.insert(ticket.segment);
     if (durable) {
       // Simulated ObjectStore commit. These unit tests do NOT test fsync.
@@ -165,8 +181,9 @@ TEST_P(JournalTest, AppendVersionsFollowTheSequence)
     EXPECT_EQ(n, version.version);
     Transaction t;
     Ticket ticket;
-    ASSERT_EQ(0, j.append(object(), version, 16 * width(), (n - 1) * 4096,
-                          bytes(4096, 'v'), t, &ticket, utime_t(100 + n, 0)));
+    ASSERT_EQ(0, append_copy(j, object(), version, 16 * width(), (n - 1) * 4096,
+                             bytes(4096, 'v'), t, &ticket,
+                             utime_t(100 + n, 0)));
     EXPECT_EQ(version.version, ticket.sequence);
     EXPECT_EQ(version, j.version_now(7));
     EXPECT_EQ(0, j.committed(ticket, 0));
@@ -299,7 +316,7 @@ TEST_P(JournalTest, SplitCopiesSlotsWithoutChangingRecordLocations)
   slot_prefix.hobj.nspace = std::string(hobject_t::INTERNAL_PG_LOCAL_NS);
   const spg_t parent(pg_t(0, 1), shard);
   const spg_t child(pg_t(2, 1), shard);
-  Journal journal(coll_t(parent), slot_prefix, limits());
+  Journal journal(slot_prefix, limits());
   auto child_object = object("child");
   child_object.set_hash(2);
   Placement first, second;
@@ -443,10 +460,10 @@ TEST_P(JournalTest, ExactPayloadInAppendOnlyObjectStoreRecords)
   auto j = journal();
   Transaction t;
   Ticket first, second;
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 1), width(), 1024,
-                        bytes(1024, 'a'), t, &first));
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 2), width(), 4096,
-                        bytes(4096, 'b'), t, &second));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 1), width(), 1024,
+                           bytes(1024, 'a'), t, &first));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 2), width(), 4096,
+                           bytes(4096, 'b'), t, &second));
   EXPECT_EQ(first.segment, second.segment);
   auto it = t.begin();
   uint64_t end = 0;
@@ -719,7 +736,7 @@ TEST_P(JournalTest, CoalescesAcrossSegmentsAndKillsOldSegmentBySupersede)
   l.segment_bytes = record_bytes() * 5 / 2; // two 1 KiB records per segment
   l.max_bytes = 16 * l.segment_bytes;
   l.max_segments = 16;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   auto a = append(j, 0, 1024, 'a');
   auto b = append(j, 1024, 1024, 'b');
   auto c = append(j, 2048, 1024, 'c');
@@ -752,7 +769,7 @@ TEST_P(JournalTest, PressureWhenTheLastSegmentOpensAndFlushesOldestFirst)
   l.segment_bytes = record_bytes() * 5 / 2; // two 1 KiB records per segment
   l.max_bytes = 2 * l.segment_bytes;
   l.max_segments = 2;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   append(j, 0, 1024, 'a');
   append(j, width(), 1024, 'b');
   EXPECT_EQ(1u, j.segment_count());
@@ -782,14 +799,14 @@ TEST_P(JournalTest, BackpressureBudgetReleasedWhenTheSegmentDies)
   // half of the single 8 KiB segment.
   l.segment_bytes = l.max_bytes = 8192;
   l.max_segments = 1;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   append(j, 0, 1024);
   EXPECT_TRUE(j.pressure());
   auto used = j.bytes();
   Transaction t;
   Ticket rejected;
-  EXPECT_EQ(-EAGAIN, j.append(object(), eversion_t(1, 2), width(), 1024,
-                              bytes(1024, 'b'), t, &rejected));
+  EXPECT_EQ(-EAGAIN, append_copy(j, object(), eversion_t(1, 2), width(), 1024,
+                                 bytes(1024, 'b'), t, &rejected));
   EXPECT_TRUE(t.empty());
   EXPECT_EQ(used, j.bytes());
   ASSERT_TRUE(flush(j));
@@ -859,22 +876,22 @@ TEST_P(JournalTest, ByteLimitCountsPaddedPayloadsAndHeaders)
 {
   auto l = limits();
   l.segment_bytes = l.max_bytes = record_bytes();
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   append(j, 0, 1024);
   EXPECT_EQ(l.max_bytes, j.bytes());
   EXPECT_EQ(record_alignment, j.payload_bytes());
   Transaction t;
   Ticket ignored;
-  EXPECT_EQ(-EAGAIN, j.append(object(), eversion_t(1, 2), width(), 1024,
-                              bytes(1024, 'x'), t, &ignored));
+  EXPECT_EQ(-EAGAIN, append_copy(j, object(), eversion_t(1, 2), width(), 1024,
+                                 bytes(1024, 'x'), t, &ignored));
   EXPECT_TRUE(t.empty());
-  Journal big(coll_t(), prefix(), l);
-  EXPECT_EQ(-E2BIG, big.append(object(), eversion_t(1, 1), width(), 0,
-                               bytes(8192, 'x'), t, &ignored));
+  Journal big(prefix(), l);
+  EXPECT_EQ(-E2BIG, append_copy(big, object(), eversion_t(1, 1), width(), 0,
+                                bytes(8192, 'x'), t, &ignored));
   EXPECT_TRUE(t.empty());
   EXPECT_TRUE(big.empty());
-  EXPECT_EQ(0, big.append(object(), eversion_t(1, 1), width(), 0,
-                          bytes(4096, 'x'), t, &ignored));
+  EXPECT_EQ(0, append_copy(big, object(), eversion_t(1, 1), width(), 0,
+                           bytes(4096, 'x'), t, &ignored));
   EXPECT_EQ(record_alignment, big.payload_bytes());
   EXPECT_EQ(l.max_bytes, big.bytes());
 }
@@ -889,8 +906,8 @@ TEST_P(JournalTest, RecordsOfBothSizesStayBlockAligned)
     const uint64_t len = rng() % 2 ? 1024 : 4096;
     const uint64_t off = (rng() % (width() / len)) * len;
     Ticket ticket;
-    ASSERT_EQ(0, j.append(object(), eversion_t(1, n + 1), width(), off,
-                          bytes(len, 'x'), t, &ticket));
+    ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, n + 1), width(), off,
+                             bytes(len, 'x'), t, &ticket));
     expected += record_alignment;
   }
   EXPECT_EQ(expected, j.payload_bytes());
@@ -992,7 +1009,7 @@ TEST_P(JournalTest, SegmentRotationIsBoundedAndOldestFlushesFirst)
   auto l = limits();
   l.segment_bytes = record_bytes(); // one 1 KiB record per segment
   l.max_segments = 2;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   auto first = append(j, 0, 1024, 'a', object(), false);
   auto second = append(j, width(), 1024, 'b');
   EXPECT_NE(first.segment, second.segment);
@@ -1002,8 +1019,8 @@ TEST_P(JournalTest, SegmentRotationIsBoundedAndOldestFlushesFirst)
   EXPECT_FALSE(j.begin_flush(any()));
   Transaction t;
   Ticket ignored;
-  EXPECT_EQ(-EAGAIN, j.append(object(), eversion_t(1, 3), width(), 2048,
-                              bytes(1024, 'c'), t, &ignored));
+  EXPECT_EQ(-EAGAIN, append_copy(j, object(), eversion_t(1, 3), width(), 2048,
+                                 bytes(1024, 'c'), t, &ignored));
   EXPECT_TRUE(t.empty());
   EXPECT_EQ(0, j.committed(first, 0));
   auto oldest = flush(j);
@@ -1027,7 +1044,7 @@ TEST_P(JournalTest, ReclaimFlushesOnlyStripesPinningTheOldestSegment)
   l.segment_bytes = 2 * record_bytes(); // two 1 KiB records per segment
   l.max_bytes = 3 * l.segment_bytes;
   l.max_segments = 3;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   // One incomplete stripe per record: segments A = {0, 1}, B = {2, 3}, C = {4}.
   std::vector<Ticket> t;
   for (uint64_t i = 0; i < 5; ++i) {
@@ -1091,7 +1108,7 @@ TEST_P(JournalTest, ReclaimFollowsEachStripesOldestLiveRecord)
   l.segment_bytes = 2 * record_bytes();
   l.max_bytes = 3 * l.segment_bytes;
   l.max_segments = 3;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   append(j, 0, 1024, 'a');           // A: stripe 0
   append(j, width(), 1024, 'b');     // A: stripe 1
   append(j, 2 * width(), 1024, 'c'); // B: stripe 2
@@ -1143,8 +1160,8 @@ TEST_P(JournalTest, FailedAppendStopsAdmissionAndFlush)
   EXPECT_FALSE(j.begin_flush(any()));
   Transaction t;
   Ticket ignored;
-  EXPECT_EQ(-EIO, j.append(object(), eversion_t(1, 2), width(), 1024,
-                           bytes(1024, 'y'), t, &ignored));
+  EXPECT_EQ(-EIO, append_copy(j, object(), eversion_t(1, 2), width(), 1024,
+                              bytes(1024, 'y'), t, &ignored));
   EXPECT_TRUE(t.empty());
   EXPECT_EQ(1u, j.records());
 }
@@ -1205,8 +1222,8 @@ TEST_P(JournalTest, InvalidWritesHaveNoSideEffects)
          std::pair{std::numeric_limits<uint64_t>::max() - 1023, uint64_t(1024)}}) {
     Transaction t;
     Ticket ignored;
-    EXPECT_EQ(-EINVAL, j.append(object(), eversion_t(1, 1), width(), off,
-                                bytes(len, 'x'), t, &ignored));
+    EXPECT_EQ(-EINVAL, append_copy(j, object(), eversion_t(1, 1), width(), off,
+                                   bytes(len, 'x'), t, &ignored));
     EXPECT_TRUE(t.empty());
     EXPECT_TRUE(j.empty());
     EXPECT_FALSE(j.dirty());
@@ -1224,7 +1241,7 @@ TEST_P(JournalTest, RandomOverwritesMatchReferenceAfterDrain)
   l.segment_bytes = 64 * 1024;
   l.max_bytes = 4 * l.segment_bytes;
   l.max_segments = 4;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   std::mt19937 rng(123);
   std::map<hobject_t, std::string> expected, physical;
   for (const auto& name : {"one", "two"}) {
@@ -1245,8 +1262,8 @@ TEST_P(JournalTest, RandomOverwritesMatchReferenceAfterDrain)
     const char value = 'a' + rng() % 26;
     Transaction t;
     Ticket ticket;
-    int r = j.append(oid, eversion_t(1, n + 1), width() * 3, off,
-                     bytes(size, value), t, &ticket);
+    int r = append_copy(j, oid, eversion_t(1, n + 1), width() * 3, off,
+                        bytes(size, value), t, &ticket);
     if (r == 0) {
       seen.insert(ticket.segment);
     }
@@ -1258,8 +1275,8 @@ TEST_P(JournalTest, RandomOverwritesMatchReferenceAfterDrain)
       }
       tickets.clear();
       j.seal();
-      while ((r = j.append(oid, eversion_t(1, n + 1), width() * 3, off,
-                           bytes(size, value), t, &ticket)) == -EAGAIN) {
+      while ((r = append_copy(j, oid, eversion_t(1, n + 1), width() * 3, off,
+                              bytes(size, value), t, &ticket)) == -EAGAIN) {
         auto stripe = j.begin_flush(any());
         ASSERT_TRUE(stripe);
         apply(*stripe);
@@ -1304,8 +1321,8 @@ TEST_P(JournalTest, ObjectTailPreservesDataAndPadsOnlyBeyondEOF)
   const uint64_t size = width() + 4609;
   Transaction t;
   Ticket ticket;
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 1), size, width() + 1024,
-                        bytes(1024, 'x'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 1), size, width() + 1024,
+                           bytes(1024, 'x'), t, &ticket));
   ASSERT_EQ(0, j.committed(ticket, 0));
   auto stripe = j.begin_flush(any());
   ASSERT_TRUE(stripe);
@@ -1326,8 +1343,8 @@ TEST_P(JournalTest, FullyCoveredTailNeedsNoBaseRead)
   auto j = journal();
   Transaction t;
   Ticket ticket;
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 1), width() + 1024, width(),
-                        bytes(1024, 'x'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 1), width() + 1024,
+                           width(), bytes(1024, 'x'), t, &ticket));
   ASSERT_EQ(0, j.committed(ticket, 0));
   EXPECT_TRUE(j.flush_ready()); // the whole tail is covered
   auto stripe = j.begin_flush(false);
@@ -1451,14 +1468,14 @@ TEST(ECWriteJournal, RejectInvalidGeometryAndLimits)
   for (uint64_t width : {0u, 1024u, 4097u}) {
     Limits l;
     l.stripe_width = width;
-    EXPECT_THROW(Journal(coll_t(), prefix(), l), std::invalid_argument);
+    EXPECT_THROW(Journal(prefix(), l), std::invalid_argument);
   }
   Limits l;
   l.max_bytes = l.segment_bytes - 1;
-  EXPECT_THROW(Journal(coll_t(), prefix(), l), std::invalid_argument);
+  EXPECT_THROW(Journal(prefix(), l), std::invalid_argument);
   l = Limits();
   l.segment_bytes = record_alignment - 1; // cannot hold one aligned record
-  EXPECT_THROW(Journal(coll_t(), prefix(), l), std::invalid_argument);
+  EXPECT_THROW(Journal(prefix(), l), std::invalid_argument);
 }
 
 TEST(ECWriteJournal, TruncatedRecordCannotDecode)
@@ -1606,7 +1623,7 @@ TEST(ECWriteJournal, DetachedSlotHeadersAreRequiredAndFilterOwnership)
 TEST(ECWriteJournal, EveryHolderGetsTheSameBytesAtTheSameOffset)
 {
   Limits l;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   Placement placement;
   Ticket ticket;
   ASSERT_EQ(0, j.append(object(), eversion_t(1, 1), 16 * l.stripe_width, 4096,
@@ -1652,7 +1669,7 @@ TEST(ECWriteJournal, ReleasedSlotIsReusedAndReset)
   l.segment_bytes = 3 * record_alignment; // two 1 KiB records and headers
   l.max_bytes = 2 * l.segment_bytes;
   l.max_segments = 2;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   auto place = [&](uint64_t off, uint64_t version) {
     Placement placement;
     Ticket ticket;
@@ -1690,7 +1707,7 @@ TEST(ECWriteJournal, CheckAppendPredictsAppendWithoutChangingState)
   l.segment_bytes = 3 * record_alignment; // two 1 KiB records and headers
   l.max_bytes = 2 * l.segment_bytes;
   l.max_segments = 2;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   EXPECT_EQ(-EINVAL, j.check_append(object(), 0));
   EXPECT_EQ(-EINVAL, j.check_append(object(), 1536));
   EXPECT_EQ(0, j.check_append(object(), 4096));
@@ -1717,15 +1734,15 @@ TEST(ECWriteJournal, CheckAppendPredictsAppendWithoutChangingState)
 TEST(ECWriteJournal, FlushReportsTheNewestRecordVersion)
 {
   Limits l;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   Transaction t;
   Ticket a, b, c;
-  ASSERT_EQ(0, j.append(object(), eversion_t(4, 7), 16 * l.stripe_width, 0,
-                        bytes(1024, 'a'), t, &a));
-  ASSERT_EQ(0, j.append(object(), eversion_t(4, 9), 16 * l.stripe_width, 1024,
-                        bytes(1024, 'b'), t, &b));
-  ASSERT_EQ(0, j.append(object(), eversion_t(4, 8), 16 * l.stripe_width,
-                        l.stripe_width, bytes(1024, 'c'), t, &c));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(4, 7), 16 * l.stripe_width,
+                           0, bytes(1024, 'a'), t, &a));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(4, 9), 16 * l.stripe_width,
+                           1024, bytes(1024, 'b'), t, &b));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(4, 8), 16 * l.stripe_width,
+                           l.stripe_width, bytes(1024, 'c'), t, &c));
   for (auto ticket : {a, b, c}) {
     ASSERT_EQ(0, j.committed(ticket, 0));
   }
@@ -1739,11 +1756,11 @@ TEST(ECWriteJournal, FlushReportsTheNewestRecordVersion)
 TEST(ECWriteJournal, ResetDropsLiveRecordsForReplay)
 {
   Limits l;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   Transaction t;
   Ticket ticket;
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 1), 16 * l.stripe_width, 0,
-                        bytes(1024, 'a'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 1), 16 * l.stripe_width,
+                           0, bytes(1024, 'a'), t, &ticket));
   EXPECT_TRUE(j.dirty());
   // The records stay on the holders' slots; memory is simply dropped.
   j.on_reset();
@@ -1756,7 +1773,7 @@ TEST(ECWriteJournal, ResetDropsLiveRecordsForReplay)
 TEST(ECWriteJournal, AdoptKeepsRecordsInTheirSlotsAndFreesThemAsTheyFlush)
 {
   Limits l;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   const uint64_t size = 16 * l.stripe_width;
   // Two records of stripe 0 overlap at 1 KiB; the newer version wins even
   // when adopted first, as when slots are scanned out of order. They were
@@ -1818,7 +1835,7 @@ TEST(ECWriteJournal, AdoptKeepsRecordsInTheirSlotsAndFreesThemAsTheyFlush)
 TEST(ECWriteJournal, HeldSlotsStayOutOfUseUntilReleasedOrAdopted)
 {
   Limits l;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   const uint64_t size = 16 * l.stripe_width;
   // Replay found two records in slot 0 and one in slot 1 that it cannot
   // place yet (a fetch, a recovery): neither slot may take a new segment.
@@ -1878,7 +1895,7 @@ TEST_P(JournalTest, AdoptedRecordsCountAgainstTheBudget)
   l.segment_bytes = record_bytes() * 5 / 2; // two 1 KiB records per segment
   l.max_bytes = 4 * l.segment_bytes;
   l.max_segments = 4;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   // Two live records in each of the four slots: the log is as full as the
   // slots were, and a new segment has to wait for the first flush.
   for (uint64_t slot = 0; slot < 4; ++slot) {
@@ -1946,21 +1963,21 @@ TEST_P(JournalTest, OldestVersionSpansTheObjectsLiveStripes)
   Ticket ticket;
   // Stripe 0 at (1,20), stripe 1 at (1,10) then (1,30) over the same block,
   // stripe 2 at (1,25); another object at (1,5).
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 20), 16 * width(), 0,
-                        bytes(1024, 'a'), t, &ticket));
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 10), 16 * width(), width(),
-                        bytes(1024, 'b'), t, &ticket));
-  ASSERT_EQ(0, j.append(other, eversion_t(1, 5), 16 * width(), 0,
-                        bytes(1024, 'c'), t, &ticket));
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 25), 16 * width(), 2 * width(),
-                        bytes(1024, 'd'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 20), 16 * width(), 0,
+                           bytes(1024, 'a'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 10), 16 * width(),
+                           width(), bytes(1024, 'b'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, other, eversion_t(1, 5), 16 * width(), 0,
+                           bytes(1024, 'c'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 25), 16 * width(),
+                           2 * width(), bytes(1024, 'd'), t, &ticket));
   EXPECT_EQ(eversion_t(1, 10), j.oldest_version(object()));
   EXPECT_EQ(eversion_t(1, 20), j.oldest_version(object(), width()));
   EXPECT_EQ(eversion_t(1, 5), j.oldest_version(other));
   EXPECT_FALSE(j.oldest_version(other, 0));
   // Superseded: stripe 1's only block now holds (1,30).
-  ASSERT_EQ(0, j.append(object(), eversion_t(1, 30), 16 * width(), width(),
-                        bytes(1024, 'e'), t, &ticket));
+  ASSERT_EQ(0, append_copy(j, object(), eversion_t(1, 30), 16 * width(),
+                           width(), bytes(1024, 'e'), t, &ticket));
   EXPECT_EQ(eversion_t(1, 20), j.oldest_version(object()));
   EXPECT_EQ(eversion_t(1, 25), j.oldest_version(object(), 0));
   // A flushed stripe leaves; one still flushing counts, as does a block
@@ -1968,18 +1985,18 @@ TEST_P(JournalTest, OldestVersionSpansTheObjectsLiveStripes)
   Journal k = journal();
   Transaction u;
   Ticket a, b, c;
-  ASSERT_EQ(0, k.append(object(), eversion_t(2, 10), 16 * width(), 0,
-                        bytes(1024, 'a'), u, &a));
-  ASSERT_EQ(0, k.append(object(), eversion_t(2, 11), 16 * width(), width(),
-                        bytes(1024, 'b'), u, &b));
+  ASSERT_EQ(0, append_copy(k, object(), eversion_t(2, 10), 16 * width(), 0,
+                           bytes(1024, 'a'), u, &a));
+  ASSERT_EQ(0, append_copy(k, object(), eversion_t(2, 11), 16 * width(),
+                           width(), bytes(1024, 'b'), u, &b));
   ASSERT_EQ(0, k.committed(a, 0));
   ASSERT_EQ(0, k.committed(b, 0));
   auto stripe = k.begin_flush_object(object(), {}, nullptr, 0, width());
   ASSERT_TRUE(stripe);
   EXPECT_EQ(0u, stripe->offset);
   EXPECT_EQ(eversion_t(2, 10), k.oldest_version(object()));
-  ASSERT_EQ(0, k.append(object(), eversion_t(2, 12), 16 * width(), 1024,
-                        bytes(1024, 'c'), u, &c));
+  ASSERT_EQ(0, append_copy(k, object(), eversion_t(2, 12), 16 * width(), 1024,
+                           bytes(1024, 'c'), u, &c));
   ASSERT_EQ(0, k.finish_flush(*stripe, 0));
   EXPECT_EQ(eversion_t(2, 11), k.oldest_version(object()));
   EXPECT_EQ(eversion_t(2, 12), k.oldest_version(object(), width()));
@@ -2020,7 +2037,7 @@ TEST(ECWriteJournal, LaterSegmentsStartTheirSlotsAtOffsetZero)
   l.segment_bytes = 3 * record_alignment; // two 4 KiB records and headers
   l.max_bytes = 3 * l.segment_bytes;
   l.max_segments = 3;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   SlotImage image;
   std::vector<Placement> placements;
   for (uint64_t n = 0; n < 6; ++n) {
@@ -2065,7 +2082,7 @@ TEST(ECWriteJournal, MultiBlockPayloadsDecodeAtTheirPaddedOffsets)
   // librbd merges adjacent writes, so records of up to a stripe are
   // journaled, 4 KiB multiples or not.
   Limits l;
-  Journal j(coll_t(), prefix(), l);
+  Journal j(prefix(), l);
   SlotImage image;
   const std::vector<uint64_t> lengths{8192, 2048, 12288, 6144, 32768, 1024, 16384};
   std::vector<Placement> placements;
@@ -2152,7 +2169,7 @@ TEST(ECWriteJournal, SplitRemovesChildSlotsTheParentLacks)
 {
   // Slots a merge left behind come back with the split: removed even where
   // the parent has nothing to copy.
-  Journal j(coll_t(), prefix(), Limits());
+  Journal j(prefix(), Limits());
   const spg_t child(pg_t(2, 1), shard_id_t(0));
   Transaction t;
   ASSERT_EQ(0, j.copy_slots_for_split(child,

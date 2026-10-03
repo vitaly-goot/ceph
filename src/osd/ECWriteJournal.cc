@@ -258,8 +258,8 @@ bool Limits::valid() const
     max_segments;
 }
 
-Journal::Journal(coll_t collection, ghobject_t prefix, Limits limits)
-  : collection(std::move(collection)), prefix(std::move(prefix)), limits(limits)
+Journal::Journal(ghobject_t prefix, Limits limits)
+  : prefix(std::move(prefix)), limits(limits)
 {
   if (!limits.valid()) {
     throw std::invalid_argument("invalid EC journal geometry or capacity");
@@ -338,20 +338,6 @@ void Journal::reindex(const StripeKey& key, Entry& entry)
   if (entry.undurable == 0 && entry.full()) {
     ready.insert(key);
   }
-}
-
-int Journal::append(const hobject_t& object, eversion_t version,
-                    uint64_t object_size, uint64_t offset,
-                    const ceph::bufferlist& data, ceph::os::Transaction& t,
-                    Ticket* ticket, utime_t mtime)
-{
-  Placement placement;
-  const int r = append(object, version, object_size, offset, data,
-                       &placement, ticket, mtime);
-  if (r == 0) {
-    emit(placement, collection, prefix.shard_id, t);
-  }
-  return r;
 }
 
 void Journal::emit(const Placement& placement, const coll_t& coll,
