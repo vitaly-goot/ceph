@@ -307,12 +307,13 @@ if(${ENABLE_COVERAGE})
   list(APPEND EXTRALIBS gcov)
 endif(${ENABLE_COVERAGE})
 
+# ceph-debugpack ships in ceph-base, so it is generated with or without tests.
+configure_file(${CMAKE_SOURCE_DIR}/src/ceph-debugpack.in
+  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-debugpack @ONLY)
 if(WITH_TESTS)
   set(GCOV_PREFIX_STRIP 4)
   configure_file(${CMAKE_SOURCE_DIR}/src/ceph-coverage.in
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-coverage @ONLY)
-  configure_file(${CMAKE_SOURCE_DIR}/src/ceph-debugpack.in
-    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-debugpack @ONLY)
 endif()
 
 option(WITH_OCF "build OCF-compliant cluster resource agent" OFF)
@@ -808,13 +809,20 @@ add_subdirectory(tools)
 
 if(WITH_TESTS)
   add_subdirectory(test)
+elseif(NOT WIN32)
+  # ceph_objectstore_bench ships in ceph-osd; build it without the test tree.
+  add_executable(ceph_objectstore_bench test/objectstore_bench.cc)
+  target_link_libraries(ceph_objectstore_bench os global ${BLKID_LIBRARIES})
+  install(TARGETS ceph_objectstore_bench DESTINATION bin)
 endif()
 
 add_subdirectory(crypto)
 
+install(PROGRAMS
+  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-debugpack
+  DESTINATION bin)
 if(WITH_TESTS)
   install(PROGRAMS
-    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-debugpack
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-coverage
     DESTINATION bin)
 endif()

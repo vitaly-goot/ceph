@@ -20,6 +20,10 @@ endif
 ifneq ($(filter pkg.ceph.arrow,$(DEB_BUILD_PROFILES)),)
   extraopts += -DWITH_SYSTEM_ARROW=ON
 endif
+# pkg.ceph.notests: skip the test binaries and the ceph-test packages (faster builds)
+ifneq ($(filter pkg.ceph.notests,$(DEB_BUILD_PROFILES)),)
+  extraopts += -DWITH_TESTS=OFF
+endif
 
 extraopts += -DWITH_JAEGER=ON
 extraopts += -DWITH_SYSTEM_UTF8PROC=ON
@@ -137,7 +141,9 @@ override_dh_strip:
 	dh_strip -plibcephfs-daemon --dbg-package=libcephfs-daemon-dbg
 	dh_strip -plibrgw2 --dbg-package=librgw2-dbg
 	dh_strip -pradosgw --dbg-package=radosgw-dbg
+ifeq ($(filter pkg.ceph.notests,$(DEB_BUILD_PROFILES)),)
 	dh_strip -pceph-test --dbg-package=ceph-test-dbg
+endif
 	dh_strip -ppython3-rados --dbg-package=python3-rados-dbg
 	dh_strip -ppython3-rbd --dbg-package=python3-rbd-dbg
 	dh_strip -ppython3-rgw --dbg-package=python3-rgw-dbg

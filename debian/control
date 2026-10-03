@@ -1079,6 +1079,7 @@ Description: debugging symbols for radosgw
 
 Package: ceph-test
 Architecture: linux-any
+Build-Profiles: <!pkg.ceph.notests>
 Depends: ceph-common,
          curl,
          jq,
@@ -1093,6 +1094,7 @@ Description: Ceph test and benchmarking tools
 
 Package: ceph-test-dbg
 Architecture: linux-any
+Build-Profiles: <!pkg.ceph.notests>
 Section: debug
 Priority: extra
 Depends: ceph-common (= ${binary:Version}),

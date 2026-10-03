@@ -13,11 +13,8 @@ set(server_srcs
   ceph-run.rst
   mount.ceph.rst
   mount.fuse.ceph.rst
-  ceph-create-keys.rst)
-if(WITH_TESTS)
-list(APPEND server_srcs
+  ceph-create-keys.rst
   ceph-debugpack.rst)
-endif(WITH_TESTS)
 
 set(osd_srcs
   ceph-clsinfo.rst
