@@ -600,6 +600,7 @@ struct SignalHandler : public Thread {
 
   void register_handler(int signum, signal_handler_t handler, bool oneshot);
   void unregister_handler(int signum, signal_handler_t handler);
+  void install_sigaction(int signum, bool oneshot);
 };
 
 static SignalHandler *g_signal_handler = NULL;
@@ -630,6 +631,11 @@ void SignalHandler::register_handler(int signum, signal_handler_t handler, bool 
   signal_thread();
   
   // install our handler
+  install_sigaction(signum, oneshot);
+}
+
+void SignalHandler::install_sigaction(int signum, bool oneshot)
+{
   struct sigaction oldact;
   struct sigaction act;
   memset(&act, 0, sizeof(act));
@@ -694,6 +700,14 @@ void register_async_signal_handler_oneshot(int signum, signal_handler_t handler)
 {
   ceph_assert(g_signal_handler);
   g_signal_handler->register_handler(signum, handler, true);
+}
+
+void rearm_async_signal_handler_oneshot(int signum)
+{
+  ceph_assert(g_signal_handler);
+  // Called from the signal thread while it holds the handlers lock and the
+  // handlers[] entry is still present; only the kernel disposition was reset.
+  g_signal_handler->install_sigaction(signum, true);
 }
 
 void unregister_async_signal_handler(int signum, signal_handler_t handler)

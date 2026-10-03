@@ -598,6 +598,11 @@ struct ECCommon {
     void cache_ready(Op &op);
     void try_finish_rmw();
     void finish_rmw(OpRef const &op);
+    // Send op's per-shard transactions now, with no log entry and no
+    // version, the way the rollforward kick is sent; op->on_all_commit runs
+    // once every shard committed. Only while the extent cache is idle, so
+    // nothing queued ahead of it is overtaken: returns false otherwise.
+    bool submit_unlogged(OpRef op);
 
     // The roll-forward kick. When the pipeline goes idle after an op whose
     // version is past can_rollback_to, a dummy transaction-empty op carries
@@ -863,7 +868,8 @@ struct ECCommon {
     PGTransaction &t,
     ECCommon::ReadPipeline &read_pipeline,
     ECCommon::RMWPipeline &rmw_pipeline,
-    DoutPrefixProvider *dpp);
+    DoutPrefixProvider *dpp,
+    const std::map<hobject_t, object_info_t>* submitted_oi = nullptr);
 };
 
 struct RecoveryMessages {

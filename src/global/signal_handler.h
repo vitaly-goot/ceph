@@ -55,6 +55,14 @@ void queue_async_signal(int signum);
 void register_async_signal_handler(int signum, signal_handler_t handler);
 void register_async_signal_handler_oneshot(int signum, signal_handler_t handler);
 
+/**
+ * Reinstall the kernel disposition for a oneshot (SA_RESETHAND) handler that
+ * has already fired, so that the next delivery of signum is handled again
+ * instead of taking the default action. Safe to call from within the handler
+ * itself (no locks are taken); the handler must still be registered.
+ */
+void rearm_async_signal_handler_oneshot(int signum);
+
 /// uninstall a safe async signal callback
 void unregister_async_signal_handler(int signum, signal_handler_t handler);
 

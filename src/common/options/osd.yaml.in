@@ -2,6 +2,135 @@
 ---
 
 options:
+- name: osd_ec_journal_poc_enable
+  type: bool
+  level: dev
+  desc: Enable unsafe write-only primary-local EC journal experiment
+  long_desc: Only disposable 4+3, 8+3 or 12+3 optimized pools with 4 KiB chunks. No
+    client reads while dirty, replay, recovery, scrub, snapshots or failover.
+    A PG reset with dirty records deliberately aborts rather than losing data
+    silently. Requires osd_ec_journal_poc_pool and a fresh experimental pool.
+    Graceful shutdown attempts a local drain before teardown and refuses to
+    stop if it cannot finish within 30 seconds. Drain all participating OSDs
+    before stopping peers. Restart discards temp journal objects, without replay.
+  default: false
+  flags:
+  - startup
+- name: osd_ec_journal_poc_pool
+  type: int
+  level: dev
+  desc: Pool ID enrolled in the EC journal experiment (-1 disables enrollment)
+  default: -1
+  flags:
+  - startup
+- name: osd_ec_journal_poc_segment_bytes
+  type: size
+  level: dev
+  desc: Maximum encoded bytes in a per-PG journal segment
+  long_desc: Segments are reclaimed whole once none of their records is live.
+    The oldest one is reclaimed as soon as the budget's last segment opens, so
+    smaller segments keep incomplete stripes journaled for longer in the same
+    osd_ec_journal_poc_max_bytes and spread their flushes out. Payloads are
+    padded to 4 KiB multiples (1 KiB and 4 KiB writes each occupy one data
+    block). Headers are immutable OMAP entries in the slot object; the budget
+    counts padded payloads plus encoded header values and keys, but excludes
+    RocksDB framing, WAL and compaction overhead.
+  default: 4_M
+  min: 8_K
+  flags:
+  - startup
+- name: osd_ec_journal_poc_max_bytes
+  type: size
+  level: dev
+  desc: Maximum encoded journal bytes per PG including in-flight flushes
+  long_desc: Each record is charged its padded payload plus its header and
+    OMAP key, about 4.15 KiB for a 4 KiB write. The primary keeps the PG's
+    live journaled blocks in memory, up to about 96% of this budget.
+  default: 16_M
+  min: 8_K
+  flags:
+  - startup
+- name: osd_ec_journal_poc_max_records
+  type: uint
+  level: dev
+  desc: Maximum retained journal records per PG
+  default: 8192
+  min: 1
+  flags:
+  - startup
+- name: osd_ec_journal_poc_max_flushes
+  type: uint
+  level: dev
+  desc: Stripe flushes the EC write journal PoC keeps in flight per PG
+  long_desc: Each flush materializes one stripe with an ordinary EC write, and
+    reclaiming a sealed segment means flushing every live stripe it still holds.
+    Client writes to the PG stop being admitted while the log is full, so a low
+    limit bounds the PG's write rate at one flush round trip per stripe. Stripes
+    are independent; this is the number the flusher keeps outstanding.
+  default: 8
+  min: 1
+  max: 1024
+  see_also:
+  - osd_ec_journal_poc_enable
+  - osd_ec_journal_poc_max_bytes
+  with_legacy: false
+- name: osd_ec_journal_poc_copies
+  type: uint
+  level: dev
+  desc: Shards that store each EC write journal PoC record (0 = m + 1)
+  long_desc: Each record is written by the primary shard, then shard 0 and the
+    parity shards in order, in the same transaction as their log entry, until
+    this many shards hold it. m + 1 copies survive as many failures as the pool;
+    fewer are only for measuring what the copies cost.
+  default: 0
+  min: 0
+  max: 16
+  flags:
+  - startup
+  see_also:
+  - osd_ec_journal_poc_enable
+  with_legacy: false
+- name: osd_ec_journal_poc_flush_ms
+  type: uint
+  level: dev
+  desc: Maximum age of an incomplete journaled stripe in milliseconds
+  long_desc: Complete stripes are written to the shards as soon as they are
+    durable in the journal. An incomplete stripe waits for more writes until it
+    is this old, until the journal must reclaim its oldest segment, or until a
+    drain. 0 disables the age limit (reclaim and drain only).
+  default: 100
+  min: 0
+  flags:
+  - startup
+- name: osd_ec_journal_poc_drain
+  type: bool
+  level: dev
+  desc: Drain the experimental journal and stop enrolling new writes
+  long_desc: Set on all OSDs hosting experimental primaries and stop clients.
+    Poll ec_write_journal_poc in the PG query recovery_state until bytes,
+    pending_admissions and flush_in_progress are zero before verifying reads.
+  default: false
+  flags:
+  - runtime
+- name: osd_ec_journal_poc_admit_wpf
+  type: uint
+  level: dev
+  desc: Admission control for the EC write journal PoC
+  long_desc: A durable journal record costs a write on every holder, so the
+    journal pays off only for stripes that collect several writes before their
+    flush. With a nonzero value N it takes an eligible write only if the stripe
+    already has records, or was written again within (records the log holds / N)
+    writes of the PG. Other writes take the ordinary EC write path, as do whole
+    aligned stripes, and writes to stripes without records while the log is full.
+    0 journals every eligible write.
+  default: 10
+  min: 0
+  max: 1000
+  flags:
+  - runtime
+  see_also:
+  - osd_ec_journal_poc_max_bytes
+  - osd_ec_journal_poc_max_records
 - name: osd_ec_rollforward_delay_ms
   type: uint
   level: advanced
