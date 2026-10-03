@@ -2177,10 +2177,10 @@ void ECBackend::journal_on_activate()
       s.journal.hold_slot(slot);
       ceph::bufferlist payload;
       const int read = switcher->store->read(switcher->ch, object,
-        entry.tag.slot_offset, entry.tag.length, payload);
+        entry.locator.slot_offset, entry.locator.length, payload);
       if (read >= 0) {
         try {
-          records.push_back(entry.tag.decode_record(payload));
+          records.push_back(entry.locator.decode_record(payload));
           continue;
         } catch (const ceph::buffer::error& error) {
           why = error.what();
@@ -2191,10 +2191,10 @@ void ECBackend::journal_on_activate()
       ++s.replay_unreadable;
       if (++unreadable <= 16) {
         derr << "EC journal replay: " << header.object << " " << header.version
-             << " in slot " << slot << " at " << entry.tag.slot_offset << ": "
-             << why << "; fetching it from another holder" << dendl;
+             << " in slot " << slot << " at " << entry.locator.slot_offset
+             << ": " << why << "; fetching it from another holder" << dendl;
       }
-      s.fetches.add(header.object, header.version, std::move(entry.tag));
+      s.fetches.add(header.object, header.version, std::move(entry.locator));
     }
   }
   std::sort(records.begin(), records.end(),
@@ -2295,7 +2295,7 @@ void ECBackend::journal_headers_result(
              << " only on other holders; fetching" << dendl;
     s.journal.hold_slot(number);
     s.replay_fetching.insert(header.version);
-    s.fetches.add(header.object, header.version, std::move(entry.tag));
+    s.fetches.add(header.object, header.version, std::move(entry.locator));
   }
 }
 
@@ -2359,16 +2359,18 @@ void ECBackend::journal_fetch_next()
   // holder: read those ranges of this holder's copy, verbatim.
   std::map<hobject_t, ECCommon::read_request_t> to_read;
   for (const auto& f : s.fetches.pending()) {
-    const hobject_t slot = s.journal.slot_object(f.tag.slot, source.shard).hobj;
+    const hobject_t slot =
+      s.journal.slot_object(f.locator.slot, source.shard).hobj;
     auto [i, fresh] = to_read.try_emplace(slot,
       ECUtil::shard_extent_set_t(sinfo.get_k_plus_m()), false,
-      f.tag.slot_offset + f.tag.length);
+      f.locator.slot_offset + f.locator.length);
     auto& req = i->second;
-    req.object_size = std::max(req.object_size, f.tag.slot_offset + f.tag.length);
-    req.shard_want_to_read.map[source.shard].union_insert(f.tag.slot_offset,
-                                                          f.tag.length);
+    req.object_size = std::max(req.object_size,
+                               f.locator.slot_offset + f.locator.length);
+    req.shard_want_to_read.map[source.shard].union_insert(f.locator.slot_offset,
+                                                          f.locator.length);
     auto& read = req.shard_reads[source.shard];
-    read.extents.union_insert(f.tag.slot_offset, f.tag.length);
+    read.extents.union_insert(f.locator.slot_offset, f.locator.length);
     read.pg_shard = source;
   }
   dout(10) << __func__ << " " << s.fetches.pending().size() << " records from "
@@ -2383,17 +2385,17 @@ void ECBackend::journal_fetch_result(const hobject_t& slot,
 {
   auto& s = *journal_state;
   for (const auto& f : s.fetches.pending()) {
-    if (s.journal.slot_object(f.tag.slot, shard).hobj != slot) {
+    if (s.journal.slot_object(f.locator.slot, shard).hobj != slot) {
       continue;
     }
     ceph::bufferlist bl;
-    data.get_buffer(shard, f.tag.slot_offset, f.tag.length, bl);
-    if (bl.length() != f.tag.length) {
+    data.get_buffer(shard, f.locator.slot_offset, f.locator.length, bl);
+    if (bl.length() != f.locator.length) {
       continue; // this holder's copy is short: try the next one
     }
     ECWriteJournal::Record record;
     try {
-      record = f.tag.decode_record(bl);
+      record = f.locator.decode_record(bl);
     } catch (const ceph::buffer::error&) {
       continue;
     }

@@ -75,7 +75,7 @@ struct Record {
   ceph::bufferlist data;
   utime_t mtime;
   // The slot replay read it from, the same on every holder
-  // (LogTag::decode_record); adopt() keeps it in that slot. Not encoded.
+  // (RecordLocator::decode_record); adopt() keeps it in that slot. Not encoded.
   uint64_t slot = no_slot;
 
   void encode_header(ceph::bufferlist& out, uint64_t slot_offset) const;
@@ -105,26 +105,25 @@ inline constexpr std::string_view materialized_attr = "ec_journal";
 // Where a record lives: the same slot and offset on every holder. Replay
 // builds one from each listed header (SlotEntry) and fetches the payload
 // through it from another holder when its own copy is missing or unreadable.
-struct LogTag {
+struct RecordLocator {
   uint64_t slot = 0;
   uint64_t slot_offset = 0;
   uint64_t length = 0; // padded payload bytes
   uint64_t offset = 0; // object offset of the write
   ceph::bufferlist header{};
-  void encode(ceph::bufferlist& out) const;
-  void decode(ceph::bufferlist::const_iterator& in);
+  // The record, from its header and this payload. Throws buffer::error if
+  // the payload is short, fails the checksum or is not this record's.
   Record decode_record(const ceph::bufferlist& payload) const;
 };
-WRITE_CLASS_ENCODER(LogTag)
 
 // One record of a slot as its OMAP header describes it. Replay judges a
 // record by its header alone and reads only the payloads it still needs,
-// through the tag: from this shard's copy of the slot, or from another
+// through its locator: from this shard's copy of the slot, or from another
 // holder's identical copy if this one does not read back intact or lacks
 // the record altogether (the other holders' listings are read too).
 struct SlotEntry {
   Record header; // no data
-  LogTag tag;
+  RecordLocator locator;
 };
 // The records of one slot that belong to pgid, oldest first. Throws
 // buffer::error unless the headers place their padded payloads back to
@@ -136,7 +135,7 @@ std::vector<SlotEntry> decode_slot_headers(uint64_t slot,
                                            const SlotHeaders& headers,
                                            pg_t pgid, unsigned split_bits);
 // Headers and payloads of a whole slot read at once (decode_slot_headers,
-// then every tag's decode_record).
+// then every locator's decode_record).
 std::vector<Record> decode_slot_records(const ceph::bufferlist& data,
                                         const SlotHeaders& headers,
                                         pg_t pgid, unsigned split_bits);
@@ -166,10 +165,10 @@ class ReplayFetches {
   struct Pending {
     hobject_t object;
     eversion_t version;
-    LogTag tag;
+    RecordLocator locator;
   };
 
-  void add(const hobject_t& object, eversion_t version, LogTag tag);
+  void add(const hobject_t& object, eversion_t version, RecordLocator locator);
   bool complete(const hobject_t& object, eversion_t version);
   void fail(int result, bool all_objects = false);
   void clear();

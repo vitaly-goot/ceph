@@ -372,11 +372,10 @@ times the records, and up to about 1.9 times the live block data in the
 primary's memory: live blocks take up to about 96% of ``max_bytes`` per
 primary PG. Halve ``max_bytes`` to keep the inline format's record count and
 memory: 256 MiB holds 63,184 4 KiB records where the inline format held
-65,536 in 512 MiB. The tags add about 1.3 MiB of raw data per 10,000
-retained PG-log entries and dups on each shard that logs them. OMAP adds
-memtable and cache pressure; its full contents are not permanently
-duplicated in the in-memory journal. RocksDB framing, WAL, SST duplication
-and allocator overhead are outside the configured logical byte budget.
+65,536 in 512 MiB. OMAP adds memtable and cache pressure; its full contents
+are not permanently duplicated in the in-memory journal. RocksDB framing,
+WAL, SST duplication and allocator overhead are outside the configured
+logical byte budget.
 
 Benchmark both 1 KiB and 4 KiB traffic against the inline-header version,
 recording commit latency, client IOPS, writes per flush, OSD RSS, device write
@@ -459,7 +458,7 @@ once a second.
 On a PG split, every shard first waits for its queued store transactions to
 apply, then copies its slot objects into the child's collection in the split
 transaction, including each slot's OMAP headers. The copies use the child's PG hash but retain every byte and
-record offset, so the log tags remain valid on all holders. Parent slots are
+record offset, so record locations remain valid on all holders. Parent slots are
 left intact. Each of the child's slots is removed first, whether the parent
 has that slot or not: a PG merge leaves the source PG's slots behind under
 their old hash, and a later split hands them back to the child, where their
@@ -686,8 +685,8 @@ fetches retaining object barriers, unreadable slots blocking untagged
 objects, and prevention of premature flushes. Record-format tests check
 one-block 4 KiB writes, no slot xattr operations, byte budgets, checksums, missing, misplaced and short headers,
 headers of records that open later segments, payloads of several blocks
-(4 KiB multiples or not) located by their headers alone, remote-fetch
-header/tag consistency and which op_returns items count as log tags.
+(4 KiB multiples or not) located by their headers alone, and remote-fetch
+header/locator consistency.
 
 ``unittest_ec_journal_flush`` additionally exercises the actual EC planner and
 shard extent mapping for all three geometries: full/partial pages, complete stripes,

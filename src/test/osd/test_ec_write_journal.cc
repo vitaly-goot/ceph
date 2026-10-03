@@ -206,9 +206,9 @@ TEST(JournalReplay, MissingRecordsKeepObjectsBlocked)
   ReplayFetches fetches;
   const auto first = object("first");
   const auto second = object("second");
-  fetches.add(first, eversion_t(1, 1), LogTag{0, 0, 4096, 0});
-  fetches.add(first, eversion_t(1, 2), LogTag{0, 4096, 4096, 1024});
-  fetches.add(second, eversion_t(1, 3), LogTag{1, 0, 4096, 0});
+  fetches.add(first, eversion_t(1, 1), RecordLocator{0, 0, 4096, 0});
+  fetches.add(first, eversion_t(1, 2), RecordLocator{0, 4096, 4096, 1024});
+  fetches.add(second, eversion_t(1, 3), RecordLocator{1, 0, 4096, 0});
   fetches.fail(-EIO);
   EXPECT_EQ(-EIO, fetches.error());
   EXPECT_FALSE(fetches.empty());
@@ -1537,8 +1537,8 @@ TEST(ECWriteJournal, ListingWithoutSizeStillRequiresTiling)
   const auto entries = decode_slot_headers(3, std::nullopt, headers, pgid, 0);
   ASSERT_EQ(2u, entries.size());
   EXPECT_EQ(eversion_t(1, 2), entries[1].header.version);
-  EXPECT_EQ(3u, entries[1].tag.slot);
-  EXPECT_EQ(4096u, entries[1].tag.slot_offset);
+  EXPECT_EQ(3u, entries[1].locator.slot);
+  EXPECT_EQ(4096u, entries[1].locator.slot_offset);
   SlotHeaders gap;
   first.encode_header(gap[record_header_key(0)], 0);
   second.encode_header(gap[record_header_key(8192)], 8192);
@@ -1556,21 +1556,21 @@ TEST(ECWriteJournal, DetachedHeaderChecksPayloadAndLocation)
   ceph::bufferlist header;
   record.encode_header(header, 8192);
   EXPECT_LT(header.length(), record_alignment);
-  LogTag tag{2, 8192, 4096, 4096, header};
-  auto decoded = tag.decode_record(record.data);
+  RecordLocator locator{2, 8192, 4096, 4096, header};
+  auto decoded = locator.decode_record(record.data);
   EXPECT_EQ(record.object, decoded.object);
   EXPECT_EQ(record.version, decoded.version);
   EXPECT_TRUE(record.data.contents_equal(decoded.data));
-  EXPECT_THROW(tag.decode_record(bytes(4096, 'x')), ceph::buffer::error);
-  EXPECT_THROW(tag.decode_record(bytes(4095, 'd')), ceph::buffer::error);
-  tag.slot_offset = 4096;
-  EXPECT_THROW(tag.decode_record(record.data), ceph::buffer::error);
-  tag.slot_offset = 8192;
+  EXPECT_THROW(locator.decode_record(bytes(4096, 'x')), ceph::buffer::error);
+  EXPECT_THROW(locator.decode_record(bytes(4095, 'd')), ceph::buffer::error);
+  locator.slot_offset = 4096;
+  EXPECT_THROW(locator.decode_record(record.data), ceph::buffer::error);
+  locator.slot_offset = 8192;
   auto corrupt = header.to_str();
   corrupt.back() ^= 1;
-  tag.header.clear();
-  tag.header.append(corrupt);
-  EXPECT_THROW(tag.decode_record(record.data), ceph::buffer::error);
+  locator.header.clear();
+  locator.header.append(corrupt);
+  EXPECT_THROW(locator.decode_record(record.data), ceph::buffer::error);
 }
 
 TEST(ECWriteJournal, DetachedSlotHeadersAreRequiredAndFilterOwnership)
@@ -1901,25 +1901,6 @@ TEST_P(JournalTest, AdoptedRecordsCountAgainstTheBudget)
   EXPECT_EQ(0, j.check_append(object(), 1024));
 }
 
-TEST(ECWriteJournal, LogTagRoundTrips)
-{
-  Record record{object(), eversion_t(3, 4), 65536, 40960,
-                bytes(4096, 't')};
-  LogTag tag{3, 12288, 4096, 40960};
-  record.encode_header(tag.header, tag.slot_offset);
-  ceph::bufferlist bl;
-  encode(tag, bl);
-  LogTag decoded;
-  auto p = bl.cbegin();
-  decode(decoded, p);
-  EXPECT_EQ(3u, decoded.slot);
-  EXPECT_EQ(12288u, decoded.slot_offset);
-  EXPECT_EQ(4096u, decoded.length);
-  EXPECT_EQ(40960u, decoded.offset);
-  EXPECT_TRUE(tag.header.contents_equal(decoded.header));
-  EXPECT_TRUE(record.data.contents_equal(decoded.decode_record(record.data).data));
-}
-
 TEST(ECWriteJournal, MarkerMergeDropsEntriesBaseCovers)
 {
   // The attr before: base (1,5), four stripes. A flush of stripe 1 whose
@@ -2117,18 +2098,18 @@ TEST(ECWriteJournal, MultiBlockPayloadsDecodeAtTheirPaddedOffsets)
     EXPECT_EQ(n * l.stripe_width, records[n].offset);
     EXPECT_TRUE(payloads[n].contents_equal(records[n].data));
     // The header alone locates the payload, for a local or remote read.
-    const auto& tag = entries[n].tag;
-    EXPECT_EQ(slot, tag.slot);
-    EXPECT_EQ(slot_offset, tag.slot_offset);
-    EXPECT_EQ(placements[n].offset, tag.slot_offset);
-    EXPECT_EQ(p2roundup<uint64_t>(lengths[n], record_alignment), tag.length);
-    EXPECT_EQ(n * l.stripe_width, tag.offset);
+    const auto& locator = entries[n].locator;
+    EXPECT_EQ(slot, locator.slot);
+    EXPECT_EQ(slot_offset, locator.slot_offset);
+    EXPECT_EQ(placements[n].offset, locator.slot_offset);
+    EXPECT_EQ(p2roundup<uint64_t>(lengths[n], record_alignment), locator.length);
+    EXPECT_EQ(n * l.stripe_width, locator.offset);
     EXPECT_EQ(eversion_t(1, n + 1), entries[n].header.version);
     EXPECT_EQ(0u, entries[n].header.data.length());
     ceph::bufferlist payload;
-    payload.substr_of(data, tag.slot_offset, tag.length);
-    EXPECT_TRUE(payloads[n].contents_equal(tag.decode_record(payload).data));
-    slot_offset += tag.length;
+    payload.substr_of(data, locator.slot_offset, locator.length);
+    EXPECT_TRUE(payloads[n].contents_equal(locator.decode_record(payload).data));
+    slot_offset += locator.length;
   }
   EXPECT_EQ(data.length(), slot_offset);
 }
@@ -2144,9 +2125,9 @@ TEST(ECWriteJournal, SlotHeadersMustTileTheSlotData)
   const uint64_t size = 8192 + record_alignment;
   const auto entries = decode_slot_headers(5, size, headers, pgid, 0);
   ASSERT_EQ(2u, entries.size());
-  EXPECT_EQ(5u, entries[1].tag.slot);
-  EXPECT_EQ(8192u, entries[1].tag.slot_offset);
-  EXPECT_EQ(record_alignment, entries[1].tag.length);
+  EXPECT_EQ(5u, entries[1].locator.slot);
+  EXPECT_EQ(8192u, entries[1].locator.slot_offset);
+  EXPECT_EQ(record_alignment, entries[1].locator.length);
   EXPECT_EQ(second.version, entries[1].header.version);
   // The data is shorter than the headers say, or runs past the last one.
   EXPECT_THROW(decode_slot_headers(5, size - record_alignment, headers, pgid, 0),

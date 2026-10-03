@@ -130,7 +130,8 @@ std::vector<SlotEntry> decode_slot_headers(uint64_t slot,
       throw ceph::buffer::malformed_input("EC journal slot: short payload");
     }
     if (pgid.contains(split_bits, entry.header.object)) {
-      entry.tag = LogTag{slot, offset, padded, entry.header.offset, header};
+      entry.locator = RecordLocator{slot, offset, padded, entry.header.offset,
+                                    header};
       entries.push_back(std::move(entry));
     }
   }
@@ -148,35 +149,13 @@ std::vector<Record> decode_slot_records(const ceph::bufferlist& data,
   for (const auto& entry : decode_slot_headers(0, data.length(), headers,
                                                pgid, split_bits)) {
     ceph::bufferlist payload;
-    payload.substr_of(data, entry.tag.slot_offset, entry.tag.length);
-    records.push_back(entry.tag.decode_record(payload));
+    payload.substr_of(data, entry.locator.slot_offset, entry.locator.length);
+    records.push_back(entry.locator.decode_record(payload));
   }
   return records;
 }
 
-void LogTag::encode(ceph::bufferlist& out) const
-{
-  ENCODE_START(2, 2, out);
-  encode(slot, out);
-  encode(slot_offset, out);
-  encode(length, out);
-  encode(offset, out);
-  encode(header, out);
-  ENCODE_FINISH(out);
-}
-
-void LogTag::decode(ceph::bufferlist::const_iterator& in)
-{
-  DECODE_START(2, in);
-  decode(slot, in);
-  decode(slot_offset, in);
-  decode(length, in);
-  decode(offset, in);
-  decode(header, in);
-  DECODE_FINISH(in);
-}
-
-Record LogTag::decode_record(const ceph::bufferlist& payload) const
+Record RecordLocator::decode_record(const ceph::bufferlist& payload) const
 {
   if (payload.length() != length) {
     throw ceph::buffer::malformed_input("EC journal fetch: short payload");
@@ -233,9 +212,10 @@ void Materialized::decode(ceph::bufferlist::const_iterator& in)
   DECODE_FINISH(in);
 }
 
-void ReplayFetches::add(const hobject_t& object, eversion_t version, LogTag tag)
+void ReplayFetches::add(const hobject_t& object, eversion_t version,
+                        RecordLocator locator)
 {
-  entries.push_back({object, version, tag});
+  entries.push_back({object, version, std::move(locator)});
   objects.insert(object);
 }
 
