@@ -351,7 +351,6 @@ void Journal::reindex(const StripeKey& key, Entry& entry)
     entry.oldest_version = std::min(entry.oldest_version, b->second.version);
   }
   entry.oldest = oldest->second.sequence;
-  entry.oldest_at = oldest->second.at;
   if (entry.flushing) {
     return;
   }
@@ -520,7 +519,6 @@ int Journal::append(const hobject_t& object, eversion_t version,
     // object, so every live record of a stripe sees the same size.
     ceph_assert(entry.object_size == object_size);
   }
-  const auto now = ceph::mono_clock::now();
   for (uint64_t off = 0; off < len; off += block_size) {
     ceph::bufferlist block;
     block.substr_of(data, off, block_size);
@@ -529,7 +527,7 @@ int Journal::append(const hobject_t& object, eversion_t version,
       release(entry, b->second); // latest append wins, the older is dead
       ++superseded;
     }
-    b->second = Block{std::move(block), version, sequence, segment.id, now,
+    b->second = Block{std::move(block), version, sequence, segment.id,
                       false, mtime};
     ++entry.undurable;
     ++live;
@@ -712,7 +710,6 @@ int Journal::adopt(const Record& record)
   used_bytes += bytes;
   used_payload_bytes += padded;
   ++used_records;
-  const auto now = ceph::mono_clock::now();
   for (uint64_t off = 0; off < len; off += block_size) {
     auto [b, fresh] = entry.blocks.try_emplace(offset - key.second + off);
     if (!fresh) {
@@ -725,7 +722,7 @@ int Journal::adopt(const Record& record)
     ceph::bufferlist block;
     block.substr_of(record.data, off, block_size);
     b->second = Block{std::move(block), record.version, sequence, segment.id,
-                      now, true, record.mtime};
+                      true, record.mtime};
     ++live;
     ++segment.live_blocks;
   }
@@ -763,7 +760,7 @@ Stripe Journal::take(StripeKey key)
 }
 
 std::optional<Stripe> Journal::begin_flush(
-  std::optional<ceph::mono_clock::time_point> partial_before,
+  bool every_partial,
   const Skip& skip, bool* deferred, std::optional<uint64_t> partial_upto)
 {
   if (deferred) {
@@ -781,23 +778,22 @@ std::optional<Stripe> Journal::begin_flush(
     }
     return take(key);
   }
-  // Adopted stripes (replay) flush regardless of age or pressure. One
+  // Adopted stripes (replay) flush regardless of pressure. One
   // adopted after a fetch or a recovery has a younger sequence than fresh
   // appends, so while any is resident the whole order is scanned.
   const bool replaying = adopting();
-  if (!partial_before && !partial_upto && !replaying) {
+  if (!every_partial && !partial_upto && !replaying) {
     return std::nullopt;
   }
   for (const auto& [sequence, key] : by_age) {
     auto& entry = index.at(key);
-    // by_age is in admission order, so both limits cut it at one point: a
-    // stripe past both is younger than everything after it. Strictly oldest
-    // first, too, so a stripe still waiting for an append commit holds the
-    // newer ones back (milliseconds).
+    // by_age is in admission order, so the reclaim bound cuts it at one
+    // point: a stripe past it is younger than everything after it. Strictly
+    // oldest first, too, so a stripe still waiting for an append commit
+    // holds the newer ones back (milliseconds).
     const bool reclaim = partial_upto && sequence <= *partial_upto;
-    const bool aged = partial_before && entry.oldest_at <= *partial_before;
     const bool adopted = replaying && adopted_stripe(entry);
-    if ((!reclaim && !aged && !adopted) || entry.undurable) {
+    if ((!every_partial && !reclaim && !adopted) || entry.undurable) {
       if (replaying) {
         continue;
       }
@@ -1027,14 +1023,6 @@ bool Journal::reclaim_ready() const
   const auto bound = reclaim_bound();
   const auto& [oldest, key] = *by_age.begin();
   return bound && oldest <= *bound && index.at(key).undurable == 0;
-}
-
-std::optional<ceph::mono_clock::time_point> Journal::oldest_at() const
-{
-  if (by_age.empty()) {
-    return std::nullopt;
-  }
-  return index.at(by_age.begin()->second).oldest_at;
 }
 
 } // namespace ECWriteJournal

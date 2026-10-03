@@ -187,13 +187,12 @@ struct ECBackend::JournalState final : md_config_obs_t {
   uint64_t slot_removals = 0;
   uint64_t open_segment = 0;
   ceph::mono_clock::time_point wake_at{};
-  uint64_t flush_ms; // maximum age of an incomplete stripe; 0 = pressure only
   uint64_t admitted = 0;
   uint64_t acked = 0;
   uint64_t full_stripes = 0;
   uint64_t partial_stripes = 0;
   uint64_t pressure_flushes = 0; // incomplete stripes flushed to reclaim a segment
-  uint64_t aged_flushes = 0;     // ... because older than flush_ms
+  uint64_t adopted_flushes = 0;  // ... because replay adopted their records
   uint64_t drain_flushes = 0;    // ... on drain
   uint64_t barrier_flushes = 0;  // ... ahead of an unsupported mutation
   uint64_t barrier_events = 0;   // unsupported writes that had to wait
@@ -252,10 +251,10 @@ struct ECBackend::JournalState final : md_config_obs_t {
   } timer{this};
 
   JournalState(ECBackend* backend, ghobject_t prefix,
-               ECWriteJournal::Limits limits, uint64_t flush_ms,
+               ECWriteJournal::Limits limits,
                unsigned max_flushes, std::vector<shard_id_t> holders)
     : backend(backend), journal(backend->switcher->coll, std::move(prefix), limits),
-      max_flushes(max_flushes), holders(std::move(holders)), flush_ms(flush_ms) {
+      max_flushes(max_flushes), holders(std::move(holders)) {
     drain_conf = backend->cct->_conf.get_val<bool>("osd_ec_journal_poc_drain");
     backend->cct->_conf.add_observer(this);
   }
@@ -1340,7 +1339,6 @@ void ECBackend::init_journal()
     add_holder(shard);
   }
   journal_state = std::make_unique<JournalState>(this, std::move(prefix), limits,
-    cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_flush_ms"),
     std::max<unsigned>(1,
       cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_max_flushes")),
     std::move(holders));
@@ -1465,7 +1463,7 @@ void ECBackend::dump_journal(Formatter* f) const
   f->dump_unsigned("full_stripes", s.full_stripes);
   f->dump_unsigned("partial_stripes", s.partial_stripes);
   f->dump_unsigned("pressure_flushes", s.pressure_flushes);
-  f->dump_unsigned("aged_flushes", s.aged_flushes);
+  f->dump_unsigned("adopted_flushes", s.adopted_flushes);
   f->dump_unsigned("drain_flushes", s.drain_flushes);
   f->dump_unsigned("barrier_flushes", s.barrier_flushes);
   f->dump_unsigned("barrier_events", s.barrier_events);
@@ -1547,18 +1545,17 @@ void ECBackend::pump_journal()
   });
 
   // Complete stripes flush whenever the flusher has capacity, without reads.
-  // Incomplete ones only when a write waits for the objects it touches
-  // (their stripes, first) or a drain for a clean journal (all of them),
-  // when the log has to reclaim its oldest segment (only the stripes pinning
-  // it), or once older than flush_ms: every extra record they gather before
-  // that is a read and a rewrite saved.
+  // Incomplete ones only when a read or a write waits for the objects it
+  // touches (their stripes, first) or a drain for a clean journal (all of
+  // them), when the log has to reclaim its oldest segment (only the stripes
+  // pinning it), or when replay adopted their records: every extra record
+  // they gather before that is a read and a rewrite saved.
   //
   // Each flush is an ordinary logged write of the object, submitted through
   // the PG (ec_journal_flush) like any other op, so torn flushes roll back,
   // lagging shards are recovered and the object's materialized attr records
   // what it covered. This runs from the journal timer only, never inside
   // another op's submission.
-  const auto now = ceph::mono_clock::now();
   // A stripe passed over for a scrub or a degraded object is retried soon.
   // One whose object waits for a replay fetch or for recovery is not: the
   // fetch or the recovery wakes the driver, and a failed fetch keeps the
@@ -1579,12 +1576,6 @@ void ECBackend::pump_journal()
   while (writeable && s.flushes_in_flight < s.max_flushes) {
     const auto reclaim_upto =
       clean ? std::optional<uint64_t>{} : s.journal.reclaim_bound();
-    std::optional<ceph::mono_clock::time_point> partial_before;
-    if (clean) {
-      partial_before = now;
-    } else if (s.flush_ms) {
-      partial_before = now - std::chrono::milliseconds(s.flush_ms);
-    }
     bool deferred = false;
     bool isolating = false; // ahead of a read or write of the stripe's object
     std::optional<ECWriteJournal::Stripe> stripe;
@@ -1611,7 +1602,7 @@ void ECBackend::pump_journal()
     }
     if (!stripe) {
       bool passed = false;
-      stripe = s.journal.begin_flush(partial_before, skip, &passed, reclaim_upto);
+      stripe = s.journal.begin_flush(clean, skip, &passed, reclaim_upto);
       deferred |= passed;
     }
     if (deferred && retry) {
@@ -1626,7 +1617,7 @@ void ECBackend::pump_journal()
     if (!full) {
       (clean ? s.drain_flushes :
        isolating ? s.barrier_flushes :
-       reclaim_upto ? s.pressure_flushes : s.aged_flushes)++;
+       reclaim_upto ? s.pressure_flushes : s.adopted_flushes)++;
     }
     // Contiguous runs of the stripe's live blocks, at object offsets.
     std::map<uint64_t, ceph::bufferlist> runs;
@@ -1667,18 +1658,10 @@ void ECBackend::pump_journal()
   }
   s.pumping = false;
   // Commits wake the driver for complete stripes and reclaim; the timer
-  // expires incomplete stripes and does the housekeeping described above.
+  // does the housekeeping described above.
   std::optional<std::chrono::milliseconds> wake;
-  if (s.flush_ms && s.flushes_in_flight < s.max_flushes) {
-    if (auto oldest = s.journal.oldest_at()) {
-      const auto remaining = *oldest + std::chrono::milliseconds(s.flush_ms) - now;
-      wake = remaining > decltype(remaining)::zero()
-        ? std::chrono::ceil<std::chrono::milliseconds>(remaining)
-        : journal_flush_retry_ms; // due, but not yet durable or deferred
-    }
-  }
   if (!s.journal.empty() || !s.barrier_objects.empty()) {
-    wake = std::min(wake.value_or(journal_housekeeping_ms), journal_housekeeping_ms);
+    wake = journal_housekeeping_ms;
   }
   if (!wake && s.slots_on_disk && get_parent()->pgb_is_primary()) {
     wake = journal_idle_check_ms;

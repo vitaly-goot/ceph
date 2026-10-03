@@ -90,18 +90,6 @@ options:
   see_also:
   - osd_ec_journal_poc_enable
   with_legacy: false
-- name: osd_ec_journal_poc_flush_ms
-  type: uint
-  level: dev
-  desc: Maximum age of an incomplete journaled stripe in milliseconds
-  long_desc: Complete stripes are written to the shards as soon as they are
-    durable in the journal. An incomplete stripe waits for more writes until it
-    is this old, until the journal must reclaim its oldest segment, or until a
-    drain. 0 disables the age limit (reclaim and drain only).
-  default: 100
-  min: 0
-  flags:
-  - startup
 - name: osd_ec_journal_poc_drain
   type: bool
   level: dev

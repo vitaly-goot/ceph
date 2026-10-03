@@ -112,14 +112,11 @@ class JournalTest : public testing::TestWithParam<unsigned> {
     }
     return ticket;
   }
-  // Flush any durable stripe, oldest first (the reclaim/drain policy).
-  static std::optional<ceph::mono_clock::time_point> any() {
-    return ceph::mono_clock::now();
-  }
+  // Flush any durable stripe, oldest first (the drain policy).
+  static constexpr bool any() { return true; }
   // Materialize one stripe: begin, simulated durable shard writes, finish.
-  std::optional<Stripe> flush(Journal& journal,
-      std::optional<ceph::mono_clock::time_point> partial_before = any()) {
-    auto stripe = journal.begin_flush(partial_before);
+  std::optional<Stripe> flush(Journal& journal, bool every_partial = any()) {
+    auto stripe = journal.begin_flush(every_partial);
     if (stripe) {
       EXPECT_EQ(0, journal.finish_flush(*stripe, 0));
     }
@@ -520,14 +517,14 @@ TEST_P(JournalTest, CompleteStripeIsReadyOnlyOnceDurableAndWithoutPolicy)
     tickets.push_back(append(j, off, 4096, 'a' + off / 4096, object(), false));
   }
   EXPECT_FALSE(j.flush_ready());
-  EXPECT_FALSE(j.begin_flush(std::nullopt));
+  EXPECT_FALSE(j.begin_flush(false));
   for (size_t n = 0; n + 1 < tickets.size(); ++n) {
     EXPECT_EQ(0, j.committed(tickets[n], 0));
     EXPECT_FALSE(j.flush_ready());
   }
   EXPECT_EQ(0, j.committed(tickets.back(), 0));
   EXPECT_TRUE(j.flush_ready());
-  auto stripe = j.begin_flush(std::nullopt); // no partial policy needed
+  auto stripe = j.begin_flush(false); // no partial policy needed
   ASSERT_TRUE(stripe);
   EXPECT_TRUE(stripe->full());
   EXPECT_TRUE(holes(*stripe).empty());
@@ -545,7 +542,7 @@ TEST_P(JournalTest, CompleteStripeIsReadyOnlyOnceDurableAndWithoutPolicy)
   EXPECT_EQ(0u, j.records());
 }
 
-TEST_P(JournalTest, IncompleteStripeWaitsForAgeReclaimOrDrain)
+TEST_P(JournalTest, IncompleteStripeWaitsForReclaimOrDrain)
 {
   auto j = journal();
   append(j, 0, 1024);
@@ -553,15 +550,12 @@ TEST_P(JournalTest, IncompleteStripeWaitsForAgeReclaimOrDrain)
   EXPECT_TRUE(j.partial_ready());
   EXPECT_FALSE(j.flush_ready());
   EXPECT_FALSE(j.pressure());
-  EXPECT_FALSE(j.begin_flush(std::nullopt));
-  const auto at = j.oldest_at();
-  ASSERT_TRUE(at);
-  EXPECT_FALSE(j.begin_flush(*at - std::chrono::seconds(1))); // not old enough
-  auto stripe = j.begin_flush(*at); // admitted at or before the cutoff
+  EXPECT_FALSE(j.begin_flush(false)); // no reclaim bound, no drain
+  auto stripe = j.begin_flush(true); // a drain takes it
   ASSERT_TRUE(stripe);
   EXPECT_FALSE(stripe->full());
   EXPECT_EQ(1024u, stripe->dirty_bytes());
-  EXPECT_FALSE(j.oldest_at()); // nothing resident while it flushes
+  EXPECT_FALSE(j.partial_ready()); // nothing resident while it flushes
   EXPECT_EQ(0, j.finish_flush(*stripe, 0));
   EXPECT_FALSE(j.dirty());
 }
@@ -606,7 +600,7 @@ TEST_P(JournalTest, RandomOrderDistinctWritesCompleteStripeWithoutBaseReads)
       expected.replace(slot * size, size, std::string(size, value));
     }
     EXPECT_TRUE(j.flush_ready());
-    auto stripe = j.begin_flush(std::nullopt);
+    auto stripe = j.begin_flush(false);
     ASSERT_TRUE(stripe);
     EXPECT_TRUE(stripe->full());
     EXPECT_TRUE(holes(*stripe).empty());
@@ -1048,13 +1042,13 @@ TEST_P(JournalTest, ReclaimFlushesOnlyStripesPinningTheOldestSegment)
 
   // Exactly the two stripes pinning A, oldest first, then nothing, although
   // three younger incomplete stripes are durable and pressure() still holds.
-  auto a0 = j.begin_flush(std::nullopt, {}, nullptr, bound);
-  auto a1 = j.begin_flush(std::nullopt, {}, nullptr, bound);
+  auto a0 = j.begin_flush(false, {}, nullptr, bound);
+  auto a1 = j.begin_flush(false, {}, nullptr, bound);
   ASSERT_TRUE(a0);
   ASSERT_TRUE(a1);
   EXPECT_EQ(0u, a0->offset);
   EXPECT_EQ(width(), a1->offset);
-  EXPECT_FALSE(j.begin_flush(std::nullopt, {}, nullptr, bound));
+  EXPECT_FALSE(j.begin_flush(false, {}, nullptr, bound));
   EXPECT_FALSE(j.reclaim_ready()); // the completions wake the flusher
   EXPECT_TRUE(j.pressure());
 
@@ -1074,13 +1068,13 @@ TEST_P(JournalTest, ReclaimFlushesOnlyStripesPinningTheOldestSegment)
   bound = j.reclaim_bound();
   ASSERT_TRUE(bound);
   EXPECT_EQ(t[3].sequence, *bound);
-  auto b0 = j.begin_flush(std::nullopt, {}, nullptr, bound);
-  auto b1 = j.begin_flush(std::nullopt, {}, nullptr, bound);
+  auto b0 = j.begin_flush(false, {}, nullptr, bound);
+  auto b1 = j.begin_flush(false, {}, nullptr, bound);
   ASSERT_TRUE(b0);
   ASSERT_TRUE(b1);
   EXPECT_EQ(2 * width(), b0->offset);
   EXPECT_EQ(3 * width(), b1->offset);
-  EXPECT_FALSE(j.begin_flush(std::nullopt, {}, nullptr, bound));
+  EXPECT_FALSE(j.begin_flush(false, {}, nullptr, bound));
   // What flushing by pressure() alone takes next: a stripe still gathering
   // records in C, flushed incomplete for no capacity gain.
   auto overreach = j.begin_flush(any());
@@ -1105,11 +1099,11 @@ TEST_P(JournalTest, ReclaimFollowsEachStripesOldestLiveRecord)
   // goes with the block it has gathered since.
   auto bound = j.reclaim_bound();
   ASSERT_TRUE(bound);
-  auto stripe = j.begin_flush(std::nullopt, {}, nullptr, bound);
+  auto stripe = j.begin_flush(false, {}, nullptr, bound);
   ASSERT_TRUE(stripe);
   EXPECT_EQ(0u, stripe->offset);
   EXPECT_EQ(2u, stripe->blocks.size());
-  EXPECT_FALSE(j.begin_flush(std::nullopt, {}, nullptr, bound));
+  EXPECT_FALSE(j.begin_flush(false, {}, nullptr, bound));
   EXPECT_EQ(0, j.finish_flush(*stripe, 0));
   EXPECT_FALSE(j.reclaim_bound()); // A is dead and released
   EXPECT_EQ(2u, j.segment_count());
@@ -1181,7 +1175,7 @@ TEST_P(JournalTest, SkippedCandidatesAreReportedAsDeferred)
   auto busy = [](const Journal::StripeKey& key) {
     return key.first == object("busy");
   };
-  auto stripe = j.begin_flush(std::nullopt, busy, &deferred);
+  auto stripe = j.begin_flush(false, busy, &deferred);
   EXPECT_FALSE(stripe); // the complete stripe is blocked, no partial policy
   EXPECT_TRUE(deferred);
   stripe = j.begin_flush(any(), busy, &deferred);
@@ -1277,7 +1271,7 @@ TEST_P(JournalTest, RandomOverwritesMatchReferenceAfterDrain)
     expected.at(oid).replace(off, size, std::string(size, value));
     if (n % 7 == 0) {
       // Complete stripes go out eagerly, whatever the age policy.
-      if (auto stripe = j.begin_flush(std::nullopt)) {
+      if (auto stripe = j.begin_flush(false)) {
         EXPECT_TRUE(stripe->full());
         apply(*stripe);
         ASSERT_EQ(0, j.finish_flush(*stripe, 0));
@@ -1333,7 +1327,7 @@ TEST_P(JournalTest, FullyCoveredTailNeedsNoBaseRead)
                         bytes(1024, 'x'), t, &ticket));
   ASSERT_EQ(0, j.committed(ticket, 0));
   EXPECT_TRUE(j.flush_ready()); // the whole tail is covered
-  auto stripe = j.begin_flush(std::nullopt);
+  auto stripe = j.begin_flush(false);
   ASSERT_TRUE(stripe);
   EXPECT_TRUE(stripe->full());
   EXPECT_TRUE(holes(*stripe).empty());
@@ -1358,7 +1352,7 @@ TEST_P(JournalTest, MergedWriteFillsEveryBlockItCovers)
   append(j, 0, 4096, 'a');
   append(j, 12288, width() - 12288, 'z'); // the rest, merged again
   EXPECT_TRUE(j.flush_ready());
-  auto stripe = j.begin_flush(std::nullopt);
+  auto stripe = j.begin_flush(false);
   ASSERT_TRUE(stripe);
   EXPECT_TRUE(stripe->full());
   EXPECT_EQ(std::string(4096, 'a') + std::string(4096, 'm') +
@@ -1385,7 +1379,7 @@ TEST_P(JournalTest, ObjectFlushTakesOnlyThatObjectsStripesAtAnyAge)
   EXPECT_TRUE(j.dirty(b));
   EXPECT_FALSE(j.dirty(object("c")));
   EXPECT_TRUE(j.object_ready(a));
-  EXPECT_FALSE(j.begin_flush(std::nullopt)); // too young for age or reclaim
+  EXPECT_FALSE(j.begin_flush(false)); // no reclaim bound, no drain
 
   std::vector<Stripe> taken;
   while (auto stripe = j.begin_flush_object(a)) {
@@ -1675,7 +1669,7 @@ TEST(ECWriteJournal, ReleasedSlotIsReusedAndReset)
   EXPECT_NE(a.slot, c.slot);
   // Flush both stripes of the first segment: it dies and its slot is free.
   for (int i = 0; i < 2; ++i) {
-    auto stripe = j.begin_flush(ceph::mono_clock::now());
+    auto stripe = j.begin_flush(true);
     ASSERT_TRUE(stripe);
     ASSERT_EQ(0, j.finish_flush(*stripe, 0));
   }
@@ -1791,7 +1785,7 @@ TEST(ECWriteJournal, AdoptKeepsRecordsInTheirSlotsAndFreesThemAsTheyFlush)
   ASSERT_EQ(0, j.committed(ticket, 0));
   // Adopted stripes flush without a drain, pressure or age, oldest first.
   EXPECT_TRUE(j.adopted_ready());
-  auto first = j.begin_flush(std::nullopt);
+  auto first = j.begin_flush(false);
   ASSERT_TRUE(first);
   EXPECT_EQ(0u, first->offset);
   EXPECT_EQ(std::string(1024, 'o'), first->blocks.at(0).to_str());
@@ -1801,14 +1795,14 @@ TEST(ECWriteJournal, AdoptKeepsRecordsInTheirSlotsAndFreesThemAsTheyFlush)
   // Slot 0 held nothing else: free again. Slot 1 still holds other.
   EXPECT_TRUE(j.adopting());
   EXPECT_EQ(1u, j.adopted_segments());
-  auto second = j.begin_flush(std::nullopt);
+  auto second = j.begin_flush(false);
   ASSERT_TRUE(second);
   EXPECT_EQ(l.stripe_width, second->offset);
   ASSERT_EQ(0, j.finish_flush(*second, 0));
   EXPECT_FALSE(j.adopting());
   EXPECT_FALSE(j.adopted_ready());
   // The fresh stripe is not affected: it waits for age or pressure.
-  EXPECT_FALSE(j.begin_flush(std::nullopt));
+  EXPECT_FALSE(j.begin_flush(false));
   EXPECT_TRUE(j.dirty(object(), 2 * l.stripe_width, l.stripe_width));
   // The next segment takes the lowest slot freed, and resets it.
   j.seal();
@@ -1860,7 +1854,7 @@ TEST(ECWriteJournal, HeldSlotsStayOutOfUseUntilReleasedOrAdopted)
   EXPECT_TRUE(j.adopting());
   EXPECT_EQ(-EAGAIN, j.check_append(object(), 1024));
   EXPECT_TRUE(j.adopted_ready());
-  auto stripe = j.begin_flush(std::nullopt);
+  auto stripe = j.begin_flush(false);
   ASSERT_TRUE(stripe);
   EXPECT_EQ(3 * l.stripe_width, stripe->offset);
   ASSERT_EQ(0, j.finish_flush(*stripe, 0));
@@ -1895,7 +1889,7 @@ TEST_P(JournalTest, AdoptedRecordsCountAgainstTheBudget)
   EXPECT_EQ(8 * record_bytes(), j.bytes());
   EXPECT_EQ(-EAGAIN, j.check_append(object(), 1024));
   EXPECT_TRUE(j.pressure());
-  auto stripe = j.begin_flush(std::nullopt);
+  auto stripe = j.begin_flush(false);
   ASSERT_TRUE(stripe);
   EXPECT_EQ(0u, stripe->offset);
   ASSERT_EQ(0, j.finish_flush(*stripe, 0));

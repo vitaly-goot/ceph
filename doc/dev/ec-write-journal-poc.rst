@@ -134,17 +134,21 @@ Flush policy
 The unit of flush is a stripe, not a segment. ``begin_flush()`` picks:
 
 1. any complete, durable stripe: it needs no reads, so it goes out as soon as
-   the flusher is idle, whatever the age policy;
+   the flusher is idle;
 2. otherwise, and only when the driver asks for incomplete stripes, the
    durable incomplete stripe with the oldest live record, strictly oldest
    first. That is also the order that frees the oldest segment.
 
 The driver asks for incomplete stripes when the log has to reclaim its
-oldest segment, when an unsupported mutation waits for the objects it touches
-(then all of their stripes, ahead of anything else) or a drain for a clean
-journal (then all of them), and when a stripe is older than
-``osd_ec_journal_poc_flush_ms`` (0 disables that age limit). Candidates
-blocked by a scrub range or a degraded object are passed over.
+oldest segment, when a read or an unsupported mutation waits for the objects
+it touches (then all of their stripes, ahead of anything else), on a drain
+for a clean journal (then all of them), and for the stripes replay adopted.
+Candidates blocked by a scrub range or a degraded object are passed over.
+
+There is no age limit. An earlier ``osd_ec_journal_poc_flush_ms`` (default
+100 ms) also flushed an incomplete stripe once its oldest record was that
+old; every measurement ran it at one hour, that is off, and the reasons
+above cover what it was for, so the option and its timer were removed.
 
 Reclaim is bounded by sequence, not just triggered by ``pressure()``.
 ``Journal::reclaim_bound()`` is the newest sequence of the oldest segment that
@@ -430,7 +434,7 @@ An adopted record stays in its slot: the journal keeps a closed segment per
 slot for them, charged to the budget like appends and placed ahead of
 anything this interval appends, and reuses the slot once its adopted
 records have all flushed, as it does any other segment's. Adopted stripes
-flush first, without waiting for age or pressure, and the PG admits new
+flush first, without waiting for pressure, and the PG admits new
 writes into the free slots as soon as the listings and fetches below are in
 (``replaying`` clears; ``replay_listed_ms`` and ``replay_admit_ms`` in the
 PG query report the delays), instead of after the whole backlog. A slot
@@ -562,8 +566,8 @@ PG references and schedules work without recursive completion callbacks.
 An append commit wakes the driver only when it makes a flush possible that
 was not possible before it (a complete stripe became durable, or the oldest
 stripe of a reclaim/drain did). Flush commits also wake progress.
-The timer expires incomplete stripes when ``flush_ms`` is set and, while
-segments exist, wakes once a second for housekeeping: a drain requested
+While segments exist the timer wakes once a second for housekeeping: a
+drain requested
 through the config observer (which cannot take the PG lock) or a deferred
 stripe must not wait for the next client write.
 
@@ -597,8 +601,6 @@ Startup settings (all relevant OSDs must run the modified binary):
 * ``osd_ec_journal_poc_max_records``: 8192 records per PG in the log. Size it
   for ``max_bytes`` worth of the smallest record, or it becomes the pressure
   trigger instead of the segment count.
-* ``osd_ec_journal_poc_flush_ms``: 100 ms maximum age of an incomplete
-  stripe; 0 leaves incomplete stripes to pressure and drain only.
 
 The pool must use ``allow_ec_overwrites`` and ``allow_ec_optimizations`` and a
 4+3, 8+3 or 12+3 profile with 4096-byte chunks. Prefill the test data with journaling
@@ -634,7 +636,7 @@ encoded headers and keys), ``segments``, ``live_blocks``/``live_bytes`` (index
 memory), ``superseded_blocks``, ``pressure``, ``reclaiming`` (a reclaim
 bound is set), ``admitted``, ``acked``,
 ``full_stripes``, ``partial_stripes``, the reason for each incomplete flush
-(``pressure_flushes``, ``aged_flushes``, ``drain_flushes``,
+(``pressure_flushes``, ``adopted_flushes``, ``drain_flushes``,
 ``barrier_flushes``; until the object-scoped barrier, barrier flushes were
 counted as ``pressure_flushes``), ``barrier_events`` (unsupported mutations
 that had to wait for journaled data), ``barrier_objects`` (objects such a
@@ -672,7 +674,7 @@ Validation
 Normal core build target: ``unittest_ec_write_journal``. It links the small journal
 component rather than the entire OSD backend. The tests cover all three geometries,
 both write sizes, exact ObjectStore record encoding, commit-before-flush,
-eager complete stripes, age/pressure/drain policies for incomplete ones,
+eager complete stripes, pressure and drain policies for incomplete ones,
 strict oldest-first order, supersede accounting and cross-segment coalescing,
 segment death by flush or overwrite, writes arriving while their stripe
 flushes, capacity, skipped candidates, reset handling, failure handling and a

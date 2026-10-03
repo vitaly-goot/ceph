@@ -14,7 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include "common/ceph_time.h"
 #include "common/hobject.h"
 #include "include/utime.h"
 #include "os/Transaction.h"
@@ -29,8 +28,8 @@ namespace ECWriteJournal {
 // log) and an in-memory index of live 1 KiB blocks folded per stripe (latest
 // append wins; a superseded block is dead immediately). Flushing is decided
 // per stripe, not per segment: a complete stripe can be materialized without
-// reads at any time, an incomplete one when it is old enough or when the log
-// must reclaim its oldest segment.
+// reads at any time, an incomplete one when the log must reclaim its oldest
+// segment, when a read or a write waits for its object, or on a drain.
 //
 // Each segment occupies one of max_segments fixed slot objects. A record is
 // placed once (slot, offset) and the caller writes the same bytes into every
@@ -303,17 +302,17 @@ class Journal {
   // Choose the next stripe to materialize and mark it flushing. A complete,
   // durable stripe is always eligible and needs no base reads. Otherwise a
   // durable incomplete stripe is chosen, oldest first (which is also the order
-  // that frees the oldest segment), if its oldest live record was admitted at
-  // or before partial_before, or has a sequence at or below partial_upto.
+  // that frees the oldest segment), if every_partial is set (a drain) or its
+  // oldest live record has a sequence at or below partial_upto.
   // Candidates for which skip() returns true (scrub, degraded object) are
   // passed over; *deferred reports that at least one was. Only records whose
   // append committed are ever exposed; a later append to a flushing stripe
   // stays journaled.
   std::optional<Stripe> begin_flush(
-    std::optional<ceph::mono_clock::time_point> partial_before,
+    bool every_partial,
     const Skip& skip = {}, bool* deferred = nullptr,
     std::optional<uint64_t> partial_upto = std::nullopt);
-  // Every durable stripe of one object, complete or not, regardless of age:
+  // Every durable stripe of one object, complete or not:
   // an unsupported mutation of the object waits for its buffered data only,
   // and other objects' stripes keep gathering records meanwhile. With a byte
   // range, only the stripes overlapping it (a read waits for those).
@@ -350,7 +349,7 @@ class Journal {
   void release_hold(uint64_t slot);
   uint64_t held_slots() const { return holds.size(); }
   // A durable stripe with an adopted record is waiting: adopted stripes
-  // flush without a drain, pressure or age (begin_flush).
+  // flush without a drain or pressure (begin_flush).
   bool adopted_ready() const;
   uint64_t slot_count() const { return limits.max_segments; }
 
@@ -410,8 +409,6 @@ class Journal {
   std::optional<uint64_t> reclaim_bound() const;
   // A durable incomplete stripe within reclaim_bound() is waiting.
   bool reclaim_ready() const;
-  // Admission time of the oldest live record, for an age-based flush timer.
-  std::optional<ceph::mono_clock::time_point> oldest_at() const;
   int error() const { return failed; }
 
  private:
@@ -445,7 +442,6 @@ class Journal {
     eversion_t version;
     uint64_t sequence = 0;
     uint64_t segment = 0;
-    ceph::mono_clock::time_point at;
     bool durable = false;
     utime_t mtime;
   };
@@ -456,7 +452,6 @@ class Journal {
     uint32_t undurable = 0;
     bool flushing = false;
     uint64_t oldest = 0; // sequence of the oldest live block
-    ceph::mono_clock::time_point oldest_at;
     // Lowest version among the live blocks (adopted records need not
     // arrive in version order), kept by reindex() for oldest_version().
     eversion_t oldest_version;

@@ -919,9 +919,9 @@ TEST_P(JournalFlushTest, JournalGenerationsUseProductionShardAssembly)
     }
     // Incomplete after 65 random 1 KiB writes at 8+3/12+3, sometimes complete
     // at 4+3: either way a reclaim/drain flush takes the oldest stripe.
-    auto stripe = journal.begin_flush(ceph::mono_clock::now());
+    auto stripe = journal.begin_flush(true);
     ASSERT_TRUE(stripe);
-    EXPECT_FALSE(journal.oldest_at()); // the only stripe is flushing
+    EXPECT_FALSE(journal.partial_ready()); // the only stripe is flushing
     auto& s = *stripe;
     auto plan = ECWriteJournal::plan_flush(s, sinfo, shards, false, 1);
     ECUtil::shard_extent_map_t base(&sinfo);
@@ -944,7 +944,7 @@ TEST_P(JournalFlushTest, JournalGenerationsUseProductionShardAssembly)
     EXPECT_EQ(expected, physical);
     ASSERT_EQ(0, journal.finish_flush(s, 0));
     EXPECT_FALSE(journal.dirty());
-    EXPECT_FALSE(journal.begin_flush(ceph::mono_clock::now()));
+    EXPECT_FALSE(journal.begin_flush(true));
   }
   // Everything is on the shards; sealing releases the dead log.
   journal.seal();
