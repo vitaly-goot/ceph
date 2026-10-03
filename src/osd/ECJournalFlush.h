@@ -25,8 +25,6 @@ Limits read_limits(const Config& conf, uint64_t stripe_width)
     "osd_ec_journal_poc_segment_bytes");
   limits.max_bytes = conf.template get_val<Option::size_t>(
     "osd_ec_journal_poc_max_bytes");
-  limits.max_records = conf.template get_val<uint64_t>(
-    "osd_ec_journal_poc_max_records");
   limits.max_segments = limits.segment_bytes
     ? std::max(uint64_t(1), limits.max_bytes / limits.segment_bytes) : 0;
   return limits;

@@ -778,7 +778,10 @@ TEST_P(JournalTest, PressureWhenTheLastSegmentOpensAndFlushesOldestFirst)
 TEST_P(JournalTest, BackpressureBudgetReleasedWhenTheSegmentDies)
 {
   auto l = limits();
-  l.max_records = 1;
+  // Room for one record: its padded payload, header and key take more than
+  // half of the single 8 KiB segment.
+  l.segment_bytes = l.max_bytes = 8192;
+  l.max_segments = 1;
   Journal j(coll_t(), prefix(), l);
   append(j, 0, 1024);
   EXPECT_TRUE(j.pressure());

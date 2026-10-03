@@ -93,7 +93,7 @@ Implemented component
   is shared across all holders, with no per-record slot xattr update.
 * Separate append and durable-commit states. Merely constructing/queueing a
   transaction does not make records eligible for flushing or client ACK.
-* Bounded encoded bytes, record count, segment size and segment count. Capacity
+* Bounded encoded bytes, segment size and segment count. Capacity
   is released when a closed segment holds no live record and all its appends
   are durable, not on client ACK or flush submission. A caller receiving ``-EAGAIN`` must flush and apply backpressure;
   it must not bypass the journal with a newer write of a stripe the journal
@@ -597,10 +597,10 @@ Startup settings (all relevant OSDs must run the modified binary):
   journaled and how large each reclaim is.
 * ``osd_ec_journal_poc_max_bytes``: 16 MiB per-PG total encoded log budget,
   live and dead records alike. Memory holds live blocks only, up to about
-  96% of this per primary PG with 4 KiB records.
-* ``osd_ec_journal_poc_max_records``: 8192 records per PG in the log. Size it
-  for ``max_bytes`` worth of the smallest record, or it becomes the pressure
-  trigger instead of the segment count.
+  96% of this per primary PG with 4 KiB records. It is the only cap on the
+  log's contents: a separate record-count limit
+  (``osd_ec_journal_poc_max_records``) was removed, because the smallest
+  record already takes one padded 4 KiB block and the byte budget bound first.
 
 The pool must use ``allow_ec_overwrites`` and ``allow_ec_optimizations`` and a
 4+3, 8+3 or 12+3 profile with 4096-byte chunks. Prefill the test data with journaling

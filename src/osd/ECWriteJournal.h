@@ -215,7 +215,6 @@ struct Limits {
   uint64_t stripe_width = 8 * 4096;
   uint64_t segment_bytes = 4 * 1024 * 1024;
   uint64_t max_bytes = 16 * 1024 * 1024;
-  uint64_t max_records = 8192;
   uint64_t max_segments = 4;
 
   bool valid() const;
@@ -356,8 +355,8 @@ class Journal {
   ghobject_t slot_object(uint64_t slot, shard_id_t shard) const;
   // prefix's shard copy of a resident segment's slot.
   ghobject_t segment_object(uint64_t segment) const;
-  // Bytes of resident segments (padded payloads plus headers and keys) and
-  // record count, live or dead. This is the budget the limits bound; capacity
+  // Bytes of resident segments (padded payloads plus headers and keys), the
+  // budget max_bytes bounds, and their record count, live or dead. Capacity
   // returns when a segment is dead and its appends are durable.
   uint64_t bytes() const { return used_bytes; }
   uint64_t payload_bytes() const { return used_payload_bytes; }

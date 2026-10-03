@@ -17,7 +17,6 @@ struct JournalConfig {
   std::map<std::string, Option::value_t> values = {
     {"osd_ec_journal_poc_segment_bytes", Option::size_t{8192}},
     {"osd_ec_journal_poc_max_bytes", Option::size_t{32768}},
-    {"osd_ec_journal_poc_max_records", uint64_t{128}},
   };
   template<typename T> T get_val(const std::string& key) const {
     return std::get<T>(values.at(key));

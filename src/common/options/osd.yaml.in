@@ -50,14 +50,6 @@ options:
   min: 8_K
   flags:
   - startup
-- name: osd_ec_journal_poc_max_records
-  type: uint
-  level: dev
-  desc: Maximum retained journal records per PG
-  default: 8192
-  min: 1
-  flags:
-  - startup
 - name: osd_ec_journal_poc_max_flushes
   type: uint
   level: dev

@@ -275,7 +275,7 @@ bool Limits::valid() const
 {
   return stripe_width && stripe_width % 4096 == 0 &&
     segment_bytes >= record_alignment && segment_bytes <= max_bytes &&
-    max_records && max_segments;
+    max_segments;
 }
 
 Journal::Journal(coll_t collection, ghobject_t prefix, Limits limits)
@@ -434,7 +434,7 @@ int Journal::room_for(uint64_t bytes, bool* rotate) const
   }
   const bool next = segments.empty() || segments.back().state != State::open ||
     bytes > limits.segment_bytes - segments.back().bytes;
-  if (used_records == limits.max_records || bytes > limits.max_bytes - used_bytes) {
+  if (bytes > limits.max_bytes - used_bytes) {
     return -EAGAIN;
   }
   if (next && (segments.size() == limits.max_segments || free_slots.empty())) {
@@ -979,7 +979,6 @@ bool Journal::pressure() const
 {
   return !segments.empty() &&
     (segments.size() >= limits.max_segments ||
-     used_records >= limits.max_records ||
      used_bytes + limits.segment_bytes > limits.max_bytes);
 }
 
@@ -992,20 +991,17 @@ std::optional<uint64_t> Journal::reclaim_bound() const
   // pending append commit. Count its space as returned, or every pass would
   // reach past the segment it frees.
   uint64_t bytes = used_bytes;
-  uint64_t records = used_records;
   uint64_t count = segments.size();
   const Segment* pinned = nullptr;
   for (const auto& segment : segments) {
     if (segment.state != State::open && segment.live_blocks == 0) {
       bytes -= segment.bytes;
-      records -= segment.entries.size();
       --count;
     } else if (!pinned && segment.live_blocks) {
       pinned = &segment;
     }
   }
   const bool short_of_room = count >= limits.max_segments ||
-    records >= limits.max_records ||
     bytes + limits.segment_bytes > limits.max_bytes;
   if (!short_of_room || !pinned || pinned->entries.empty()) {
     return std::nullopt;
