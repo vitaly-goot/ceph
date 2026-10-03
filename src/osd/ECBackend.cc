@@ -87,10 +87,6 @@ struct ECBackend::JournalState final : md_config_obs_t {
   // osd_ec_journal_poc_drain is a runtime option; a config observer keeps
   // it off the per-op path (no ConfigProxy lock or key lookup per pump).
   std::atomic<bool> drain_conf{false};
-  // osd_ec_journal_poc_admit_wpf, the same way: 0 journals every eligible
-  // write; N journals only stripes written again within the writes the log
-  // holds divided by N (admission control, journal_admit).
-  std::atomic<uint64_t> admit_wpf_conf{0};
   ECWriteJournal::DrainWaiters shutdown_drain;
   // Stripes are independent: each flush is its own EC write of one stripe,
   // and the journal hands out a different stripe per begin_flush. Reclaiming
@@ -206,26 +202,13 @@ struct ECBackend::JournalState final : md_config_obs_t {
   uint64_t flushed_bytes = 0;
   uint64_t pressure_events = 0;  // journal writes that waited for room
 
-  // Admission control. A durable record costs a write on every holder, so
-  // journaling only pays for a stripe that collects enough writes before its
-  // flush to share it. A stripe written again within `window` writes of the
-  // PG (HotStripes) is expected to: about admit_wpf writes per flush once
-  // the log is full, since the log holds log_writes records.
-  uint64_t admit_wpf = 0;     // applied value of admit_wpf_conf
-  uint64_t log_writes = 0;    // 4 KiB writes the log holds (records)
-  ECWriteJournal::HotStripes hot;
+  // Admission (journal_admit): every eligible write is journaled, except a
+  // whole aligned stripe that has no records and a write to a stripe that
+  // has none while the log is full.
   uint64_t admit_live = 0;    // journaled: the stripe already had records
-  uint64_t admit_hot = 0;     // journaled: hot stripe, or admission off
-  uint64_t bypass_cold = 0;   // direct EC write: cold stripe
-  uint64_t bypass_full = 0;   // ... whole stripe, nothing to read
+  uint64_t admit_new = 0;     // journaled: the stripe had none
+  uint64_t bypass_full = 0;   // direct EC write: whole stripe, nothing to read
   uint64_t bypass_room = 0;   // ... log full, stripe clean: no wait
-  void apply_admission_conf() {
-    const auto wpf = admit_wpf_conf.load();
-    if (wpf != admit_wpf) {
-      admit_wpf = wpf;
-      hot.set_window(wpf ? std::max<uint64_t>(1, log_writes / wpf) : 0);
-    }
-  }
 
   // A flush that must wait for the flusher, or a drain, is woken by the
   // append commit that makes it possible; everything else by the timer.
@@ -274,13 +257,6 @@ struct ECBackend::JournalState final : md_config_obs_t {
     : backend(backend), journal(backend->switcher->coll, std::move(prefix), limits),
       max_flushes(max_flushes), holders(std::move(holders)), flush_ms(flush_ms) {
     drain_conf = backend->cct->_conf.get_val<bool>("osd_ec_journal_poc_drain");
-    admit_wpf_conf =
-      backend->cct->_conf.get_val<uint64_t>("osd_ec_journal_poc_admit_wpf");
-    // 4 KiB records of an RBD data object ("rbd_data.<image>.<object>").
-    const hobject_t typical(object_t(std::string(38, 'x')), "", CEPH_NOSNAP, 0,
-                            0, "");
-    log_writes = journal.capacity(typical, ECWriteJournal::record_alignment);
-    apply_admission_conf();
     backend->cct->_conf.add_observer(this);
   }
   ~JournalState() override {
@@ -288,14 +264,13 @@ struct ECBackend::JournalState final : md_config_obs_t {
     backend->cct->_conf.remove_observer(this);
   }
   std::vector<std::string> get_tracked_keys() const noexcept override {
-    return {"osd_ec_journal_poc_drain", "osd_ec_journal_poc_admit_wpf"};
+    return {"osd_ec_journal_poc_drain"};
   }
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set<std::string>&) override {
     // Config thread, no PG lock: only the atomic. pump_journal picks it up
     // on the next submit, commit or timer wake.
     drain_conf = conf.get_val<bool>("osd_ec_journal_poc_drain");
-    admit_wpf_conf = conf.get_val<uint64_t>("osd_ec_journal_poc_admit_wpf");
   }
 };
 
@@ -1500,11 +1475,8 @@ void ECBackend::dump_journal(Formatter* f) const
   f->dump_unsigned("deferred_flushes", s.deferred_flushes);
   f->dump_unsigned("flushed_logical_bytes", s.flushed_bytes);
   f->dump_unsigned("pressure_events", s.pressure_events);
-  f->dump_unsigned("admit_wpf", s.admit_wpf);
-  f->dump_unsigned("admit_window", s.hot.window());
   f->dump_unsigned("admit_live", s.admit_live);
-  f->dump_unsigned("admit_hot", s.admit_hot);
-  f->dump_unsigned("bypass_cold", s.bypass_cold);
+  f->dump_unsigned("admit_new", s.admit_new);
   f->dump_unsigned("bypass_full", s.bypass_full);
   f->dump_unsigned("bypass_room", s.bypass_room);
   f->dump_bool("replaying", s.replaying);
@@ -1849,23 +1821,20 @@ PGBackend::ec_journal_admission_t ECBackend::journal_admit(
   auto& s = *journal_state;
   if (journal_admission_open() && ECWriteJournal::candidate_write(oid, ops,
         obs, snapset, snap_seq, sinfo.get_stripe_width())) {
-    // Admission control. A stripe that already has records takes every
-    // later write too: nothing may overtake journaled data. Otherwise the
-    // journal takes only a hot stripe (written again within the window, so
-    // likely to share its flush among enough writes to pay for the copies)
-    // and never a whole aligned stripe, which needs no read anyway. With
-    // osd_ec_journal_poc_admit_wpf = 0 it takes every eligible write.
-    s.apply_admission_conf();
+    // Every eligible write is journaled, with two exceptions. A whole
+    // aligned stripe that has no records goes straight to the EC write path,
+    // which needs no read for it either; and so does a write that finds the
+    // log full while its stripe has no records. A stripe that already has
+    // records takes every later write: nothing may overtake journaled data.
     const uint64_t width = sinfo.get_stripe_width();
     const auto& extent = ops.front().op.extent;
     const uint64_t stripe = extent.offset / width * width;
     const bool live = s.journal.dirty(oid, stripe, width);
-    const bool hot = s.hot.touch(oid, stripe);
     const bool whole = extent.offset == stripe && extent.length == width;
-    if (live || !s.admit_wpf || (hot && !whole)) {
+    if (live || !whole) {
       const int r = s.journal.check_append(oid, extent.length);
       if (r == 0) {
-        ++(live ? s.admit_live : s.admit_hot);
+        ++(live ? s.admit_live : s.admit_new);
         if (!s.replay_admit_ms &&
             s.activated_at != ceph::mono_clock::time_point{}) {
           s.replay_admit_ms = std::chrono::duration<double, std::milli>(
@@ -1873,7 +1842,7 @@ PGBackend::ec_journal_admission_t ECBackend::journal_admit(
         }
         return admission::journal;
       }
-      if (r == -EAGAIN && !live && s.admit_wpf && !s.replay_blocked(oid)) {
+      if (r == -EAGAIN && !live && !s.replay_blocked(oid)) {
         // The log is full, but none of this stripe is in it: the direct
         // write costs less than waiting for room.
         ++s.bypass_room;
@@ -1895,7 +1864,7 @@ PGBackend::ec_journal_admission_t ECBackend::journal_admit(
       // The direct EC write. Its stripe holds no record, so it overtakes
       // nothing; the object's other stripes keep theirs, and the write marks
       // only its own stripe materialized (PrimaryLogPG::finish_ctx).
-      ++(whole ? s.bypass_full : s.bypass_cold);
+      ++s.bypass_full;
       return admission::classic;
     }
   }

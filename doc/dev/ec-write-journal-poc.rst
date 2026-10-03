@@ -9,7 +9,7 @@ Initial implementation on ``wip/ec-journal-poc``, based on
 
 Core committed as ``35d449d1881``; initial backend checkpoint ``a582e6e955d``.
 The implementation connects it to the
-optimized classic EC backend: admission (with per-stripe admission control),
+optimized classic EC backend: admission,
 durable append, metadata commit, timer/pressure drain, deferred data writes,
 trim, and PG-query counters.
 It is disabled by default and restricted to an explicitly configured pool.
@@ -24,8 +24,8 @@ size-option variants, submitted object-state snapshots, log admission barriers,
 flush readiness and journal-to-production-assembler generations. Backend,
 planner and OSD-shutdown translation units are checked with ``-Werror``.
 These checks do not establish runtime correctness of the driver or shutdown.
-Current focused result: **215 tests pass with GCC 13, ASan and UBSan**,
-including admission control and detached record headers. The production
+Current focused result: **211 tests pass with GCC 13, ASan and UBSan**,
+including detached record headers. The production
 backend, planner, generator, journal core, PrimaryLogPG and OSD translation
 units pass the focused warning-as-error compile check. These are not
 measurements of BlueStore write amplification or end-to-end throughput.
@@ -204,13 +204,12 @@ librbd makes by merging adjacent ones) of an existing head object without
 snapshot state, leaving its size unchanged, while the acting set holds every
 copy and no drain is requested (``ECWriteJournal::candidate_write``, which
 predicts what ``eligible_overwrite`` accepts at submission). Admission
-control (below) decides which eligible writes the journal takes; one it
-sends to the ordinary EC path writes a stripe that holds no record and runs
-at once, beside the object's journaled stripes. Any other write of an object
-that still has journaled stripes waits in do_op until they have flushed,
-complete or not; a write the journal has to take (its stripe holds records,
-or admission control is off) that finds the log full waits there too, until
-a segment is released. Later ops of a waiting object queue behind it (reads
+(below) decides which eligible writes the journal takes; one it sends to the
+ordinary EC path writes a stripe that holds no record and runs at once,
+beside the object's journaled stripes. Any other write of an object that
+still has journaled stripes waits in do_op until they have flushed, complete
+or not; a write the journal has to take (its stripe holds records) that
+finds the log full waits there too, until a segment is released. Later ops of a waiting object queue behind it (reads
 included), so an object's ops keep their order. Waiting ops are requeued by
 ``ec_journal_kick`` once their object is clean or room has come back, and on
 an interval change.
@@ -245,52 +244,21 @@ rolls a record back: a record of a write that was never acknowledged is
 applied at replay like any other unless a flush or a later direct write
 covered it, which is what the client's resend writes again anyway.
 
-Admission control
-~~~~~~~~~~~~~~~~~
+Admission
+~~~~~~~~~
 
-A journaled write costs a durable record on every holder (m + 1 copies by
-default) besides its share of the stripe's later flush, so the journal pays
-off only for stripes that collect several writes before they flush. On 8+3
-with four copies and the previous inline-header format it beat direct Fast EC
-writes only while a stripe collected
-roughly ten or more writes per flush; with eleven 96 GiB volumes of uniform
-random 4 KiB writes it ran at 0.70x Fast EC. ``ECBackend::journal_admit``
-therefore decides, for each eligible write:
+``ECBackend::journal_admit`` decides, for each eligible write:
 
 1. A write of a stripe that is resident or flushing in the journal
    (``Journal::dirty(object, stripe, width)``) is journaled (``admit_live``):
-   nothing may overtake journaled data.
-2. Otherwise, with ``osd_ec_journal_poc_admit_wpf`` = 0, it is journaled
-   (counted in ``admit_hot``), as every eligible write was before.
-3. Otherwise a whole aligned stripe goes direct (``bypass_full``): it needs
+   nothing may overtake journaled data. If the log is full it waits for room.
+2. Otherwise a whole aligned stripe goes direct (``bypass_full``): it needs
    no read, so the journal saves nothing.
-4. Otherwise it is journaled if its stripe is hot (``admit_hot``) and goes
-   direct if it is cold (``bypass_cold``).
+3. Otherwise it is journaled (``admit_new``), unless the log is full: then it
+   goes direct instead of waiting for room (``bypass_room``).
 
-A write that rule 4 journals but that finds the log full goes direct instead
-of waiting for room (``bypass_room``); under rules 1 and 2 it waits as
-before. No write of an object whose records replay has yet to fetch or judge
-goes direct.
-
-The recency table, ``ECWriteJournal::HotStripes``, records the stripe
-(object name and namespace, stripe offset) of every eligible write of the
-PG, whichever way it goes. A stripe is hot when its previous write was one of
-the PG's last W eligible writes: W = ``log_writes`` / ``admit_wpf``, at
-least 1, where ``log_writes`` is the number of 4 KiB records of an RBD data
-object the empty log holds (``Journal::capacity``: the records each segment
-holds, times the segment count, bounded by ``osd_ec_journal_poc_max_bytes``
-and ``osd_ec_journal_poc_max_records``). It uses the same per-record charge
-and segment rule as append. A full log reclaims a
-stripe's records after about ``log_writes`` writes of the PG, so a stripe
-written at least once every W writes gathers about ``admit_wpf`` writes per
-flush. The default 16 MiB log in four 4 MiB segments holds 3,948 such
-records (W = 394); 256 MiB in sixteen 16 MiB segments holds 63,184
-(W = 6,318). The first write of a stripe
-is cold. The table is direct mapped, with a power-of-two number of slots, at
-least 2W, from 1,024 to 4 Mi: a collision makes it forget the older stripe,
-which reads as cold. ``osd_ec_journal_poc_admit_wpf`` is a runtime option
-(default 10, at most 1000); the PG applies a change at its next eligible
-write, and a new window clears the table.
+No write of an object whose records replay has yet to fetch or judge goes
+direct.
 
 A direct eligible write needs only its own stripe to be clean, which rule 1
 guarantees, so it does not wait for the object's other journaled stripes;
@@ -314,16 +282,36 @@ dropped), so earlier markers stay, including those of flushes queued with
 the write. A record journaled on the written stripe later has a newer version
 and stays uncovered.
 
-The PG query adds ``admit_live``, ``admit_hot``, ``bypass_cold``,
-``bypass_full`` and ``bypass_room``, and the applied ``admit_wpf`` and
-window (``admit_window``).
+The PG query adds ``admit_live``, ``admit_new``, ``bypass_full`` and
+``bypass_room``. They count admission attempts, not necessarily submitted
+writes: ``journal_admit`` runs before the per-object FIFO and object-lock
+checks, so an operation retried after either wait is counted again.
 
-The table and admission counters currently count admission attempts, not
-necessarily submitted writes: ``journal_admit`` runs before the per-object
-FIFO and object-lock checks. An operation retried after either wait touches
-the table again and can make its own stripe appear hot. Tests cover the table
-and generator, not this retry behavior. The default ``admit_wpf`` remains 10;
-the break-even point must be measured again for the detached-header format.
+Up to build -57 a recency table (``HotStripes``, tuned by
+``osd_ec_journal_poc_admit_wpf`` = N) also sent cold stripes direct: a
+stripe without records was journaled only if it had been written within the
+PG's last (log capacity / N) eligible writes. It dates from the inline-header
+record format, when on 8+3 with four copies the journal beat direct Fast EC
+writes only while a stripe collected roughly ten or more writes per flush.
+With records that take no PG log entry (build -55) the table ran below
+journaling every write at every locality. 8+3, eleven clients at queue depth
+128, IOPS as a multiple of Fast EC:
+
+=============== =========== ====== ===== =====
+working set     every write N = 10 N = 2 N = 3
+=============== =========== ====== ===== =====
+11 x 3 GiB      1.81        1.79
+11 x 6 GiB      1.64        1.56
+11 x 24 GiB     1.28        1.03   1.16  1.10
+11 x 96 GiB     1.02        0.78   0.81  0.80
+96 GiB, zoned   1.28        1.22   1.26  1.23
+=============== =========== ====== ===== =====
+
+So the table and its option were removed. The full-log path is rare: over
+the ten journal runs behind the first two columns (296 million eligible
+writes) no write waited for room or went direct because the log was full
+(``pressure_events`` and ``bypass_room`` stayed 0), since reclaim keeps
+ahead of the appends; and none was a whole stripe.
 
 Replicated records
 ------------------
@@ -521,9 +509,9 @@ the newest record version of stripe ``s`` it wrote. Every other data write
 of an enrolled pool sets ``base`` to the journal version current when it
 was admitted (``Journal::version_now``: every record appended so far sorts
 at or below it, and any record of the object appended later sorts above
-it) if the object has no live record; one that admission control let run
-beside live records sets ``stripes[s]`` to that version for the stripes it
-writes instead (see "Admission control"). Either way the attribute never
+it) if the object has no live record; one that ran beside live records
+sets ``stripes[s]`` to that version for the stripes it writes instead (see
+"Admission"). Either way the attribute never
 covers unflushed data. A record of the object with version V for stripe s
 is therefore materialized exactly when ``V <= max(base, stripes[s])``, which
 a replaying primary can check against the object itself. Versions of
@@ -658,13 +646,7 @@ mutation is waiting for now),
 separately. Journal-full requests that the journal has to take wait in do_op
 without ACK or version, under the OSD's existing client throttles.
 ``pressure_events`` counts those waits, including a requeued request's
-retries. The admission counters are described under "Admission control".
-
-``osd_ec_journal_poc_admit_wpf`` is a runtime integer, default 10: the
-journal takes an eligible write of a stripe it does not hold only if the
-write is not a whole stripe and the stripe was written again within the
-log's capacity in 4 KiB writes divided by this value; 0 journals every
-eligible write (see "Admission control").
+retries. The admission counters are described under "Admission".
 
 A flush is deferred (50 ms retries) while the scrubber holds the object's
 range or the object is degraded, backfilling or unreadable, mirroring
@@ -695,17 +677,12 @@ strict oldest-first order, supersede accounting and cross-segment coalescing,
 segment death by flush or overwrite, writes arriving while their stripe
 flushes, capacity, skipped candidates, reset handling, failure handling and a
 randomized reference check with interleaved flushes and reclaims.
-Admission-control tests cover the recency table: first and repeated writes,
-the window boundary, other stripes within the window, independence of
-objects, namespaces and stripes, a zero window, window changes and slot
-collisions.
 Split regressions cover unchanged slot offsets and OMAP headers, shard and PG
 hashes, ownership filtering, rejected partial tails, read errors and the
 removal of every child slot before the copy. Replay regressions cover failed
 fetches retaining object barriers, unreadable slots blocking untagged
 objects, and prevention of premature flushes. Record-format tests check
-one-block 4 KiB writes, no slot xattr operations, byte budgets, capacity
-against what append accepts, checksums, missing, misplaced and short headers,
+one-block 4 KiB writes, no slot xattr operations, byte budgets, checksums, missing, misplaced and short headers,
 headers of records that open later segments, payloads of several blocks
 (4 KiB multiples or not) located by their headers alone, remote-fetch
 header/tag consistency and which op_returns items count as log tags.
@@ -777,9 +754,6 @@ Remaining integration
    flusher overhead. Increase flusher concurrency only after correctness of the
    healthy write/drain path is demonstrated. Reads of journaled data wait for
    a flush; there is no overlay.
-5. Measure admission control on 8+3: admission and bypass counters, writes
-   per flushed stripe and IOPS against Fast EC, for uniform and zoned working
-   sets and several ``osd_ec_journal_poc_admit_wpf`` values.
 
 Benchmark matrix and accounting
 -------------------------------

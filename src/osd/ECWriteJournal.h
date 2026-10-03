@@ -96,8 +96,9 @@ struct Record {
 // journal while the object had no records (such a write waits until they
 // are all flushed); stripes[s] the newest record version the last flush of
 // s wrote, or the journal version current at a plain overwrite of s that
-// admission control sent past the journal while other stripes of the object
-// had records (those keep base and name only the stripes they write).
+// went past the journal (a whole stripe, or the log was full) while other
+// stripes of the object had records (those keep base and name only the
+// stripes they write).
 // It lives with the object's other attributes, so recovery and backfill carry
 // it and a replaying primary can judge records against it.
 inline constexpr std::string_view materialized_attr = "ec_journal";
@@ -274,9 +275,6 @@ class Journal {
   // no state change: 0, -EAGAIN (no room until something is released),
   // -E2BIG (never fits a segment), -EINVAL or a latched error.
   int check_append(const hobject_t& object, uint64_t length) const;
-  // Records of this object and length an empty log holds: the segments'
-  // packing, max_bytes and max_records all bound it.
-  uint64_t capacity(const hobject_t& object, uint64_t length) const;
   // Single copy: place and emit into collection, for prefix's shard.
   int append(const hobject_t& object, eversion_t version,
              uint64_t object_size, uint64_t offset,
@@ -498,30 +496,6 @@ class Journal {
   uint64_t live = 0;
   uint64_t superseded = 0;
   int failed = 0;
-};
-
-// Admission control: which stripes of a PG were written recently. A stripe
-// written again within `window` writes of the PG is hot. It is likely to
-// collect enough records before its flush that one flush shared by all of
-// them costs less than a direct EC write each; a cold one goes straight to
-// the EC write path. The table is direct mapped, so a collision only makes
-// the filter forget the older stripe (it reads as cold).
-class HotStripes {
-public:
-  // window: writes of the PG; 0 turns the filter off (nothing is hot).
-  void set_window(uint64_t window);
-  uint64_t window() const { return span; }
-  // Records a write of the stripe; true if it was written within the window.
-  bool touch(const hobject_t& object, uint64_t stripe_offset);
-
-private:
-  struct Slot {
-    uint64_t key = 0; // 0: empty
-    uint64_t seen = 0;
-  };
-  std::vector<Slot> slots;
-  uint64_t span = 0;
-  uint64_t clock = 0;
 };
 
 } // namespace ECWriteJournal

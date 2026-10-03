@@ -447,17 +447,6 @@ int Journal::room_for(uint64_t bytes, bool* rotate) const
   return 0;
 }
 
-uint64_t Journal::capacity(const hobject_t& object, uint64_t length) const
-{
-  const uint64_t bytes = record_bytes(object, length);
-  if (bytes > limits.segment_bytes) {
-    return 0;
-  }
-  // A segment closes once the next record no longer fits it.
-  return std::min({limits.max_records, limits.max_bytes / bytes,
-                   limits.segment_bytes / bytes * limits.max_segments});
-}
-
 int Journal::check_append(const hobject_t& object, uint64_t length) const
 {
   if (failed) {
@@ -1046,50 +1035,6 @@ std::optional<ceph::mono_clock::time_point> Journal::oldest_at() const
     return std::nullopt;
   }
   return index.at(by_age.begin()->second).oldest_at;
-}
-
-void HotStripes::set_window(uint64_t window)
-{
-  if (window == span) {
-    return;
-  }
-  span = window;
-  clock = 0;
-  if (!window) {
-    slots.clear();
-    slots.shrink_to_fit();
-    return;
-  }
-  // Twice the window keeps collisions rare among the stripes it can hold.
-  size_t size = 1024;
-  while (size < 2 * window && size < (size_t(1) << 22)) {
-    size <<= 1;
-  }
-  slots.assign(size, Slot{});
-}
-
-bool HotStripes::touch(const hobject_t& object, uint64_t stripe_offset)
-{
-  if (slots.empty()) {
-    return false;
-  }
-  // splitmix64 over the object's name and namespace and the stripe offset.
-  uint64_t key = std::hash<std::string>{}(object.oid.name) ^
-    (std::hash<std::string>{}(object.nspace) << 1) ^
-    (stripe_offset * 0x9e3779b97f4a7c15ull);
-  key += 0x9e3779b97f4a7c15ull;
-  key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ull;
-  key = (key ^ (key >> 27)) * 0x94d049bb133111ebull;
-  key ^= key >> 31;
-  if (!key) {
-    key = 1;
-  }
-  ++clock;
-  auto& slot = slots[key & (slots.size() - 1)];
-  const bool hit = slot.key == key && clock - slot.seen <= span;
-  slot.key = key;
-  slot.seen = clock;
-  return hit;
 }
 
 } // namespace ECWriteJournal

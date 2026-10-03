@@ -112,25 +112,6 @@ options:
   default: false
   flags:
   - runtime
-- name: osd_ec_journal_poc_admit_wpf
-  type: uint
-  level: dev
-  desc: Admission control for the EC write journal PoC
-  long_desc: A durable journal record costs a write on every holder, so the
-    journal pays off only for stripes that collect several writes before their
-    flush. With a nonzero value N it takes an eligible write only if the stripe
-    already has records, or was written again within (records the log holds / N)
-    writes of the PG. Other writes take the ordinary EC write path, as do whole
-    aligned stripes, and writes to stripes without records while the log is full.
-    0 journals every eligible write.
-  default: 10
-  min: 0
-  max: 1000
-  flags:
-  - runtime
-  see_also:
-  - osd_ec_journal_poc_max_bytes
-  - osd_ec_journal_poc_max_records
 - name: osd_ec_rollforward_delay_ms
   type: uint
   level: advanced

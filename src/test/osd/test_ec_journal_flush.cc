@@ -779,12 +779,13 @@ class ZeroParityCode : public ceph::ErasureCodeInterface {
 
 TEST_P(JournalFlushTest, DirectWriteBesideLiveRecordsMarksOnlyItsStripe)
 {
-  // Admission control sends a cold write the ordinary EC way, although other
-  // stripes of the object are journaled. Its marker names only the stripes
-  // it writes, with no base, and the generator merges it into the attr as it
-  // merges a flush's: base and the other stripes' entries stay, and a record
-  // still journaled on another stripe stays uncovered. Setting base to the
-  // write's version would let replay take that record for materialized.
+  // A whole-stripe write, or one that finds the log full, goes the ordinary
+  // EC way although other stripes of the object are journaled. Its marker
+  // names only the stripes it writes, with no base, and the generator merges
+  // it into the attr as it merges a flush's: base and the other stripes'
+  // entries stay, and a record still journaled on another stripe stays
+  // uncovered. Setting base to the write's version would let replay take
+  // that record for materialized.
   const hobject_t object(object_t("rbd_data.7f1cb2a3d4e5.0000000000000002"), "",
                          CEPH_NOSNAP, 0, 1, "");
   pg_pool_t pool;

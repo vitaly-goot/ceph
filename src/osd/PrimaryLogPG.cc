@@ -9332,8 +9332,8 @@ void PrimaryLogPG::finish_ctx(OpContext *ctx, int log_op_type, int result)
     // records its stripe itself.
     //
     // do_op (ec_journal_admit) lets a bypassing write run beside live
-    // records of the object only when admission control sent a plain
-    // overwrite of stripes that hold none past the journal. Such a write
+    // records of the object only when it is a plain overwrite of stripes
+    // that hold none (a whole stripe, or the log was full). Such a write
     // marks just the stripes it writes and keeps base: raising base would
     // let replay take the other stripes' records for materialized. Any
     // other bypassing write waited until the object had no live record, so
